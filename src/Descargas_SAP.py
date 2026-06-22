@@ -6,20 +6,22 @@ Módulo de extracción de transacciones SAP para el proyecto
 'Validación Factura Global'.
 
 Primera transacción implementada: 'Gallo' (FAGLL03).
-Basado en la grabación VBS original, con tres mejoras:
+Basado en la grabación VBS original, con estas mejoras:
   1. Las fechas las ingresa el usuario (ya no van fijas a 14.06.2026).
-  2. El nombre del archivo se calcula como (fecha_hasta + 1 día),
-     en formato DD_mmm_YY.xlsx (mes en español).  Ej: 14.06.2026 -> 15_jun_26.xlsx
-  3. La ruta y el nombre del archivo se escriben directo en el diálogo de
+  2. El nombre del archivo usa la MISMA fecha del usuario, en formato
+     DD_mmm_YY.xlsx (mes en español).  Ej: 15.06.2026 -> 15_jun_26.xlsx
+  3. Soporta descarga de un solo día o de un rango (día por día).
+  4. La ruta y el nombre del archivo se escriben directo en el diálogo de
      exportación (más robusto que navegar con F4 como hacía el VBS).
 """
 
 import os
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import openpyxl as _oxl          # asegura que PyInstaller incluya el motor de Excel
+import pandas as pd
 import win32com.client
 import pywintypes
 
@@ -63,18 +65,105 @@ def ruta_input_default():
     )
 
 
-def nombre_archivo_gallo(date_high):
+def nombre_archivo_dia(fecha):
     """
-    Recibe la fecha HIGH del rango ('DD.MM.YYYY') y devuelve el nombre del
-    archivo nombrado con el día SIGUIENTE, en formato DD_mmm_YY.xlsx.
+    Recibe una fecha ('DD.MM.YYYY') y devuelve el nombre del archivo con la
+    MISMA fecha, en formato DD_mmm_YY.xlsx (mes en español).
 
-    Ej: '14.06.2026' -> '15_jun_26.xlsx'
+    Ej: '15.06.2026' -> '15_jun_26.xlsx'
 
-    (Si prefieres el día con cero a la izquierda, cambia '{fecha.day}' por
-     '{fecha.day:02d}' en el return → daría '05_ene_26' en lugar de '5_ene_26'.)
+    (Si prefieres el día con cero a la izquierda, cambia '{f.day}' por
+     '{f.day:02d}' en el return → daría '05_ene_26' en lugar de '5_ene_26'.)
     """
-    fecha = datetime.strptime(date_high, "%d.%m.%Y") + timedelta(days=1)
-    return f"{fecha.day}_{_MESES_ES[fecha.month]}_{fecha:%y}.xlsx"
+    f = datetime.strptime(fecha, "%d.%m.%Y")
+    return f"{f.day}_{_MESES_ES[f.month]}_{f:%y}.csv"
+
+
+def nombre_archivo_rango(desde, hasta):
+    """
+    Devuelve el nombre del archivo CONSOLIDADO para un rango de varios días,
+    en formato DD_mmm_YY_a_DD_mmm_YY.csv (CSV: una sola tabla, sin límite de filas).
+
+    Ej: ('15.06.2026', '17.06.2026') -> '15_jun_26_a_17_jun_26.csv'
+    """
+    d = datetime.strptime(desde, "%d.%m.%Y")
+    h = datetime.strptime(hasta, "%d.%m.%Y")
+    return (
+        f"{d.day}_{_MESES_ES[d.month]}_{d:%y}"
+        f"_a_{h.day}_{_MESES_ES[h.month]}_{h:%y}.csv"
+    )
+
+
+def _xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True):
+    """
+    Convierte a CSV (utf-8-sig) el .xlsx que SAP genera al exportar, para que
+    TODOS los archivos descargados queden en el mismo formato. Luego borra el
+    .xlsx intermedio. utf-8-sig hace que Excel muestre bien los acentos.
+    """
+    df = pd.read_excel(ruta_xlsx, dtype=str, engine="openpyxl")
+    df.to_csv(ruta_csv, index=False, encoding="utf-8-sig")
+    if eliminar_xlsx:
+        _borrar_xlsx_con_reintentos(ruta_xlsx)
+
+
+def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=5, espera=2):
+    """
+    Borra el .xlsx intermedio. En Windows, si Excel todavía lo tiene abierto,
+    el archivo queda BLOQUEADO y os.remove falla. Por eso en cada intento
+    primero re-intentamos cerrar el workbook en Excel y luego borrar, dándole
+    tiempo a que suelte el archivo.
+    """
+    for intento in range(1, intentos + 1):
+        _cerrar_excel_workbook(ruta_xlsx)        # reintenta cerrarlo en Excel
+        try:
+            if os.path.exists(ruta_xlsx):
+                os.remove(ruta_xlsx)
+            print(f"[XLSX] Temporal borrado: {ruta_xlsx}")
+            return True
+        except OSError as e:
+            print(f"[XLSX] Aún bloqueado (intento {intento}/{intentos}): {e}")
+            time.sleep(espera)
+
+    print(f"[XLSX] ⚠️ No se pudo borrar (sigue abierto/bloqueado): {ruta_xlsx}")
+    return False
+
+
+def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=2):
+    """
+    Cierra (sin guardar) el workbook que SAP/Excel deja abierto tras la
+    exportación, para que el archivo no quede abierto ni ocupando memoria.
+    Reintenta un par de veces por si Excel aún no terminaba de abrirlo.
+    Falla en silencio si Excel no está corriendo.
+    """
+    ruta_abs = os.path.abspath(ruta_archivo)
+    for _ in range(intentos):
+        try:
+            excel = win32com.client.GetObject(Class="Excel.Application")
+        except Exception:
+            return  # no hay Excel abierto → nada que cerrar
+        cerrado = False
+        try:
+            excel.DisplayAlerts = False
+        except Exception:
+            pass
+        try:
+            for wb in list(excel.Workbooks):
+                try:
+                    if os.path.abspath(wb.FullName) == ruta_abs:
+                        wb.Close(SaveChanges=False)
+                        cerrado = True
+                        print(f"[EXCEL] Workbook cerrado: {ruta_archivo}")
+                        break
+                except Exception:
+                    continue
+        finally:
+            try:
+                excel.DisplayAlerts = True
+            except Exception:
+                pass
+        if cerrado:
+            return
+        time.sleep(espera)  # tal vez aún no terminaba de abrir; reintenta
 
 
 def _verificar_sin_partidas(session, ruta_archivo):
@@ -114,10 +203,15 @@ def _verificar_sin_partidas(session, ruta_archivo):
                 carpeta = os.path.dirname(ruta_archivo)
                 if carpeta:
                     os.makedirs(carpeta, exist_ok=True)
-                wb = _oxl.Workbook()
-                wb.active.title = "Sin datos"
-                wb.save(ruta_archivo)
-                wb.close()
+                if ruta_archivo.lower().endswith(".csv"):
+                    pd.DataFrame({"Sin datos": []}).to_csv(
+                        ruta_archivo, index=False, encoding="utf-8-sig"
+                    )
+                else:
+                    wb = _oxl.Workbook()
+                    wb.active.title = "Sin datos"
+                    wb.save(ruta_archivo)
+                    wb.close()
             except Exception as e:
                 raise RuntimeError(f"No se pudo crear el archivo vacío: {ruta_archivo}") from e
             return True
@@ -162,8 +256,16 @@ def Gallo_FAGLL03(
     session = None
     cuentas       = cuentas or _CUENTAS_GALLO
     FolderPath    = FolderPath or ruta_input_default()
-    FileName      = FileName or nombre_archivo_gallo(DateTo)
-    ruta_completa = os.path.join(FolderPath, FileName)
+    FileName      = FileName or nombre_archivo_dia(DateTo)
+    ruta_completa = os.path.join(FolderPath, FileName)   # destino final (puede ser .csv)
+
+    # SAP sólo exporta en formato hoja de cálculo (.xlsx). Si el archivo final
+    # que queremos es .csv, exportamos primero a un .xlsx temporal y al terminar
+    # lo convertimos. Así TODOS los archivos quedan en el mismo formato.
+    _base, _ext     = os.path.splitext(FileName)
+    _exportar_a_csv = _ext.lower() == ".csv"
+    _nombre_xlsx    = (_base + ".xlsx") if _exportar_a_csv else FileName
+    _ruta_xlsx      = os.path.join(FolderPath, _nombre_xlsx)
 
     try:
         # === Validaciones mínimas ===
@@ -242,9 +344,17 @@ def Gallo_FAGLL03(
         session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
         session.findById("wnd[1]/tbar[0]/btn[0]").press()
         session.findById("wnd[1]/usr/ctxtDY_PATH").text     = FolderPath
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = FileName
-        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(FileName)
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = _nombre_xlsx
+        session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(_nombre_xlsx)
         session.findById("wnd[1]/tbar[0]/btn[11]").press()
+
+        # === Cerrar el Excel que SAP abre tras exportar ===
+        time.sleep(3)
+        _cerrar_excel_workbook(_ruta_xlsx)
+
+        # === Convertir el .xlsx temporal a .csv (consistencia de formato) ===
+        if _exportar_a_csv:
+            _xlsx_a_csv(_ruta_xlsx, ruta_completa)
 
         # === Regresar a la pantalla inicial ===
         session.findById("wnd[0]/tbar[0]/btn[3]").press()
@@ -279,7 +389,7 @@ if __name__ == "__main__":
     date_from = input("Fecha desde (DD.MM.YYYY): ").strip()
     date_to   = input("Fecha hasta (DD.MM.YYYY): ").strip()
 
-    archivo = nombre_archivo_gallo(date_to)
+    archivo = nombre_archivo_dia(date_to)
     print(f"\nEl archivo se nombrará : {archivo}")
     print(f"Se guardará en         : {ruta_input_default()}\n")
 
