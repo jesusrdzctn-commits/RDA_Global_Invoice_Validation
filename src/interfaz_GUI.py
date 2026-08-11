@@ -4,13 +4,12 @@ from datetime import datetime
 import os
 
 
-# Mes en español (espejo del helper en Descargas_SAP.py). Se duplica a propósito
-# para que la GUI NO importe nada de SAP y se pueda abrir/probar en cualquier
-# equipo. Cuando el proyecto crezca lo movemos a un utils.py compartido.
-_MESES_ES = {
-    1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
-    7: "jul", 8: "ago", 9: "sep", 10: "oct", 11: "nov", 12: "dic",
-}
+# Helpers de nombrado compartidos. Viven en utils.py (sin dependencias de SAP
+# ni de tkinter), así la GUI se puede abrir y probar sola en cualquier equipo.
+from utils import (
+    nombre_archivo_dia,          nombre_archivo_rango,
+    nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
+)
 
 
 class ValidacionFacturaGUI:
@@ -20,7 +19,7 @@ class ValidacionFacturaGUI:
         self.root.geometry("580x600")
         self.root.resizable(False, False)
 
-        # Esquema de colores 
+        # Esquema de colores
         self.bg_color        = "#FFFFFF"
         self.primary_color   = "#00094F"
         self.secondary_color = "#333333"
@@ -30,8 +29,8 @@ class ValidacionFacturaGUI:
 
         self.root.configure(bg=self.bg_color)
 
-        # Callback que el controller conectará
-        self.on_download_gallo = None
+        # Callback que el controller conectará (un solo botón para ambas)
+        self.on_download_ambos = None
 
         # Modo de intervalo: "single" (un día) o "range" (varios días)
         self.mode_var = tk.StringVar(value="single")
@@ -59,7 +58,7 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg=self.primary_color,
         ).pack(pady=(0, 4))
         tk.Label(
-            main, text="Descarga de transacción Gallo (FAGLL03)",
+            main, text="Automatización de descarga y consolidación - Transacciones desde SAP",
             font=("Segoe UI", 10),
             bg=self.bg_color, fg=self.secondary_color,
         ).pack(pady=(0, 16))
@@ -180,16 +179,21 @@ class ValidacionFacturaGUI:
             wraplength=500,
         ).pack(fill="x", padx=12, pady=(0, 10))
 
-        # --- Botón de descarga ---
-        self.download_btn = tk.Button(
-            main, text="🐓 Descargar Gallo (FAGLL03)",
-            command=self._handle_download,
+        # --- Botón único de descarga (Gallo + Monivoi en secuencia) ---
+        btn_frame = tk.Frame(main, bg=self.bg_color)
+        btn_frame.pack(fill="x", pady=(0, 14))
+
+        _btn_kwargs = dict(
             font=("Segoe UI", 11, "bold"),
             bg=self.primary_color, fg=self.bg_color,
-            relief=tk.RAISED, bd=2, padx=30, pady=12, cursor="hand2",
+            relief=tk.RAISED, bd=2, pady=12, cursor="hand2",
             activebackground=self.secondary_color, activeforeground=self.bg_color,
         )
-        self.download_btn.pack(fill="x", pady=(0, 14))
+        self.download_btn = tk.Button(
+            btn_frame, text="🐓📊 Descargar Gallo + Monivoi",
+            command=self._handle_ambos, **_btn_kwargs,
+        )
+        self.download_btn.pack(side=tk.LEFT, expand=True, fill="x")
 
         # --- Barra de estado ---
         self.status_var = tk.StringVar(value="✓ Listo para comenzar")
@@ -199,25 +203,25 @@ class ValidacionFacturaGUI:
         ).pack()
 
     # ------------------------------------------------------------------
-    # Helpers de nombrado (espejo de Descargas_SAP.py, sin desfase de día)
+    # Vista previa de nombres de archivo (sin desfase para Gallo; el -1 de
+    # Monivoi ya viene aplicado dentro de utils.py)
     # ------------------------------------------------------------------
-    def _nombre_dia(self, fecha_str):
-        f = datetime.strptime(fecha_str, "%d.%m.%Y")
-        return f"{f.day}_{_MESES_ES[f.month]}_{f:%y}.csv"
-
-    def _nombre_rango(self, desde, hasta):
-        d = datetime.strptime(desde, "%d.%m.%Y")
-        h = datetime.strptime(hasta, "%d.%m.%Y")
-        return (
-            f"{d.day}_{_MESES_ES[d.month]}_{d:%y}"
-            f"_a_{h.day}_{_MESES_ES[h.month]}_{h:%y}.csv"
-        )
-
     def _preview_nombre(self):
         try:
             if self.mode_var.get() == "single":
-                return self._nombre_dia(self.date_single_var.get().strip())
-            return self._nombre_rango(
+                return nombre_archivo_dia(self.date_single_var.get().strip())
+            return nombre_archivo_rango(
+                self.date_from_var.get().strip(),
+                self.date_to_var.get().strip(),
+            )
+        except ValueError:
+            return "(fecha inválida)"
+
+    def _preview_nombre_monivoi(self):
+        try:
+            if self.mode_var.get() == "single":
+                return nombre_archivo_dia_monivoi(self.date_single_var.get().strip())
+            return nombre_archivo_rango_monivoi(
                 self.date_from_var.get().strip(),
                 self.date_to_var.get().strip(),
             )
@@ -225,7 +229,10 @@ class ValidacionFacturaGUI:
             return "(fecha inválida)"
 
     def _update_filename_preview(self):
-        self.filename_var.set(f"📄 El archivo se llamará:  {self._preview_nombre()}")
+        self.filename_var.set(
+            f"📄 Gallo:      {self._preview_nombre()}\n"
+            f"📄 Monivoi:  {self._preview_nombre_monivoi()}"
+        )
 
     # ------------------------------------------------------------------
     # Alternar modo
@@ -257,13 +264,17 @@ class ValidacionFacturaGUI:
             messagebox.showerror("Error", "Formato de fecha inválido. Use DD.MM.YYYY")
             return False
 
-    def get_config(self):
+    def get_config(self, transaccion="gallo"):
         mode = self.mode_var.get()
+        filename = (
+            self._preview_nombre_monivoi() if transaccion == "monivoi"
+            else self._preview_nombre()
+        )
         cfg = {
             "mode":       mode,
             "sociedad":   self.sociedad_var.get().strip().upper() or "MX21",
             "input_path": self.input_path,
-            "filename":   self._preview_nombre(),
+            "filename":   filename,
         }
         if mode == "single":
             cfg["fecha"] = self.date_single_var.get().strip()
@@ -276,19 +287,23 @@ class ValidacionFacturaGUI:
         self.status_var.set(message)
         self.root.update_idletasks()
 
+    # --- Estado del botón ---
     def disable_buttons(self):
         self.download_btn.config(state="disabled", bg="#666666")
 
     def enable_buttons(self):
         self.download_btn.config(state="normal", bg=self.primary_color)
 
-    def _handle_download(self):
+    # --- Handler ---
+    def _handle_ambos(self):
         if not self.validate_dates():
             return
-        if self.on_download_gallo:
-            self.on_download_gallo()
+        if self.on_download_ambos:
+            self.on_download_ambos()
         else:
-            messagebox.showinfo("Info", f"Funcionalidad no conectada\n\n{self.get_config()}")
+            messagebox.showinfo(
+                "Info", f"Funcionalidad no conectada\n\n{self.get_config('gallo')}"
+            )
 
 
 def main():
