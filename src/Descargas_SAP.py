@@ -26,6 +26,7 @@ from datetime import datetime
 import openpyxl as _oxl          # asegura que PyInstaller incluya el motor de Excel
 import pandas as pd
 import win32com.client
+import win32clipboard         
 import pywintypes
 
 from utils import (
@@ -40,8 +41,9 @@ from utils import (
 
 # Cuentas que vienen en el multiple-selection (SD_SAKNR) del VBS.
 _CUENTAS_GALLO = [
-    "4000005", "4150000", "4200000", "4200004",
-    "4200015", "4260000", "7000005",
+    "4000005", "4000010", "4000020", "4000802",
+    "4150000", "4200000", "4200004", "4200015",
+    "4260000", "4300013", "7000005",
 ]
 
 # Sociedad por defecto (BUKRS) que trae el VBS.
@@ -208,6 +210,43 @@ def _verificar_sin_partidas(session, ruta_archivo):
         print(f"[ERROR] _verificar_sin_partidas: {e}")
         return False
 
+def _copiar_al_portapapeles(texto, intentos=5, espera=0.3):
+    """
+    Pone 'texto' en el portapapeles de Windows (Unicode). Reintenta unas veces
+    porque a veces otra app tiene el portapapeles ocupado un instante.
+    OJO: esto SOBRESCRIBE lo que el usuario tuviera copiado en ese momento.
+    """
+    ultimo_error = None
+    for _ in range(intentos):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(texto, win32clipboard.CF_UNICODETEXT)
+                return True
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception as e:
+            ultimo_error = e
+            time.sleep(espera)
+    raise RuntimeError(f"No se pudo escribir en el portapapeles: {ultimo_error}")
+
+
+def _importar_cuentas_desde_popup(session):
+    """
+    Pulsa el botón 'Importar desde portapapeles' del popup de selección
+    múltiple. Prueba los IDs conocidos por si cambia entre sistemas SAP.
+    """
+    for btn_id in ("wnd[1]/tbar[0]/btn[24]", "wnd[1]/tbar[0]/btn[25]"):
+        try:
+            session.findById(btn_id).press()
+            return True
+        except Exception:
+            continue
+    raise RuntimeError(
+        "No encontré el botón 'Importar desde portapapeles' en el popup. "
+        "Confirma su ID con Script Recording (Alt+F12) y agrégalo a la lista."
+    )
 
 # ----------------------------------------------------------------------
 # Transacción Gallo (FAGLL03)
@@ -276,23 +315,21 @@ def Gallo_FAGLL03(
         session.findById("wnd[0]/tbar[0]/okcd").text = "/nFAGLL03"
         session.findById("wnd[0]").sendVKey(0)
 
-        # === Cargar cuentas (multiple selection SD_SAKNR) ===
+        # === Cargar cuentas (multiple selection SD_SAKNR) vía PORTAPAPELES ===
+        # En vez de escribir fila por fila (y tener que lidiar con el scroll cuando
+        # hay muchas cuentas), copiamos TODAS las cuentas al portapapeles —una por
+        # línea— y usamos el botón 'Importar desde portapapeles' del popup. Así no
+        # importa cuántas cuentas sean: entran de un solo jalón.
         session.findById("wnd[0]/usr/btn%_SD_SAKNR_%_APP_%-VALU_PUSH").press()
-        for i, cuenta in enumerate(cuentas, start=0):
-            cuenta = str(cuenta).strip()
-            field_id = (
-                f"wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/"
-                f"ssubSCREEN_HEADER:SAPLALDB:3010/"
-                f"tblSAPLALDBSINGLE/ctxtRSCSEL_255-SLOW_I[1,{i}]"
-            )
-            campo = session.findById(field_id)
-            campo.text          = cuenta
-            campo.setFocus()
-            campo.caretPosition = len(cuenta)
+
+        _copiar_al_portapapeles("\r\n".join(str(c).strip() for c in cuentas))
+        _importar_cuentas_desde_popup(session)
+        time.sleep(1)                                       # deja que SAP pinte las cuentas
+
         session.findById("wnd[1]/tbar[0]/btn[0]").press()  # copiar/adoptar
         session.findById("wnd[1]/tbar[0]/btn[8]").press()  # ejecutar y cerrar popup
 
-        # === Parámetros de selección ===
+         # === Parámetros de selección ===
         session.findById("wnd[0]/usr/radX_AISEL").select()          # todas las partidas
         session.findById("wnd[0]/usr/ctxtSD_BUKRS-LOW").text  = sociedad
         session.findById("wnd[0]/usr/ctxtSO_BUDAT-LOW").text  = DateFrom

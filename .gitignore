@@ -5,3 +5,5 @@ src/build/
 src/dist/
 
 Scripts (raw)/
+
+config.json

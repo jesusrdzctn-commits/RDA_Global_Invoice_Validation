@@ -9,7 +9,7 @@ Helpers compartidos SIN dependencias de SAP ni de tkinter, para que:
 Aquí vive la ÚNICA fuente de verdad para:
   - el mapeo de meses en español,
   - el formato de los nombres de archivo (Gallo y Monivoi), y
-  - el desfase de "un día antes" de Monivoi  (¡el -1 vive SOLO aquí!).
+  - el desfase de "un día después" de Monivoi  (¡el +1 vive SOLO aquí!).
 
 Regla de oro: si algún día cambia el formato del nombre o el desfase de
 Monivoi, se toca este archivo y nada más.
@@ -37,13 +37,15 @@ def parse_fecha(fecha_str):
 
 def fecha_efectiva_monivoi(fecha_str):
     """
-    Monivoi trabaja con el día ANTERIOR al que teclea el usuario.
-    Este es el ÚNICO lugar donde se aplica ese -1: tanto los nombres de archivo
-    como (si quieres) la fecha que se manda a SAP deben pasar por aquí.
+    Monivoi trabaja con el día SIGUIENTE al que teclea el usuario, porque ahí
+    vive el timbrado que los stakeholders usan como referencia.
+    Este es el ÚNICO lugar donde se aplica ese +1, y SÓLO afecta la CONSULTA en
+    SAP (SO_ERDAT). El NOMBRE del archivo NO pasa por aquí: se queda con la fecha
+    del usuario a propósito, para no confundir al stakeholder.
 
-        '11.08.2026' -> datetime(2026, 8, 10)
+        '18.08.2026' -> datetime(2026, 8, 19)
     """
-    return parse_fecha(fecha_str) - timedelta(days=1)
+    return parse_fecha(fecha_str) + timedelta(days=1)
 
 
 def fecha_efectiva_monivoi_str(fecha_str):
@@ -51,7 +53,7 @@ def fecha_efectiva_monivoi_str(fecha_str):
     Igual que fecha_efectiva_monivoi() pero devuelve el string 'DD.MM.YYYY'
     listo para escribirlo en los campos de SAP (SO_ERDAT).
 
-        '11.08.2026' -> '10.08.2026'
+        '18.08.2026' -> '19.08.2026'
     """
     return fecha_efectiva_monivoi(fecha_str).strftime(FORMATO_FECHA)
 
@@ -65,30 +67,33 @@ def _sufijo_dia(f):
 # Nombres de archivo — Gallo (FAGLL03)   [sin desfase]
 # ----------------------------------------------------------------------
 def nombre_archivo_dia(fecha_str):
-    """'15.06.2026' -> '15_jun_26.csv'."""
+    """'18.08.2026' -> '18_ago_26.csv'."""
     return f"{_sufijo_dia(parse_fecha(fecha_str))}.csv"
 
 
 def nombre_archivo_rango(desde, hasta):
-    """('15.06.2026', '17.06.2026') -> '15_jun_26_a_17_jun_26.csv'."""
+    """('18.08.2026', '20.08.2026') -> '18_ago_26_a_20_ago_26.csv'."""
     d = _sufijo_dia(parse_fecha(desde))
     h = _sufijo_dia(parse_fecha(hasta))
     return f"{d}_a_{h}.csv"
 
 
 # ----------------------------------------------------------------------
-# Nombres de archivo — Monivoi (ZLMXCOM_TRN_MONINVOI)   [día -1 incluido]
-# El -1 ya viene aplicado vía fecha_efectiva_monivoi(): no lo repitas afuera.
+# Nombres de archivo — Monivoi (ZLMXCOM_TRN_MONINVOI)   [SIN desfase en el nombre]
+# OJO: el +1 SÓLO aplica a la CONSULTA en SAP (SO_ERDAT, vía
+# fecha_efectiva_monivoi_str). El NOMBRE del archivo lleva la MISMA fecha que
+# teclea el usuario, aunque los datos por dentro sean del día siguiente. Es a
+# propósito: así el stakeholder no se confunde con la fecha del archivo.
 # ----------------------------------------------------------------------
 def nombre_archivo_dia_monivoi(fecha_str):
-    """'11.08.2026' -> 'Monitoreo_10_ago_26.csv'  (día -1)."""
-    return f"Monitoreo_{_sufijo_dia(fecha_efectiva_monivoi(fecha_str))}.csv"
+    """'18.08.2026' -> 'Monitoreo_18_ago_26.csv'  (nombre = fecha del usuario)."""
+    return f"Monitoreo_{_sufijo_dia(parse_fecha(fecha_str))}.csv"
 
 
 def nombre_archivo_rango_monivoi(desde, hasta):
-    """('11.08.2026', '13.08.2026') -> 'Monitoreo_10_ago_26_a_12_ago_26.csv'."""
-    d = _sufijo_dia(fecha_efectiva_monivoi(desde))
-    h = _sufijo_dia(fecha_efectiva_monivoi(hasta))
+    """('18.08.2026', '20.08.2026') -> 'Monitoreo_18_ago_26_a_20_ago_26.csv'."""
+    d = _sufijo_dia(parse_fecha(desde))
+    h = _sufijo_dia(parse_fecha(hasta))
     return f"Monitoreo_{d}_a_{h}.csv"
 
 
@@ -100,4 +105,4 @@ if __name__ == "__main__":
     print("Gallo   rango :", nombre_archivo_rango("15.06.2026", "17.06.2026"))
     print("Monivoi día   :", nombre_archivo_dia_monivoi("11.08.2026"))
     print("Monivoi rango :", nombre_archivo_rango_monivoi("11.08.2026", "13.08.2026"))
-    print("Monivoi a SAP :", fecha_efectiva_monivoi_str("11.08.2026"))
+    print("Monivoi a SAP :", fecha_efectiva_monivoi_str("18.08.2026"))

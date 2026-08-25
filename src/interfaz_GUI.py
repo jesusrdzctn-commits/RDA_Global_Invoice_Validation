@@ -1,7 +1,9 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 import os
+import sys
+import json
 
 
 # Helpers de nombrado compartidos. Viven en utils.py (sin dependencias de SAP
@@ -12,11 +14,25 @@ from utils import (
 )
 
 
+def _ruta_config():
+    """
+    Ubicación del config.json donde recordamos la última carpeta de descarga.
+    Se guarda JUNTO al ejecutable (cuando está empaquetado con PyInstaller) o
+    junto a este .py (cuando se corre como script). Así cada equipo conserva su
+    propia ruta sin tocar el código.
+    """
+    if getattr(sys, "frozen", False):        # corriendo como .exe (PyInstaller)
+        base = os.path.dirname(sys.executable)
+    else:                                    # corriendo como script .py
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "config.json")
+
+
 class ValidacionFacturaGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Validación Factura Global")
-        self.root.geometry("580x600")
+        self.root.geometry("580x640")
         self.root.resizable(False, False)
 
         # Esquema de colores
@@ -35,15 +51,47 @@ class ValidacionFacturaGUI:
         # Modo de intervalo: "single" (un día) o "range" (varios días)
         self.mode_var = tk.StringVar(value="single")
 
-        # Ruta de salida dinámica según el usuario del sistema
+        # --- Ruta de descarga ---------------------------------------------
+        # Arranca en una ruta por defecto según el usuario del sistema, pero el
+        # stakeholder la puede cambiar (p. ej. a una carpeta de SharePoint
+        # sincronizada con OneDrive) con el botón "Examinar...". Si ya se usó
+        # una ruta antes, se recupera del config.json.
+        self._config_file = _ruta_config()
         user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-        self.input_path = os.path.join(
+        ruta_default = os.path.join(
             user_profile, "Documents", "Validacion Factura Global", "src", "Input"
         )
-        os.makedirs(self.input_path, exist_ok=True)
+        ruta_guardada = self._cargar_ruta_guardada()
+        self.path_var = tk.StringVar(value=ruta_guardada or ruta_default)
+        os.makedirs(ruta_default, exist_ok=True)  # asegura que la default exista
 
         self._build_ui()
         self._on_mode_change()  # muestra el frame correcto + preview inicial
+
+    # ------------------------------------------------------------------
+    # Persistencia de la última ruta usada (config.json)
+    # ------------------------------------------------------------------
+    def _cargar_ruta_guardada(self):
+        """Lee la última ruta usada desde config.json. Si no existe o falla → None."""
+        try:
+            with open(self._config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ruta = str(data.get("ruta_descarga", "")).strip()
+            return ruta or None
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            return None
+
+    def _guardar_ruta(self):
+        """Guarda la ruta actual en config.json para recordarla la próxima vez."""
+        try:
+            with open(self._config_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"ruta_descarga": self.path_var.get().strip()},
+                    f, ensure_ascii=False, indent=2,
+                )
+        except OSError as e:
+            # No es crítico: si no se puede guardar, la app sigue funcionando.
+            print(f"[CONFIG] No se pudo guardar la ruta: {e}")
 
     # ------------------------------------------------------------------
     # Construcción de la interfaz
@@ -162,6 +210,28 @@ class ValidacionFacturaGUI:
             highlightbackground=self.border_color, highlightcolor=self.primary_color,
         ).grid(row=0, column=1, padx=10, pady=6, sticky="w")
 
+        # --- Carpeta de descarga (editable por el stakeholder) ---
+        path_frame = tk.LabelFrame(
+            main, text="  Carpeta de descarga  ",
+            font=("Segoe UI", 10, "bold"),
+            bg=self.bg_color, fg=self.primary_color,
+            bd=1, relief=tk.SOLID, padx=15, pady=12,
+        )
+        path_frame.pack(fill="x", pady=(0, 12))
+
+        tk.Entry(
+            path_frame, textvariable=self.path_var,
+            font=("Segoe UI", 9), bg=self.light_gray, fg=self.primary_color,
+            relief=tk.FLAT, bd=1, highlightthickness=1,
+            highlightbackground=self.border_color, highlightcolor=self.primary_color,
+        ).pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 8), ipady=4)
+
+        tk.Button(
+            path_frame, text="Examinar...", font=("Segoe UI", 9, "bold"),
+            bg=self.primary_color, fg=self.bg_color, relief=tk.FLAT,
+            cursor="hand2", padx=12, command=self._elegir_carpeta,
+        ).pack(side=tk.LEFT)
+
         # --- Info de salida (nombre + ruta) ---
         info_frame = tk.Frame(main, bg=self.light_gray, bd=1, relief=tk.SOLID)
         info_frame.pack(fill="x", pady=(0, 14))
@@ -174,7 +244,7 @@ class ValidacionFacturaGUI:
             wraplength=500,
         ).pack(fill="x", padx=12, pady=(10, 2))
         tk.Label(
-            info_frame, text=f"📁 {self.input_path}", font=("Segoe UI", 8),
+            info_frame, textvariable=self.path_var, font=("Segoe UI", 8),
             bg=self.light_gray, fg="#666666", anchor="w", justify="left",
             wraplength=500,
         ).pack(fill="x", padx=12, pady=(0, 10))
@@ -201,6 +271,19 @@ class ValidacionFacturaGUI:
             main, textvariable=self.status_var, font=("Segoe UI", 10),
             bg=self.bg_color, fg="#666666",
         ).pack()
+
+    # ------------------------------------------------------------------
+    # Selección de carpeta de descarga
+    # ------------------------------------------------------------------
+    def _elegir_carpeta(self):
+        """Abre el explorador para que el stakeholder elija la carpeta destino."""
+        carpeta = filedialog.askdirectory(
+            title="Elige la carpeta donde se descargarán los archivos",
+            initialdir=self.path_var.get() or os.path.expanduser("~"),
+        )
+        if carpeta:  # si el usuario cancela, no tocamos nada
+            self.path_var.set(os.path.normpath(carpeta))
+            self._guardar_ruta()  # recuerda la elección para la próxima vez
 
     # ------------------------------------------------------------------
     # Vista previa de nombres de archivo (sin desfase para Gallo; el -1 de
@@ -253,16 +336,30 @@ class ValidacionFacturaGUI:
         try:
             if self.mode_var.get() == "single":
                 datetime.strptime(self.date_single_var.get().strip(), "%d.%m.%Y")
-                return True
-            d1 = datetime.strptime(self.date_from_var.get().strip(), "%d.%m.%Y")
-            d2 = datetime.strptime(self.date_to_var.get().strip(), "%d.%m.%Y")
-            if d1 > d2:
-                messagebox.showerror("Error", "La fecha desde no puede ser mayor a la fecha hasta")
-                return False
-            return True
+            else:
+                d1 = datetime.strptime(self.date_from_var.get().strip(), "%d.%m.%Y")
+                d2 = datetime.strptime(self.date_to_var.get().strip(), "%d.%m.%Y")
+                if d1 > d2:
+                    messagebox.showerror("Error", "La fecha desde no puede ser mayor a la fecha hasta")
+                    return False
         except ValueError:
             messagebox.showerror("Error", "Formato de fecha inválido. Use DD.MM.YYYY")
             return False
+
+        # --- Validar la carpeta de descarga ---
+        ruta = self.path_var.get().strip()
+        if not ruta:
+            messagebox.showerror("Error", "Indica una carpeta de descarga válida.")
+            return False
+        try:
+            os.makedirs(ruta, exist_ok=True)  # la crea si aún no existe
+        except OSError as e:
+            messagebox.showerror(
+                "Error", f"No se pudo usar la carpeta de descarga:\n{ruta}\n\n{e}"
+            )
+            return False
+
+        return True
 
     def get_config(self, transaccion="gallo"):
         mode = self.mode_var.get()
@@ -270,10 +367,13 @@ class ValidacionFacturaGUI:
             self._preview_nombre_monivoi() if transaccion == "monivoi"
             else self._preview_nombre()
         )
+        input_path = self.path_var.get().strip()
+        os.makedirs(input_path, exist_ok=True)  # crea la carpeta si aún no existe
+        self._guardar_ruta()  # recuerda la ruta usada en esta corrida
         cfg = {
             "mode":       mode,
             "sociedad":   self.sociedad_var.get().strip().upper() or "MX21",
-            "input_path": self.input_path,
+            "input_path": input_path,
             "filename":   filename,
         }
         if mode == "single":
