@@ -32,7 +32,7 @@ class ValidacionFacturaGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Validación Factura Global")
-        self.root.geometry("580x640")
+        self.root.geometry("580x660")
         self.root.resizable(False, False)
 
         # Esquema de colores
@@ -45,8 +45,9 @@ class ValidacionFacturaGUI:
 
         self.root.configure(bg=self.bg_color)
 
-        # Callback que el controller conectará (un solo botón para ambas)
-        self.on_download_ambos = None
+        # Callbacks que el controller conectará
+        self.on_download_ambos = None   # descarga Gallo + Monivoi desde SAP
+        self.on_consolidar     = None   # consolidación de los CSV descargados
 
         # Modo de intervalo: "single" (un día) o "range" (varios días)
         self.mode_var = tk.StringVar(value="single")
@@ -57,13 +58,24 @@ class ValidacionFacturaGUI:
         # sincronizada con OneDrive) con el botón "Examinar...". Si ya se usó
         # una ruta antes, se recupera del config.json.
         self._config_file = _ruta_config()
+        cfg = self._cargar_config()
         user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-        ruta_default = os.path.join(
-            user_profile, "Documents", "Validacion Factura Global", "src", "Input"
+        base_proyecto = os.path.join(
+            user_profile, "Documents", "Validacion Factura Global", "src"
         )
-        ruta_guardada = self._cargar_ruta_guardada()
-        self.path_var = tk.StringVar(value=ruta_guardada or ruta_default)
-        os.makedirs(ruta_default, exist_ok=True)  # asegura que la default exista
+        ruta_input_default  = os.path.join(base_proyecto, "Input")
+        ruta_output_default = os.path.join(base_proyecto, "Output")
+
+        # Ruta de descarga (dónde SAP deja los CSV) y ruta de consolidación
+        # (dónde se guarda el Excel consolidado). Ambas se recuerdan en
+        # config.json y ambas se pueden cambiar con su botón "Examinar...".
+        self.path_var = tk.StringVar(
+            value=(cfg.get("ruta_descarga") or "").strip() or ruta_input_default
+        )
+        self.consolidacion_path_var = tk.StringVar(
+            value=(cfg.get("ruta_consolidacion") or "").strip() or ruta_output_default
+        )
+        os.makedirs(ruta_input_default, exist_ok=True)  # asegura que la default exista
 
         self._build_ui()
         self._on_mode_change()  # muestra el frame correcto + preview inicial
@@ -71,35 +83,43 @@ class ValidacionFacturaGUI:
     # ------------------------------------------------------------------
     # Persistencia de la última ruta usada (config.json)
     # ------------------------------------------------------------------
-    def _cargar_ruta_guardada(self):
-        """Lee la última ruta usada desde config.json. Si no existe o falla → None."""
+    def _cargar_config(self):
+        """Lee el config.json completo (dict). Si no existe o falla → {}."""
         try:
             with open(self._config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            ruta = str(data.get("ruta_descarga", "")).strip()
-            return ruta or None
+            return data if isinstance(data, dict) else {}
         except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
-            return None
+            return {}
 
-    def _guardar_ruta(self):
-        """Guarda la ruta actual en config.json para recordarla la próxima vez."""
+    def _guardar_config(self):
+        """Guarda ambas rutas (descarga y consolidación) en config.json."""
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"ruta_descarga": self.path_var.get().strip()},
+                    {
+                        "ruta_descarga":      self.path_var.get().strip(),
+                        "ruta_consolidacion": self.consolidacion_path_var.get().strip(),
+                    },
                     f, ensure_ascii=False, indent=2,
                 )
         except OSError as e:
             # No es crítico: si no se puede guardar, la app sigue funcionando.
-            print(f"[CONFIG] No se pudo guardar la ruta: {e}")
+            print(f"[CONFIG] No se pudo guardar la configuración: {e}")
 
     # ------------------------------------------------------------------
     # Construcción de la interfaz
+    #
+    # Estructura: un encabezado fijo arriba, un Notebook con dos pestañas en
+    # medio ("Descarga y Consolidación" y "Configuración") y la barra de estado
+    # SIEMPRE visible abajo (fuera del Notebook), para que el estatus se vea sin
+    # importar en qué pestaña estés.
     # ------------------------------------------------------------------
     def _build_ui(self):
-        main = tk.Frame(self.root, bg=self.bg_color, padx=24, pady=20)
+        main = tk.Frame(self.root, bg=self.bg_color, padx=24, pady=18)
         main.pack(fill="both", expand=True)
 
+        # --- Encabezado (fijo) ---
         tk.Label(
             main, text="Validación Factura Global",
             font=("Segoe UI", 16, "bold"),
@@ -109,11 +129,44 @@ class ValidacionFacturaGUI:
             main, text="Automatización de descarga y consolidación - Transacciones desde SAP",
             font=("Segoe UI", 10),
             bg=self.bg_color, fg=self.secondary_color,
-        ).pack(pady=(0, 16))
+        ).pack(pady=(0, 14))
+
+        # --- Notebook con las dos pestañas ---
+        style = ttk.Style()
+        try:
+            style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
+                            padding=(16, 8))
+        except Exception:
+            pass  # si el tema del equipo ignora el estilo, no pasa nada
+
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill="both", expand=True)
+
+        tab_descarga = tk.Frame(notebook, bg=self.bg_color)
+        tab_config   = tk.Frame(notebook, bg=self.bg_color)
+        notebook.add(tab_descarga, text="  Descarga y Consolidación  ")
+        notebook.add(tab_config,   text="  Configuración  ")
+
+        self._build_tab_descarga(tab_descarga)
+        self._build_tab_config(tab_config)
+
+        # --- Barra de estado (fija, debajo del Notebook) ---
+        self.status_var = tk.StringVar(value="✓ Listo para comenzar")
+        tk.Label(
+            main, textvariable=self.status_var, font=("Segoe UI", 10),
+            bg=self.bg_color, fg="#666666",
+        ).pack(pady=(12, 0))
+
+    # ------------------------------------------------------------------
+    # Pestaña 1: Descarga y Consolidación (modo, fechas, nombres, botones)
+    # ------------------------------------------------------------------
+    def _build_tab_descarga(self, parent):
+        cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
+        cont.pack(fill="both", expand=True)
 
         # --- Selector de modo ---
         mode_frame = tk.LabelFrame(
-            main, text="  Tipo de intervalo  ",
+            cont, text="  Tipo de intervalo  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
             bd=1, relief=tk.SOLID, padx=15, pady=10,
@@ -129,7 +182,7 @@ class ValidacionFacturaGUI:
             ).pack(side=tk.LEFT, padx=(0, 16))
 
         # --- Contenedor de fechas (alterna single/range) ---
-        self.date_container = tk.Frame(main, bg=self.bg_color)
+        self.date_container = tk.Frame(cont, bg=self.bg_color)
         self.date_container.pack(fill="x", pady=(0, 12))
 
         hoy = datetime.now().strftime("%d.%m.%Y")
@@ -189,9 +242,53 @@ class ValidacionFacturaGUI:
         for var in (self.date_single_var, self.date_from_var, self.date_to_var):
             var.trace_add("write", lambda *_: self._update_filename_preview())
 
+        # --- Info de salida (SÓLO los nombres; la ruta vive en Configuración) ---
+        info_frame = tk.Frame(cont, bg=self.light_gray, bd=1, relief=tk.SOLID)
+        info_frame.pack(fill="x", pady=(0, 14))
+
+        self.filename_var = tk.StringVar()
+        tk.Label(
+            info_frame, textvariable=self.filename_var,
+            font=("Segoe UI", 9, "bold"),
+            bg=self.light_gray, fg=self.primary_color, anchor="w", justify="left",
+            wraplength=500,
+        ).pack(fill="x", padx=12, pady=10)
+
+        # --- Botones de acción: descargar y consolidar (separados) ---
+        btn_frame = tk.Frame(cont, bg=self.bg_color)
+        btn_frame.pack(fill="x", pady=(4, 0))
+
+        _btn_kwargs = dict(
+            font=("Segoe UI", 11, "bold"),
+            bg=self.primary_color, fg=self.bg_color,
+            relief=tk.RAISED, bd=2, pady=12, cursor="hand2",
+            activebackground=self.secondary_color, activeforeground=self.bg_color,
+        )
+        self.download_btn = tk.Button(
+            btn_frame, text="🐓📊 Descargar Gallo + Monivoi",
+            command=self._handle_ambos, **_btn_kwargs,
+        )
+        self.download_btn.pack(fill="x")
+
+        # El botón de consolidación va en verde para distinguir "traer datos"
+        # (azul) de "procesar datos" (verde).
+        _btn_consolidar_kwargs = dict(_btn_kwargs, bg=self.success_color)
+        self.consolidar_btn = tk.Button(
+            btn_frame, text="🧩 Consolidar...!",
+            command=self._handle_consolidar, **_btn_consolidar_kwargs,
+        )
+        self.consolidar_btn.pack(fill="x", pady=(10, 0))
+
+    # ------------------------------------------------------------------
+    # Pestaña 2: Configuración (sociedad + carpetas de descarga/consolidación)
+    # ------------------------------------------------------------------
+    def _build_tab_config(self, parent):
+        cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
+        cont.pack(fill="both", expand=True)
+
         # --- Parámetros (sociedad) ---
         param_frame = tk.LabelFrame(
-            main, text="  Parámetros  ",
+            cont, text="  Parámetros  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
             bd=1, relief=tk.SOLID, padx=15, pady=15,
@@ -212,7 +309,7 @@ class ValidacionFacturaGUI:
 
         # --- Carpeta de descarga (editable por el stakeholder) ---
         path_frame = tk.LabelFrame(
-            main, text="  Carpeta de descarga  ",
+            cont, text="  Carpeta de descarga  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
             bd=1, relief=tk.SOLID, padx=15, pady=12,
@@ -232,58 +329,53 @@ class ValidacionFacturaGUI:
             cursor="hand2", padx=12, command=self._elegir_carpeta,
         ).pack(side=tk.LEFT)
 
-        # --- Info de salida (nombre + ruta) ---
-        info_frame = tk.Frame(main, bg=self.light_gray, bd=1, relief=tk.SOLID)
-        info_frame.pack(fill="x", pady=(0, 14))
-
-        self.filename_var = tk.StringVar()
-        tk.Label(
-            info_frame, textvariable=self.filename_var,
-            font=("Segoe UI", 9, "bold"),
-            bg=self.light_gray, fg=self.primary_color, anchor="w", justify="left",
-            wraplength=500,
-        ).pack(fill="x", padx=12, pady=(10, 2))
-        tk.Label(
-            info_frame, textvariable=self.path_var, font=("Segoe UI", 8),
-            bg=self.light_gray, fg="#666666", anchor="w", justify="left",
-            wraplength=500,
-        ).pack(fill="x", padx=12, pady=(0, 10))
-
-        # --- Botón único de descarga (Gallo + Monivoi en secuencia) ---
-        btn_frame = tk.Frame(main, bg=self.bg_color)
-        btn_frame.pack(fill="x", pady=(0, 14))
-
-        _btn_kwargs = dict(
-            font=("Segoe UI", 11, "bold"),
-            bg=self.primary_color, fg=self.bg_color,
-            relief=tk.RAISED, bd=2, pady=12, cursor="hand2",
-            activebackground=self.secondary_color, activeforeground=self.bg_color,
+        # --- Carpeta de consolidación (dónde se guarda el Excel consolidado) ---
+        # Igual que la de descarga: se puede escribir a mano o elegir con
+        # "Examinar...". El botón va en verde para amarrarlo visualmente con el
+        # botón de consolidar.
+        cons_path_frame = tk.LabelFrame(
+            cont, text="  Carpeta de consolidación  ",
+            font=("Segoe UI", 10, "bold"),
+            bg=self.bg_color, fg=self.primary_color,
+            bd=1, relief=tk.SOLID, padx=15, pady=12,
         )
-        self.download_btn = tk.Button(
-            btn_frame, text="🐓📊 Descargar Gallo + Monivoi",
-            command=self._handle_ambos, **_btn_kwargs,
-        )
-        self.download_btn.pack(side=tk.LEFT, expand=True, fill="x")
+        cons_path_frame.pack(fill="x", pady=(0, 12))
 
-        # --- Barra de estado ---
-        self.status_var = tk.StringVar(value="✓ Listo para comenzar")
-        tk.Label(
-            main, textvariable=self.status_var, font=("Segoe UI", 10),
-            bg=self.bg_color, fg="#666666",
-        ).pack()
+        tk.Entry(
+            cons_path_frame, textvariable=self.consolidacion_path_var,
+            font=("Segoe UI", 9), bg=self.light_gray, fg=self.primary_color,
+            relief=tk.FLAT, bd=1, highlightthickness=1,
+            highlightbackground=self.border_color, highlightcolor=self.primary_color,
+        ).pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 8), ipady=4)
+
+        tk.Button(
+            cons_path_frame, text="Examinar...", font=("Segoe UI", 9, "bold"),
+            bg=self.success_color, fg=self.bg_color, relief=tk.FLAT,
+            cursor="hand2", padx=12, command=self._elegir_carpeta_consolidacion,
+        ).pack(side=tk.LEFT)
 
     # ------------------------------------------------------------------
     # Selección de carpeta de descarga
     # ------------------------------------------------------------------
     def _elegir_carpeta(self):
-        """Abre el explorador para que el stakeholder elija la carpeta destino."""
+        """Abre el explorador para que el stakeholder elija la carpeta de descarga."""
         carpeta = filedialog.askdirectory(
             title="Elige la carpeta donde se descargarán los archivos",
             initialdir=self.path_var.get() or os.path.expanduser("~"),
         )
         if carpeta:  # si el usuario cancela, no tocamos nada
             self.path_var.set(os.path.normpath(carpeta))
-            self._guardar_ruta()  # recuerda la elección para la próxima vez
+            self._guardar_config()  # recuerda la elección para la próxima vez
+
+    def _elegir_carpeta_consolidacion(self):
+        """Explorador para elegir dónde se guardará el Excel consolidado."""
+        carpeta = filedialog.askdirectory(
+            title="Elige la carpeta donde se guardará el Excel consolidado",
+            initialdir=self.consolidacion_path_var.get() or os.path.expanduser("~"),
+        )
+        if carpeta:
+            self.consolidacion_path_var.set(os.path.normpath(carpeta))
+            self._guardar_config()
 
     # ------------------------------------------------------------------
     # Vista previa de nombres de archivo (sin desfase para Gallo; el -1 de
@@ -369,7 +461,7 @@ class ValidacionFacturaGUI:
         )
         input_path = self.path_var.get().strip()
         os.makedirs(input_path, exist_ok=True)  # crea la carpeta si aún no existe
-        self._guardar_ruta()  # recuerda la ruta usada en esta corrida
+        self._guardar_config()  # recuerda la ruta usada en esta corrida
         cfg = {
             "mode":       mode,
             "sociedad":   self.sociedad_var.get().strip().upper() or "MX21",
@@ -383,23 +475,42 @@ class ValidacionFacturaGUI:
             cfg["date_to"]   = self.date_to_var.get().strip()
         return cfg
 
+    def get_consolidacion_path(self):
+        """Ruta donde se guardará el Excel consolidado (la crea si no existe)."""
+        ruta = self.consolidacion_path_var.get().strip()
+        os.makedirs(ruta, exist_ok=True)
+        self._guardar_config()  # recuerda la ruta usada
+        return ruta
+
     def set_status(self, message):
         self.status_var.set(message)
         self.root.update_idletasks()
 
-    # --- Estado del botón ---
+    # --- Estado de los botones ---
     def disable_buttons(self):
         self.download_btn.config(state="disabled", bg="#666666")
+        self.consolidar_btn.config(state="disabled", bg="#666666")
 
     def enable_buttons(self):
         self.download_btn.config(state="normal", bg=self.primary_color)
+        self.consolidar_btn.config(state="normal", bg=self.success_color)
 
-    # --- Handler ---
+    # --- Handlers ---
     def _handle_ambos(self):
         if not self.validate_dates():
             return
         if self.on_download_ambos:
             self.on_download_ambos()
+        else:
+            messagebox.showinfo(
+                "Info", f"Funcionalidad no conectada\n\n{self.get_config('gallo')}"
+            )
+
+    def _handle_consolidar(self):
+        if not self.validate_dates():
+            return
+        if self.on_consolidar:
+            self.on_consolidar()
         else:
             messagebox.showinfo(
                 "Info", f"Funcionalidad no conectada\n\n{self.get_config('gallo')}"

@@ -26,8 +26,11 @@ from datetime import datetime
 import openpyxl as _oxl          # asegura que PyInstaller incluya el motor de Excel
 import pandas as pd
 import win32com.client
-import win32clipboard         
+import win32clipboard
 import pywintypes
+
+import ctypes
+from ctypes import wintypes
 
 from utils import (
     nombre_archivo_dia,          nombre_archivo_rango,
@@ -89,13 +92,131 @@ def _xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True):
     if eliminar_xlsx:
         _borrar_xlsx_con_reintentos(ruta_xlsx)
 
+def _terminar_proceso(pid):
+    """Cierra por la fuerza el proceso 'pid' (Windows). True si lo logró."""
+    PROCESS_TERMINATE = 0x0001
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype  = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.argtypes      = [wintypes.HANDLE]
 
-def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=5, espera=2):
+    handle = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return bool(k32.TerminateProcess(handle, 1))
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _liberar_archivo_con_restart_manager(ruta_archivo):
+    """
+    Último recurso cuando el .xlsx queda BLOQUEADO y COM no lo pudo cerrar.
+
+    ¿Por qué? En Gallo, Excel abre el archivo exportado y a veces se queda con
+    un DIÁLOGO modal esperando un clic (el ícono parpadea en DORADO: Windows
+    diciendo "esta ventana quiere tu atención"). Un Excel en modo modal NO
+    responde a COM, pero SÍ mantiene el archivo agarrado → os.remove falla.
+
+    Este helper usa el Windows Restart Manager (la misma API del "este archivo
+    está siendo usado por: Excel"). Pregunta QUÉ procesos tienen agarrado ESTE
+    archivo en específico y cierra SÓLO los que sean EXCEL.EXE. Jamás toca SAP:
+      - si el que lo tiene es SAP (caso 'in place', como Monivoi) → no hace nada;
+      - si es un Excel standalone atorado en un diálogo (Gallo) → lo cierra.
+
+    Seguro: los datos YA están en disco (por eso el .csv se genera bien); ese
+    Excel solo MUESTRA el archivo, no tiene cambios que valga la pena guardar.
+    """
+    try:
+        rstrtmgr = ctypes.WinDLL("rstrtmgr")
+
+        class RM_UNIQUE_PROCESS(ctypes.Structure):
+            _fields_ = [("dwProcessId", wintypes.DWORD),
+                        ("ProcessStartTime", wintypes.FILETIME)]
+
+        CCH_APP = 255
+        CCH_SVC = 63
+
+        class RM_PROCESS_INFO(ctypes.Structure):
+            _fields_ = [
+                ("Process", RM_UNIQUE_PROCESS),
+                ("strAppName", wintypes.WCHAR * (CCH_APP + 1)),
+                ("strServiceShortName", wintypes.WCHAR * (CCH_SVC + 1)),
+                ("ApplicationType", ctypes.c_int),
+                ("AppStatus", wintypes.DWORD),
+                ("TSSessionId", wintypes.DWORD),
+                ("bRestartable", wintypes.BOOL),
+            ]
+
+        sesion = wintypes.DWORD(0)
+        clave  = (ctypes.c_wchar * (32 + 1))()          # CCH_RM_SESSION_KEY = 32
+        if rstrtmgr.RmStartSession(ctypes.byref(sesion), 0, clave) != 0:
+            print("[RM] No se pudo iniciar la sesión de Restart Manager.")
+            return False
+
+        liberado = False
+        try:
+            archivos = (ctypes.c_wchar_p * 1)(os.path.abspath(ruta_archivo))
+            if rstrtmgr.RmRegisterResources(
+                sesion, 1, archivos, 0, None, 0, None
+            ) != 0:
+                print("[RM] No se pudo registrar el archivo.")
+                return False
+
+            necesarios = wintypes.UINT(0)
+            cuantos    = wintypes.UINT(0)
+            razon      = wintypes.DWORD(0)
+
+            # 1er llamado: ¿cuántos procesos? (devuelve ERROR_MORE_DATA)
+            rstrtmgr.RmGetList(sesion, ctypes.byref(necesarios),
+                               ctypes.byref(cuantos), None, ctypes.byref(razon))
+
+            if necesarios.value == 0:
+                print(f"[RM] Ningún proceso tiene agarrado: {ruta_archivo}")
+                return False
+
+            cuantos = wintypes.UINT(necesarios.value)
+            infos   = (RM_PROCESS_INFO * necesarios.value)()
+            if rstrtmgr.RmGetList(sesion, ctypes.byref(necesarios),
+                                  ctypes.byref(cuantos), infos,
+                                  ctypes.byref(razon)) != 0:
+                print("[RM] No se pudo obtener la lista de procesos.")
+                return False
+
+            for i in range(cuantos.value):
+                nombre = infos[i].strAppName or "<desconocido>"
+                pid    = int(infos[i].Process.dwProcessId)
+                print(f"[RM] '{os.path.basename(ruta_archivo)}' lo tiene: "
+                      f"{nombre} (PID {pid})")
+                # SÓLO Excel; nunca SAP ni otros procesos.
+                if "excel" in nombre.lower():
+                    if _terminar_proceso(pid):
+                        print(f"[RM] Excel cerrado (PID {pid}) → archivo liberado.")
+                        liberado = True
+                    else:
+                        print(f"[RM] No se pudo cerrar el PID {pid}.")
+        finally:
+            rstrtmgr.RmEndSession(sesion)
+
+        return liberado
+
+    except Exception as e:
+        print(f"[RM] Falló el Restart Manager: {e}")
+        return False
+
+def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=10, espera=2):
     """
     Borra el .xlsx intermedio. En Windows, si Excel todavía lo tiene abierto,
     el archivo queda BLOQUEADO y os.remove falla. Por eso en cada intento
-    primero re-intentamos cerrar el workbook en Excel y luego borrar, dándole
-    tiempo a que suelte el archivo.
+    primero re-intentamos cerrar el archivo en Excel y luego borrar, dándole
+    tiempo a que lo suelte.
+
+    Ventana amplia (intentos=10) a propósito: Gallo es el reporte grande y el
+    primero de la corrida, así que arranca Excel "en frío" y puede tardar varios
+    segundos en terminar de abrir el archivo; hasta que no lo abre del todo, no
+    lo podemos cerrar. Sale en cuanto logra borrar, así que en el caso normal es
+    rápido.
     """
     for intento in range(1, intentos + 1):
         _cerrar_excel_workbook(ruta_xlsx)        # reintenta cerrarlo en Excel
@@ -106,48 +227,201 @@ def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=5, espera=2):
             return True
         except OSError as e:
             print(f"[XLSX] Aún bloqueado (intento {intento}/{intentos}): {e}")
+
+            # Si COM no lo suelta (típico de Gallo: Excel atorado en un diálogo
+            # DORADO que COM no puede cerrar), escalamos al Restart Manager para
+            # cerrar SÓLO ese Excel y liberar el archivo. Lo hacemos a la mitad
+            # de los intentos, no en el primero, por si se libera solo.
+            if intento == max(1, intentos // 2):
+                _liberar_archivo_con_restart_manager(ruta_xlsx)
+
             time.sleep(espera)
 
+    # Si llegamos aquí, no se pudo borrar: volcamos qué tiene Excel abierto.
     print(f"[XLSX] ⚠️ No se pudo borrar (sigue abierto/bloqueado): {ruta_xlsx}")
+    _diagnostico_excel(ruta_xlsx)
     return False
 
 
-def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=2):
+def _instancias_excel_abiertas():
     """
-    Cierra (sin guardar) el workbook que SAP/Excel deja abierto tras la
-    exportación, para que el archivo no quede abierto ni ocupando memoria.
-    Reintenta un par de veces por si Excel aún no terminaba de abrirlo.
-    Falla en silencio si Excel no está corriendo.
+    Devuelve TODAS las instancias de Excel abiertas en el equipo, no sólo la
+    primera. Esto es CLAVE para el bug de "el .xlsx se queda abierto y no se
+    puede borrar": cuando SAP exporta, abre el archivo en Excel, y muchas veces
+    lo hace en una instancia DISTINTA a la que el usuario ya tenía abierta.
+    win32com.GetObject(Class="Excel.Application") sólo alcanza UNA instancia, así
+    que si el libro está en otra, nunca lo cerramos.
+
+    Para verlas todas escaneamos la Running Object Table (ROT) de Windows: ahí
+    cada libro abierto aparece registrado por su ruta; de cada libro tomamos su
+    .Application y las juntamos sin repetir (usando el Hwnd como identidad).
+
+    Degrada con elegancia: si el escaneo de la ROT falla por lo que sea, al menos
+    devuelve la instancia principal vía GetObject.
     """
-    ruta_abs = os.path.abspath(ruta_archivo)
-    for _ in range(intentos):
-        try:
-            excel = win32com.client.GetObject(Class="Excel.Application")
-        except Exception:
-            return  # no hay Excel abierto → nada que cerrar
-        cerrado = False
-        try:
-            excel.DisplayAlerts = False
-        except Exception:
-            pass
-        try:
-            for wb in list(excel.Workbooks):
-                try:
-                    if os.path.abspath(wb.FullName) == ruta_abs:
-                        wb.Close(SaveChanges=False)
-                        cerrado = True
-                        print(f"[EXCEL] Workbook cerrado: {ruta_archivo}")
-                        break
-                except Exception:
-                    continue
-        finally:
+    instancias = {}
+
+    # 1) Vía ROT: descubre TODAS las instancias a partir de los libros abiertos.
+    try:
+        import pythoncom
+        rot = pythoncom.GetRunningObjectTable()
+        ctx = pythoncom.CreateBindCtx(0)
+        for moniker in rot.EnumRunning():
             try:
-                excel.DisplayAlerts = True
+                nombre = moniker.GetDisplayName(ctx, None)
+            except Exception:
+                continue
+            if not nombre:
+                continue
+            # Los libros abiertos se registran por su ruta de archivo.
+            if not nombre.lower().endswith((".xls", ".xlsx", ".xlsm", ".xlsb", ".csv")):
+                continue
+            try:
+                obj = rot.GetObject(moniker)
+                wb  = win32com.client.Dispatch(obj)
+                app = wb.Application
+                instancias[int(app.Hwnd)] = app
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2) Fallback / complemento: la instancia principal registrada.
+    try:
+        app = win32com.client.GetObject(Class="Excel.Application")
+        instancias[int(app.Hwnd)] = app
+    except Exception:
+        pass
+
+    return list(instancias.values())
+
+
+def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
+    """
+    Cierra (sin guardar) el archivo que SAP/Excel deja abierto tras la
+    exportación, para que no quede bloqueado (si sigue abierto, Windows no deja
+    borrar el .xlsx temporal).
+
+    Barre TODAS las instancias de Excel (ver _instancias_excel_abiertas), no sólo
+    una, porque SAP suele abrir el archivo en una instancia aparte. En cada
+    instancia busca el archivo en DOS lugares:
+      A) Los libros normales (colección Workbooks), calzando por RUTA COMPLETA y,
+         si falla, por NOMBRE de archivo (SAP a veces reporta la ruta con otra
+         forma: mayúsculas, ruta corta 8.3, etc.).
+      B) Las ventanas en VISTA PROTEGIDA (ProtectedViewWindows). ¡Esto es clave
+         para Gallo! Excel abre en "Vista protegida" los archivos recién
+         exportados/grandes, y esas ventanas NO aparecen en Workbooks, así que
+         antes ni las tocábamos y el archivo quedaba bloqueado.
+
+    Si tras cerrar una instancia queda SIN libros ni vistas protegidas, la cierra
+    para no dejar una ventana vacía. NUNCA cierra una instancia que todavía tenga
+    otros libros del usuario.
+
+    Reintenta unas veces por si Excel aún no terminaba de abrir el archivo (Gallo,
+    al ser el reporte grande y el primero, arranca Excel "en frío" y tarda más).
+    Devuelve True si logró cerrar algo que calzaba; False si no encontró nada.
+    """
+    ruta_abs      = os.path.normcase(os.path.abspath(ruta_archivo))
+    objetivo_base = os.path.normcase(os.path.basename(ruta_archivo))
+
+    for _ in range(intentos):
+        instancias = _instancias_excel_abiertas()
+        if not instancias:
+            return False  # no hay Excel abierto → nada que cerrar
+
+        cerrado = False
+        for excel in instancias:
+            try:
+                excel.DisplayAlerts = False
             except Exception:
                 pass
+
+            try:
+                # === A) Libros normales ===
+                for wb in list(excel.Workbooks):
+                    try:
+                        calza = (
+                            os.path.normcase(os.path.abspath(wb.FullName)) == ruta_abs
+                            or os.path.normcase(str(wb.Name)) == objetivo_base
+                        )
+                        if calza:
+                            wb.Close(SaveChanges=False)
+                            cerrado = True
+                            print(f"[EXCEL] Workbook cerrado: {ruta_archivo}")
+                    except Exception:
+                        continue
+
+                # === B) Ventanas en Vista Protegida (no están en Workbooks) ===
+                try:
+                    for pvw in list(excel.ProtectedViewWindows):
+                        try:
+                            info = ""
+                            for prop in ("SourceName", "Caption"):
+                                try:
+                                    info += os.path.normcase(str(getattr(pvw, prop)))
+                                except Exception:
+                                    pass
+                            if objetivo_base in info:
+                                pvw.Close()
+                                cerrado = True
+                                print(f"[EXCEL] Vista protegida cerrada: {ruta_archivo}")
+                        except Exception:
+                            continue
+                except Exception:
+                    pass  # la instancia puede no exponer ProtectedViewWindows
+
+                # === Si la instancia quedó totalmente vacía, ciérrala ===
+                try:
+                    sin_libros = int(excel.Workbooks.Count) == 0
+                    sin_vista_prot = True
+                    try:
+                        sin_vista_prot = int(excel.ProtectedViewWindows.Count) == 0
+                    except Exception:
+                        pass
+                    if sin_libros and sin_vista_prot:
+                        excel.Quit()
+                        print("[EXCEL] Instancia de Excel cerrada (sin libros abiertos)")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    excel.DisplayAlerts = True
+                except Exception:
+                    pass
+
         if cerrado:
-            return
+            return True
         time.sleep(espera)  # tal vez aún no terminaba de abrir; reintenta
+
+    return False
+
+
+def _diagnostico_excel(ruta_archivo):
+    """
+    Vuelca en consola QUÉ tiene Excel abierto cuando no se pudo cerrar/borrar el
+    archivo. Sirve para depurar en el equipo del usuario sin adivinar: dice
+    cuántas instancias hay y, en cada una, qué libros y qué vistas protegidas
+    tiene. Si algún día Gallo vuelve a no cerrarse, este log es la pista.
+    """
+    try:
+        instancias = _instancias_excel_abiertas()
+        print(
+            f"[EXCEL][DIAG] No se pudo cerrar '{os.path.basename(ruta_archivo)}'. "
+            f"Instancias de Excel detectadas: {len(instancias)}"
+        )
+        for i, excel in enumerate(instancias, 1):
+            try:
+                libros = [str(wb.Name) for wb in list(excel.Workbooks)]
+            except Exception as e:
+                libros = [f"<error al listar: {e}>"]
+            vistas = []
+            try:
+                vistas = [str(p.Caption) for p in list(excel.ProtectedViewWindows)]
+            except Exception:
+                pass
+            print(f"[EXCEL][DIAG]   Instancia {i}: libros={libros} vista_protegida={vistas}")
+    except Exception as e:
+        print(f"[EXCEL][DIAG] Falló el diagnóstico: {e}")
 
 
 def _verificar_sin_partidas(session, ruta_archivo):
@@ -358,18 +632,23 @@ def Gallo_FAGLL03(
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = _nombre_xlsx
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(_nombre_xlsx)
         session.findById("wnd[1]/tbar[0]/btn[11]").press()
+        time.sleep(3)  # deja que SAP termine de ESCRIBIR el archivo
 
-        # === Cerrar el Excel que SAP abre tras exportar ===
-        time.sleep(3)
+        # === PRIMERO salir de la lista en SAP → suelta el .xlsx ===
+        # Si SAP muestra el resultado con "Excel in place", es SAP quien tiene
+        # el archivo agarrado (no un Excel que podamos cerrar por COM). Al
+        # regresar a la pantalla inicial, SAP suelta ese Excel incrustado y el
+        # archivo queda libre para convertir/borrar.
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        time.sleep(2)
+
+        # === LUEGO cerrar cualquier Excel normal que haya quedado abierto ===
         _cerrar_excel_workbook(_ruta_xlsx)
 
         # === Convertir el .xlsx temporal a .csv (consistencia de formato) ===
         if _exportar_a_csv:
             _xlsx_a_csv(_ruta_xlsx, ruta_completa)
-
-        # === Regresar a la pantalla inicial ===
-        session.findById("wnd[0]/tbar[0]/btn[3]").press()
-        session.findById("wnd[0]/tbar[0]/btn[3]").press()
 
         print(f"[GALLO] Archivo descargado correctamente: {ruta_completa}")
         return True

@@ -1,5 +1,6 @@
 src/__pycache__/
 src/Input/
+src/Output/
 src/ValidacionFacturaGlobal.spec
 src/build/
 src/dist/

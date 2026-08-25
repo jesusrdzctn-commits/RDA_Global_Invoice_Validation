@@ -80,6 +80,8 @@ def check_source_files():
         "interfaz_GUI.py",
         "controller.py",
         "Descargas_SAP.py",
+        "Consolidacion.py",
+        "utils.py",
     ]
 
     print("🔍 Verificando archivos fuente...")

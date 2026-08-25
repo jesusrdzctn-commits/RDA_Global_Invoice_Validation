@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, timedelta
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 import pandas as pd
 
@@ -9,6 +9,7 @@ from Descargas_SAP import (
     Gallo_FAGLL03,   nombre_archivo_dia,          nombre_archivo_rango,
     Monivoi_ZLMXCOM, nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
 )
+from Consolidacion import consolidar_gallo_monivoi
 
 
 class ValidacionFacturaController:
@@ -37,6 +38,8 @@ class ValidacionFacturaController:
 
         # Un solo botón dispara AMBAS transacciones en secuencia.
         self.gui.on_download_ambos = self.execute_download_ambos
+        # Botón aparte para consolidar los CSV ya descargados.
+        self.gui.on_consolidar = self.execute_consolidacion
 
     # =================================================================
     # ENTRADA ÚNICA: corre Gallo y luego Monivoi, con un solo resumen
@@ -108,6 +111,111 @@ class ValidacionFacturaController:
             self.gui.enable_buttons()
             if "completada" not in self.gui.status_var.get():
                 self.gui.set_status("✓ Listo para comenzar")
+
+    # =================================================================
+    # CONSOLIDACIÓN: junta los CSV descargados en un solo Excel
+    # =================================================================
+    def execute_consolidacion(self):
+        """
+        Toma los CSV de Gallo y Monivoi (según las fechas de la GUI) y genera
+        el Excel consolidado con la pestaña 'Validación - Doc.'.
+        Si algún CSV no está donde se espera, ofrece elegirlo manualmente.
+        """
+        if not self.gui.validate_dates():
+            return
+
+        cfg_gallo   = self.gui.get_config("gallo")
+        cfg_monivoi = self.gui.get_config("monivoi")
+        input_path  = cfg_gallo["input_path"]
+
+        # --- Localizar archivos: automático por fechas, respaldo manual ---
+        ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
+        if not ruta_gallo:
+            return
+        ruta_monivoi = self._localizar_archivo(input_path, cfg_monivoi["filename"], "Monivoi")
+        if not ruta_monivoi:
+            return
+
+        # --- Salida: carpeta de consolidación elegida por el usuario en la GUI ---
+        try:
+            ruta_output = self.gui.get_consolidacion_path()
+        except OSError as e:
+            messagebox.showerror(
+                "Error", f"No se pudo usar la carpeta de consolidación:\n{e}"
+            )
+            return
+        nombre_salida = f"Consolidado_{os.path.splitext(cfg_gallo['filename'])[0]}.xlsx"
+
+        confirm = messagebox.askyesno(
+            "Confirmar consolidación",
+            f"¿Consolidar estos archivos en un solo Excel?\n\n"
+            f"  🐓 Gallo   : {os.path.basename(ruta_gallo)}\n"
+            f"  📊 Monivoi : {os.path.basename(ruta_monivoi)}\n\n"
+            f"Se generará:\n  {nombre_salida}\n\n"
+            f"En la carpeta:\n  {ruta_output}"
+        )
+        if not confirm:
+            return
+
+        self.gui.disable_buttons()
+        try:
+            resumen = consolidar_gallo_monivoi(
+                ruta_gallo, ruta_monivoi, ruta_output,
+                nombre_salida=nombre_salida,
+                callback_status=self.gui.set_status,
+            )
+
+            nota_monivoi = (
+                "\n⚠️ El archivo de Monivoi venía sin datos; su pestaña quedó vacía."
+                if resumen["monivoi_sin_datos"] else ""
+            )
+            self.gui.set_status("✅ ¡Consolidación completada!")
+            messagebox.showinfo(
+                "Consolidación completada",
+                f"Archivo generado:\n{resumen['ruta']}\n\n"
+                f"  • Filas Gallo              : {resumen['filas_gallo']:,}\n"
+                f"  • Filas Monivoi            : {resumen['filas_monivoi']:,}\n"
+                f"  • Referencias únicas       : {resumen['refs_unicas']:,}\n"
+                f"  • Docs 'MX Commercial'     : {resumen['filas_catalogo']:,}\n"
+                f"  • Globales (filtro final)  : {resumen['filas_globales']:,}"
+                f"{nota_monivoi}"
+            )
+        except (FileNotFoundError, ValueError) as e:
+            self.gui.set_status("❌ Error en la consolidación")
+            messagebox.showerror("Error en la consolidación", str(e))
+        except Exception as e:
+            self.gui.set_status("❌ Error en la consolidación")
+            messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
+        finally:
+            self.gui.enable_buttons()
+            if "completada" not in self.gui.status_var.get():
+                self.gui.set_status("✓ Listo para comenzar")
+
+    def _localizar_archivo(self, input_path, filename, etiqueta):
+        """
+        Busca el CSV con el nombre esperado (según fechas de la GUI). Si no
+        está, pregunta si se quiere elegir manualmente con el explorador.
+        Devuelve la ruta encontrada/elegida, o None para cancelar.
+        """
+        ruta = os.path.join(input_path, filename)
+        if os.path.exists(ruta):
+            return ruta
+
+        buscar = messagebox.askyesno(
+            f"Archivo de {etiqueta} no encontrado",
+            f"No encontré el archivo esperado:\n\n  {filename}\n\n"
+            f"en la carpeta:\n  {input_path}\n\n"
+            f"¿Quieres seleccionarlo manualmente?"
+        )
+        if not buscar:
+            return None
+
+        ruta_manual = filedialog.askopenfilename(
+            title=f"Selecciona el CSV de {etiqueta}",
+            initialdir=input_path,
+            filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
+        )
+        return ruta_manual or None
 
     # =================================================================
     # NÚCLEOS DE DESCARGA (sin confirm ni popup: sólo ejecutan)
