@@ -177,7 +177,8 @@ class ValidacionFacturaController:
                 f"  • Filas Monivoi            : {resumen['filas_monivoi']:,}\n"
                 f"  • Referencias únicas       : {resumen['refs_unicas']:,}\n"
                 f"  • Docs 'MX Commercial'     : {resumen['filas_catalogo']:,}\n"
-                f"  • Globales (filtro final)  : {resumen['filas_globales']:,}"
+                f"  • Globales (filtro final)  : {resumen['filas_globales']:,}\n"
+                f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}"
                 f"{nota_monivoi}"
             )
         except (FileNotFoundError, ValueError) as e:
