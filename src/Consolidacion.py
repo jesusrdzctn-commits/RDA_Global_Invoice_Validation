@@ -3,13 +3,16 @@ Validación Factura Global — Consolidación
 ==========================================
 
 Toma los CSV descargados de SAP ('Gallo' FAGLL03 y 'Monivoi' ZLMXCOM) y arma
-UN solo Excel con cuatro pestañas:
+UN solo Excel con seis pestañas:
 
     1) 'Gallo'            → el CSV de Gallo + 3 columnas nuevas (K, L, M)
     2) 'Monivoi'          → el CSV de Monivoi tal cual
     3) 'Validación - Doc.'→ catálogo construido a partir de la Gallo
     4) 'TD'               → matrices (Tabla Dinámica) de suma de importe por
                             cedis × clase de documento (Facturas y Notas de Crédito)
+    5) 'Venta DSD'        → matriz fecha × suma de importe, clases C1/C2/C5/C6/X0
+                            y clase en blanco
+    6) 'Venta EIAP'       → matriz fecha × suma de importe, clase RV
 
 Pasos que replica (los mismos que se harían a mano en Excel):
 
@@ -32,31 +35,58 @@ Pasos que replica (los mismos que se harían a mano en Excel):
        filtra Referencia 3=='Global'), pero NO el bloque G-H del Paso 9.
 
 Matriz 'TD' (Tabla Dinámica):
-    - Subconjunto base: Referencia 3=='Global' y Asignación != 'MX Commercial'.
-    - Filas: TODOS los Centros ('cedis') únicos de la Gallo (no sólo los del
-      subconjunto base), ordenados; un cedis sin actividad calificada sale en 0.
+    - Subconjunto base (Facturas y Notas): Referencia 3=='Global' y
+      Asignación != 'MX Commercial'.
+    - Filas: CADA matriz trae su PROPIA lista de cedis, derivada de SUS propios
+      filtros (incluida su clase de documento) y ordenada. Sin recorte de rango:
+      entra todo cedis que cumpla, no sólo 80AB..80VW. Por eso los tres bloques
+      pueden mostrar distintos cedis y distinto número de filas.
     - Facturas: encabezados B5='C1', C5='C5'; cedis desde A6 hacia abajo.
     - Notas de Crédito: encabezados M5='C2', N5='C6'; cedis desde L6 hacia abajo.
     - Cada celda del cuerpo = suma de 'Importe en moneda local' de los documentos
-      de ese cedis y esa clase (dentro del subconjunto base).
+      de ese cedis y esa clase.
     - Columna 'Grand Total' a la derecha de cada bloque (D en Facturas, O en
       Notas) = suma de las dos clases por cedis. Fila 'Grand Total' al final =
       suma por columna; la celda de cruce es el gran total del bloque.
     - Etiquetas de análisis para el stakeholder: 'Monitor', 'Contabilidad' y
       'Diferencias' en D1:D3 (Facturas) y O1:O3 (Notas). Sólo rótulos.
-    - Tercera matriz 'PEP VOUCHERS' (columnas V/W): filtro Referencia 3=='Global',
-      Referencia 2=='PP' y Clase de documento=='C2'. Suma de importe por cedis,
-      encabezado 'C2' en W5, con su fila 'Grand Total'. NO excluye 'MX Commercial'.
+    - Tercera matriz 'PEP VOUCHERS' (columnas W/X): filtro Referencia 3=='Global',
+      Referencia 2=='PP' y Clase de documento=='C2'. Cedis en W (desde W6),
+      encabezado 'C2' en X5, con su fila 'Grand Total'. NO excluye 'MX Commercial'.
+
+Pestañas 'Venta DSD' y 'Venta EIAP' (dos columnas: fecha e importe):
+    - DOS filtros, ambos obligatorios: 'Clase de documento' Y 'Cuenta'. A
+      diferencia de 'TD', NO exigen Referencia 3=='Global' ni excluyen
+      'MX Commercial'; suman toda la hoja Gallo que cumpla ambos filtros.
+          Venta DSD  → clase C1, C2, C5, C6, X0 o en blanco
+                       Y cuenta 4000010 / 4000005
+          Venta EIAP → clase RV
+                       Y cuenta 4000010 / 4000020 / 4000802 / 4300013
+    - Col. A: la fecha. Una fila por día, agrupando por la columna
+      'Fe.contabilización' de la Gallo (el export trae 'dd/mm/aaaa hh:mm': la
+      hora se recorta, sólo se agrupa por día). Las fechas que el usuario
+      seleccionó en la GUI SIEMPRE aparecen, aunque ese día no traiga
+      importes (0.00).
+    - Col. B: suma de 'Importe en moneda local' de ese día.
+    - Si hay filas con la fecha vacía, se muestran en un renglón 'Sin fecha'
+      para que el 'Grand Total' siempre cuadre con el filtro (no se pierde
+      dinero por el camino).
+    - Si el CSV trae fechas FUERA de las seleccionadas, igual se muestran (son
+      datos reales) y se reportan en el resumen para que el stakeholder lo vea.
 
 NOTA: los cruces de los pasos 7 y 8 se calculan en Python y se pegan como
-VALORES (no fórmulas vivas), para que el archivo abra rápido y sin #N/A. La
-matriz 'TD' también se pega como valores numéricos ya sumados.
+VALORES (no fórmulas vivas), para que el archivo abra rápido y sin #N/A. Las
+matrices 'TD', 'Venta DSD' y 'Venta EIAP' también se pegan como valores
+numéricos ya sumados.
 
 Este módulo NO depende de SAP ni de tkinter: se puede probar solo con
 `python Consolidacion.py` teniendo dos CSV a la mano.
 """
 
 import os
+import re
+import unicodedata
+from datetime import datetime
 
 import pandas as pd
 from openpyxl.styles import Font
@@ -97,18 +127,75 @@ TD_NOTAS = {
 TD_LABELS_ANALISIS = [(1, "Monitor"), (2, "Contabilidad"), (3, "Diferencias")]
 
 # Tercera matriz: PEP vouchers. Filtro: Referencia 3=='Global',
-# Referencia 2=='PP' y Clase de documento=='C2'. Una sola columna de valor (W),
-# con las filas de cedis en V. No excluye 'MX Commercial' (sólo esos 3 filtros).
+# Referencia 2=='PP' y Clase de documento=='C2'. Una sola columna de valor (X),
+# con las filas de cedis en W. No excluye 'MX Commercial' (sólo esos 3 filtros).
 TD_PEP = {
     "titulo": "PEP VOUCHERS",
-    "col_cedis": 22,           # V
-    "col_valor": 23,           # W
-    "encabezado_valor": "C2",  # clase del filtro (va en W5)
+    "col_cedis": 23,           # W
+    "col_valor": 24,           # X
+    "encabezado_valor": "C2",  # clase del filtro (va en X5)
 }
 TD_PEP_REFERENCIA2 = "PP"
 TD_PEP_CLASE = "C2"
 
 TD_FORMATO_NUMERO = "#,##0.00"
+
+# --- Pestañas 'Venta DSD' y 'Venta EIAP' ---
+# Matriz de dos columnas: fecha (A) e importe sumado (B). Se filtra por DOS
+# criterios a la vez (AND): clase de documento Y cuenta. La cadena vacía ""
+# entre las clases representa el "(blanks)" de Excel, es decir la clase vacía
+# o con puros espacios.
+HOJA_VENTA_DSD  = "Venta DSD"
+HOJA_VENTA_EIAP = "Venta EIAP"
+VENTA_CLASES_DSD  = frozenset({"C1", "C2", "C5", "C6", "X0", ""})
+VENTA_CLASES_EIAP = frozenset({"RV"})
+# Cuentas de mayor. Se comparan NORMALIZADAS (sin ceros a la izquierda y sin
+# el '.0' que a veces deja la conversión xlsx→csv), así que da igual si SAP
+# las exporta como '4000010', '0004000010' o '4000010.0'.
+VENTA_CUENTAS_DSD  = frozenset({"4000010", "4000005"})
+VENTA_CUENTAS_EIAP = frozenset({"4000010", "4000020", "4000802", "4300013"})
+
+VENTA_COL_FECHA_CANDIDATAS = (
+    "Fe.contabilización",
+    "Fecha contabilización",
+    "Fecha de contabilización",
+    "Fecha contab.",
+)
+VENTA_COL_CUENTA_CANDIDATAS = (
+    "Cuentas",
+    "Cuenta",
+    "Cuenta de mayor",
+    "Cuenta contable",
+    "Cta.mayor",
+    "Nº cuenta",
+    "No. cuenta",
+)
+VENTA_ENCABEZADO_FECHA   = "Fecha"
+VENTA_ENCABEZADO_IMPORTE = "Importe en moneda local"
+VENTA_ETIQUETA_SIN_FECHA = "Sin fecha"
+VENTA_ETIQUETA_TOTAL     = "Grand Total"
+VENTA_FORMATO_FECHA_EXCEL = "DD.MM.YYYY"
+
+# Formatos de fecha que puede traer el export de SAP. Se prueban primero los de
+# año de 4 dígitos; los de 2 dígitos son el último recurso. La ambigüedad real
+# (p. ej. 01/09/2026 = 1-sep o 9-ene) se resuelve contra las fechas que el
+# usuario seleccionó en la GUI; si no se puede resolver, truena con un mensaje
+# claro en vez de adivinar.
+VENTA_FORMATOS_FECHA_4D = (
+    "%d.%m.%Y", "%m.%d.%Y",
+    "%d/%m/%Y", "%m/%d/%Y",
+    "%Y-%m-%d", "%Y/%m/%d",
+    "%d-%m-%Y", "%m-%d-%Y",
+)
+VENTA_FORMATOS_FECHA_2D = ("%d.%m.%y", "%m.%d.%y", "%d/%m/%y", "%m/%d/%y")
+VENTA_ANIO_MIN = 1990
+VENTA_ANIO_MAX = 2100
+
+# El export de Gallo trae la fecha como 'dd/mm/aaaa hh:mm'. Este patrón se queda
+# sólo con la parte de FECHA (grupo 1) y descarta lo que venga después de un
+# espacio o de una 'T'. No intenta interpretar el orden día/mes: de eso se
+# encarga _detectar_formato_fecha.
+_RE_SOLO_FECHA = re.compile(r"^(\d{1,4}[./\-]\d{1,2}[./\-]\d{1,4})(?:[ T].*)?$")
 
 
 # ----------------------------------------------------------------------
@@ -174,6 +261,92 @@ def _col_por_nombre(df, nombre):
         f"No encontré la columna '{nombre}' en el archivo de Gallo. "
         f"Columnas disponibles: {list(df.columns)}"
     )
+
+
+def _normalizar_encabezado(texto):
+    """
+    Normaliza un encabezado para compararlo sin acentos, puntos, espacios ni
+    mayúsculas: 'Fe.Contabilización' y 'fecha contabilizacion' se vuelven
+    comparables. Sólo se usa para reconocer VARIANTES DE ESCRITURA del mismo
+    campo, nunca para adivinar una columna distinta.
+    """
+    sin_acentos = unicodedata.normalize("NFKD", str(texto))
+    sin_acentos = "".join(c for c in sin_acentos if not unicodedata.combining(c))
+    return "".join(c for c in sin_acentos.lower() if c.isalnum())
+
+
+def _col_por_candidatos(df, candidatos, descripcion):
+    """
+    Resuelve una columna aceptando varias formas de escribir el MISMO campo
+    ('Fe.contabilización' / 'Fecha contabilización', 'Cuentas' / 'Cuenta de
+    mayor'). La comparación ignora acentos, puntos, espacios y mayúsculas.
+
+    Si no está ninguna, truena con un mensaje accionable que lista las columnas
+    reales: preferimos parar a filtrar/agrupar por una columna equivocada.
+    """
+    normalizadas = {_normalizar_encabezado(c): c for c in df.columns}
+    for candidata in candidatos:
+        real = normalizadas.get(_normalizar_encabezado(candidata))
+        if real is not None:
+            return real
+    raise ValueError(
+        f"No encontré la columna de {descripcion} en el archivo de Gallo "
+        f"(busqué: {', '.join(candidatos)}). "
+        f"Columnas disponibles: {list(df.columns)}"
+    )
+
+
+def _col_fecha_contabilizacion(df):
+    """Columna de fecha de contabilización de la Gallo ('Fe.contabilización')."""
+    return _col_por_candidatos(
+        df, VENTA_COL_FECHA_CANDIDATAS, "fecha de contabilización"
+    )
+
+
+def _col_cuenta(df):
+    """Columna de cuenta de mayor de la Gallo ('Cuentas')."""
+    return _col_por_candidatos(df, VENTA_COL_CUENTA_CANDIDATAS, "cuenta")
+
+
+def _normalizar_cuenta(valor):
+    """
+    Normaliza una cuenta de mayor para compararla sin sorpresas de formato:
+
+        ' 0004000010 ' -> '4000010'
+        '4000010.0'    -> '4000010'   (la conversión xlsx→csv la volvió float)
+        '4000010'      -> '4000010'
+
+    Sólo se quitan ceros a la IZQUIERDA y el '.0' decimal; nunca dígitos
+    significativos. Un valor no numérico se devuelve tal cual (en mayúsculas),
+    para que una cuenta con letras siga siendo comparable.
+    """
+    texto = str(valor).strip().upper().replace(" ", "")
+    if not texto:
+        return ""
+    # '4000010.0' / '4000010.00' → '4000010' (sólo si los decimales son ceros)
+    if re.fullmatch(r"\d+\.0*", texto):
+        texto = texto.split(".", 1)[0]
+    if texto.isdigit():
+        return texto.lstrip("0") or "0"
+    return texto
+
+
+def _solo_fecha(valor):
+    """
+    Recorta la hora de un valor de fecha: el export de Gallo trae
+    'dd/mm/aaaa hh:mm' y para agrupar por día la hora estorba.
+
+        '01/09/2026 14:35' -> '01/09/2026'
+        '2026-09-01T00:00' -> '2026-09-01'
+        '01.09.2026'       -> '01.09.2026'
+
+    Si el valor no empieza con algo que parezca fecha, se devuelve tal cual
+    (ya recortado) para que el detector de formato truene mostrando el valor
+    REAL en vez de uno mutilado por este helper.
+    """
+    texto = str(valor).strip()
+    coincidencia = _RE_SOLO_FECHA.match(texto)
+    return coincidencia.group(1) if coincidencia else texto
 
 
 def _clasificar_tipo(referencia2):
@@ -247,6 +420,114 @@ def _parse_importe_us(valor):
 
 
 # ----------------------------------------------------------------------
+# Fechas de las pestañas 'Venta ...'
+# ----------------------------------------------------------------------
+def _parsear_fechas_seleccionadas(fechas):
+    """
+    Valida y normaliza las fechas que el usuario eligió en la GUI
+    ('DD.MM.YYYY') a objetos date, sin duplicados y en orden cronológico.
+
+    Devuelve [] si no se recibió ninguna (el módulo sigue siendo usable solo).
+    """
+    if not fechas:
+        return []
+    if isinstance(fechas, str):
+        fechas = [fechas]
+
+    convertidas = []
+    for texto in fechas:
+        try:
+            convertidas.append(datetime.strptime(str(texto).strip(), "%d.%m.%Y").date())
+        except ValueError:
+            raise ValueError(
+                f"La fecha seleccionada '{texto}' no tiene el formato "
+                f"esperado 'DD.MM.YYYY'."
+            )
+    return sorted(set(convertidas))
+
+
+def _intentar_formato(valores, formato):
+    """
+    Devuelve la lista de dates si TODOS los valores parsean con ese formato y
+    caen en un año razonable; None si alguno falla.
+
+    El chequeo de año no es cosmético: strptime acepta '26' para %Y y devolvería
+    el año 26 d.C., lo que haría pasar por bueno un formato equivocado.
+    """
+    convertidas = []
+    for valor in valores:
+        try:
+            fecha = datetime.strptime(valor, formato).date()
+        except ValueError:
+            return None
+        if not (VENTA_ANIO_MIN <= fecha.year <= VENTA_ANIO_MAX):
+            return None
+        convertidas.append(fecha)
+    return convertidas
+
+
+def _detectar_formato_fecha(valores, fechas_referencia=()):
+    """
+    Detecta con qué formato viene la columna de fecha del CSV de Gallo.
+
+    Regla: se prueban los formatos de año de 4 dígitos y, sólo si ninguno
+    sirve, los de 2 dígitos. Si varios formatos parsean TODO:
+      - si todos dan el MISMO resultado, la ambigüedad da igual → se usa el 1º;
+      - si dan resultados distintos, se desempata con las fechas que el usuario
+        seleccionó (gana el formato que deja más fechas dentro de la selección);
+      - si sigue habiendo empate, se lanza ValueError. Nunca se adivina: un
+        01/09/2026 mal interpretado movería el importe de día sin avisar.
+
+    Devuelve el formato (str) o None si no hay ningún valor que parsear.
+    """
+    valores = [v for v in valores if v]
+    if not valores:
+        return None
+
+    referencia = set(fechas_referencia or ())
+
+    for tanda in (VENTA_FORMATOS_FECHA_4D, VENTA_FORMATOS_FECHA_2D):
+        viables = []
+        for formato in tanda:
+            convertidas = _intentar_formato(valores, formato)
+            if convertidas is not None:
+                viables.append((formato, convertidas))
+
+        if not viables:
+            continue
+        if len(viables) == 1:
+            return viables[0][0]
+
+        primera = viables[0][1]
+        if all(convertidas == primera for _, convertidas in viables[1:]):
+            return viables[0][0]   # mismo resultado: la ambigüedad es inocua
+
+        if referencia:
+            puntajes = [
+                (sum(1 for f in convertidas if f in referencia), formato)
+                for formato, convertidas in viables
+            ]
+            mejor = max(puntaje for puntaje, _ in puntajes)
+            ganadores = [formato for puntaje, formato in puntajes if puntaje == mejor]
+            if mejor > 0 and len(ganadores) == 1:
+                return ganadores[0]
+
+        raise ValueError(
+            "No pude determinar sin ambigüedad el formato de la columna de "
+            "fecha de contabilización de Gallo "
+            f"(ejemplo: '{valores[0]}'; candidatos: "
+            f"{', '.join(formato for formato, _ in viables)}). "
+            "Revisa el formato de fecha del export de SAP."
+        )
+
+    raise ValueError(
+        "No pude interpretar la columna de fecha de contabilización de Gallo "
+        f"(ejemplo: '{valores[0]}'). Formatos soportados: "
+        f"{', '.join(VENTA_FORMATOS_FECHA_4D + VENTA_FORMATOS_FECHA_2D)}."
+    )
+
+
+# ----------------------------------------------------------------------
 # Proceso principal
 # ----------------------------------------------------------------------
 def consolidar_gallo_monivoi(
@@ -255,9 +536,11 @@ def consolidar_gallo_monivoi(
     ruta_output,
     nombre_salida=None,
     callback_status=None,
+    fechas_seleccionadas=None,
 ):
     """
-    Ejecuta la consolidación completa (pasos 1 a 9 + reclasificación + matriz TD).
+    Ejecuta la consolidación completa (pasos 1 a 9 + reclasificación + matriz TD
+    + pestañas 'Venta DSD' y 'Venta EIAP').
 
     Args:
         ruta_gallo   (str): Ruta al CSV descargado de Gallo (FAGLL03).
@@ -266,18 +549,28 @@ def consolidar_gallo_monivoi(
         nombre_salida (str|None): Nombre del .xlsx final. Si None →
             'Consolidado_<nombre del CSV de Gallo>.xlsx'.
         callback_status (function|None): Para reportar avance a la GUI.
+        fechas_seleccionadas (list[str]|None): Fechas 'DD.MM.YYYY' que el
+            usuario eligió en la GUI (una en modo día, todas las del rango en
+            modo rango). Garantizan que esos días aparezcan en 'Venta DSD' y
+            'Venta EIAP' aunque no traigan importes, y desempatan el formato de
+            fecha del CSV. Si es None, las filas salen sólo de los datos.
 
     Returns:
         dict: resumen del proceso →
             ruta, filas_gallo, filas_monivoi, refs_unicas,
             filas_catalogo, filas_globales, monivoi_sin_datos,
-            filas_reclasificadas, cedis_matriz, total_facturas, total_notas,
-            total_pep, total_importe_gallo
+            filas_reclasificadas, cedis_facturas, cedis_notas, cedis_pep,
+            total_facturas, total_notas, total_pep, total_importe_gallo,
+            total_venta_dsd, total_venta_eiap, venta_avisos
     """
 
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
+
+    # Se valida ANTES de leer nada: si la GUI manda una fecha con formato raro,
+    # es mejor enterarse en el primer segundo que después de procesar 1M filas.
+    fechas_sel = _parsear_fechas_seleccionadas(fechas_seleccionadas)
 
     # === Paso 1: leer ambos archivos ==================================
     update_status("📄 Leyendo archivo de Gallo...")
@@ -298,11 +591,13 @@ def consolidar_gallo_monivoi(
     col_asig   = _col(gallo, "Asignación",   3, "D")
     col_doc    = _col(gallo, "Nº documento", 4, "E")
 
-    # Columnas que necesita la matriz 'TD'. Se resuelven ESTRICTAMENTE por
+    # Columnas que necesitan las matrices. Se resuelven ESTRICTAMENTE por
     # nombre (su posición en el export no es fija) y fallan pronto con un
     # error claro si no están, antes de procesar nada.
     col_clase   = _col_por_nombre(gallo, "Clase de documento")
     col_importe = _col_por_nombre(gallo, "Importe en moneda local")
+    col_fecha   = _col_fecha_contabilizacion(gallo)
+    col_cuenta  = _col_cuenta(gallo)
 
     # === Paso 2: 'Referencia 2' = primeros 2 caracteres de 'Referencia'
     # Se agrega AL FINAL de la tabla; con el layout estándar (A-J) eso la
@@ -372,12 +667,23 @@ def consolidar_gallo_monivoi(
     filas_reclasificadas = int(mascara_reclasificar.sum())
     gallo.loc[mascara_reclasificar, "Referencia 3"] = "Individual"
 
+    # === Importe: UNA sola pasada de parseo para todas las matrices =====
+    # Son ~1.15M filas en un rango de 3 días: parsear dos veces la misma
+    # columna sería tirar tiempo, y además garantiza que 'TD' y las pestañas
+    # 'Venta ...' vean exactamente los mismos números.
+    update_status("🔢 Convirtiendo 'Importe en moneda local' a número...")
+    importe_num = gallo[col_importe].map(_parse_importe_us)
+
     # === Matriz 'TD': suma de importe por cedis × clase de documento ===
     update_status("📊 Construyendo matriz 'TD'...")
-    td_resumen = _preparar_matriz_td(gallo, col_centro, col_asig, col_clase, col_importe)
+    td_resumen = _preparar_matriz_td(gallo, col_centro, col_asig, col_clase, importe_num)
+    total_importe_gallo = td_resumen["total_importe_gallo"]
 
-    # Suma total de TODA la columna 'Importe en moneda local' (para el popup).
-    total_importe_gallo = round(float(gallo[col_importe].map(_parse_importe_us).sum()), 2)
+    # === Matrices 'Venta DSD' y 'Venta EIAP': suma por fecha ===========
+    update_status("📆 Construyendo 'Venta DSD' y 'Venta EIAP'...")
+    ventas = _preparar_ventas(
+        gallo, col_clase, col_cuenta, col_fecha, importe_num, fechas_sel
+    )
 
     # === Exportar el Excel consolidado =================================
     update_status("💾 Guardando Excel consolidado...")
@@ -433,6 +739,10 @@ def consolidar_gallo_monivoi(
         ws_td = writer.book.create_sheet(HOJA_TD)
         _escribir_matriz_td(ws_td, td_resumen)
 
+        # --- Pestañas 'Venta DSD' y 'Venta EIAP' ---
+        for nombre_hoja, clave in ((HOJA_VENTA_DSD, "dsd"), (HOJA_VENTA_EIAP, "eiap")):
+            _escribir_hoja_venta(writer.book.create_sheet(nombre_hoja), ventas[clave])
+
     update_status("✅ Consolidación completada")
 
     return {
@@ -444,100 +754,116 @@ def consolidar_gallo_monivoi(
         "filas_globales":       len(globales),
         "monivoi_sin_datos":    monivoi_sin_datos,
         "filas_reclasificadas": filas_reclasificadas,
-        "cedis_matriz":         len(td_resumen["cedis"]),
+        "cedis_facturas":       len(td_resumen["facturas"]["cedis"]),
+        "cedis_notas":          len(td_resumen["notas"]["cedis"]),
+        "cedis_pep":            len(td_resumen["pep"]["cedis"]),
         "total_facturas":       td_resumen["total_facturas"],
         "total_notas":          td_resumen["total_notas"],
         "total_pep":            td_resumen["total_pep"],
         "total_importe_gallo":  total_importe_gallo,
+        "total_venta_dsd":      ventas["dsd"]["total"],
+        "total_venta_eiap":     ventas["eiap"]["total"],
+        "venta_avisos":         ventas["avisos"],
     }
 
 
 # ----------------------------------------------------------------------
 # Matriz 'TD' — cálculo y escritura
 # ----------------------------------------------------------------------
-def _preparar_matriz_td(gallo, col_centro, col_asig, col_clase, col_importe):
+def _preparar_matriz_td(gallo, col_centro, col_asig, col_clase, importe_num):
     """
     Build the aggregated data for the 'TD' sheet.
 
-    Base subset (step II of the spec): Referencia 3 == 'Global' AND
-    Asignación != 'MX Commercial'. Within that subset we sum
-    'Importe en moneda local' grouped by (Centro, Clase de documento).
+    IMPORTANT: every matrix derives its OWN cedis list from its OWN filters
+    (document class included), so the three blocks can list different centros
+    and have different row counts. There is no 80AB..80VW range clipping: any
+    centro that satisfies a matrix's filters becomes a row of that matrix.
 
-    Returns a dict:
-        - 'cedis'  : sorted list of unique non-empty Centro values in the subset
-                     (shared row labels for BOTH matrices)
-        - 'suma'   : dict {(centro, clase_upper): importe_sumado}
-        - 'total_facturas' / 'total_notas': control totals for the summary
+        Facturas     → Referencia 3=='Global' & Asignación != 'MX Commercial'
+                       & Clase de documento in {C1, C5}
+        Notas        → same base, Clase de documento in {C2, C6}
+        PEP vouchers → Referencia 3=='Global' & Referencia 2=='PP'
+                       & Clase de documento=='C2'   (MX Commercial NOT excluded)
+
+    Args:
+        importe_num (pd.Series): 'Importe en moneda local' ALREADY parsed to
+            float by the caller (single pass shared with the 'Venta ...' sheets).
+
+    Returns a dict with one entry per block ('facturas', 'notas', 'pep'), each
+    holding its own 'cedis' list and 'suma' lookup, plus the control totals and
+    the grand total of the whole 'Importe en moneda local' column.
     """
-    # Row labels: ALL unique non-empty centros in the WHOLE Gallo (not only the
-    # filtered subset), sorted. A cedis with no qualifying activity still shows
-    # up as a row and simply displays zeros. Shared by the three matrices.
-    todos_centros = gallo[col_centro].astype(str).str.strip()
-    cedis = sorted(c for c in todos_centros.unique() if c != "")
+    # Normalize once.
+    centro_norm = gallo[col_centro].astype(str).str.strip()
+    clase_norm  = gallo[col_clase].astype(str).str.strip().str.upper()
+    ref2_norm   = gallo["Referencia 2"].astype(str).str.strip().str.upper()
+    asig_norm   = gallo[col_asig].astype(str).str.strip()
+    es_global   = gallo["Referencia 3"] == "Global"
+    con_centro  = centro_norm != ""
 
-    # --- Facturas / Notas subset: Referencia 3=='Global' & Asignación != MX ---
-    mascara_td = (
-        (gallo["Referencia 3"] == "Global")
-        & (gallo[col_asig].astype(str).str.strip() != VALOR_ASIGNACION)
-    )
-    td = gallo.loc[mascara_td, [col_centro, col_clase, col_importe]].copy()
-    td["_centro"]  = td[col_centro].astype(str).str.strip()
-    td["_clase"]   = td[col_clase].astype(str).str.strip().str.upper()
-    td["_importe"] = td[col_importe].map(_parse_importe_us)
-    td = td[td["_centro"] != ""]
+    # Base subset shared by Facturas and Notas (each adds its own class filter).
+    base = es_global & (asig_norm != VALOR_ASIGNACION) & con_centro
 
-    # (centro, clase) -> summed amount. Round to cents so no float noise
-    # (e.g. -265.44000000000005) leaks into the cells or the control totals.
-    if td.empty:
-        suma = {}
-    else:
-        serie = td.groupby(["_centro", "_clase"])["_importe"].sum()
-        suma = {clave: round(float(valor), 2) for clave, valor in serie.items()}
+    def _bloque(mascara, clases):
+        """Cedis list + {(centro, clase): importe} for one two-class block."""
+        m = mascara & clase_norm.isin({clase for clase, _ in clases})
+        cedis = sorted(centro_norm[m].unique())
+        if not m.any():
+            return {"cedis": cedis, "suma": {}}
+        datos = pd.DataFrame({
+            "_centro":  centro_norm[m],
+            "_clase":   clase_norm[m],
+            "_importe": importe_num[m],
+        })
+        serie = datos.groupby(["_centro", "_clase"])["_importe"].sum()
+        # Round to cents so no float noise (e.g. -265.44000000000005) leaks
+        # into the cells or the control totals.
+        return {"cedis": cedis,
+                "suma": {k: round(float(v), 2) for k, v in serie.items()}}
 
-    clases_facturas = {clase for clase, _ in TD_FACTURAS["clases"]}
-    clases_notas    = {clase for clase, _ in TD_NOTAS["clases"]}
-    total_facturas  = sum(v for (_, clase), v in suma.items() if clase in clases_facturas)
-    total_notas     = sum(v for (_, clase), v in suma.items() if clase in clases_notas)
+    facturas = _bloque(base, TD_FACTURAS["clases"])
+    notas    = _bloque(base, TD_NOTAS["clases"])
 
-    # --- PEP vouchers subset: Referencia 3=='Global' & Referencia 2=='PP' &
-    #     Clase de documento=='C2'. (No excluye 'MX Commercial': el stakeholder
-    #     pidió sólo esos tres filtros.) Suma de importe por cedis. ---
-    ref2       = gallo["Referencia 2"].astype(str).str.strip().str.upper()
-    clase_norm = gallo[col_clase].astype(str).str.strip().str.upper()
+    # PEP vouchers: its own filter, and it does NOT exclude 'MX Commercial'
+    # (el stakeholder pidió sólo esos tres filtros).
     mascara_pep = (
-        (gallo["Referencia 3"] == "Global")
-        & (ref2 == TD_PEP_REFERENCIA2)
+        es_global
+        & con_centro
+        & (ref2_norm == TD_PEP_REFERENCIA2)
         & (clase_norm == TD_PEP_CLASE)
     )
-    pep = gallo.loc[mascara_pep, [col_centro, col_importe]].copy()
-    pep["_centro"]  = pep[col_centro].astype(str).str.strip()
-    pep["_importe"] = pep[col_importe].map(_parse_importe_us)
-    pep = pep[pep["_centro"] != ""]
-    if pep.empty:
-        suma_pep = {}
+    cedis_pep = sorted(centro_norm[mascara_pep].unique())
+    if mascara_pep.any():
+        datos_pep = pd.DataFrame({
+            "_centro":  centro_norm[mascara_pep],
+            "_importe": importe_num[mascara_pep],
+        })
+        serie_pep = datos_pep.groupby("_centro")["_importe"].sum()
+        suma_pep  = {c: round(float(v), 2) for c, v in serie_pep.items()}
     else:
-        serie_pep = pep.groupby("_centro")["_importe"].sum()
-        suma_pep = {c: round(float(v), 2) for c, v in serie_pep.items()}
+        suma_pep = {}
 
     return {
-        "cedis":          cedis,
-        "suma":           suma,
-        "suma_pep":       suma_pep,
-        "total_facturas": round(float(total_facturas), 2),
-        "total_notas":    round(float(total_notas), 2),
-        "total_pep":      round(float(sum(suma_pep.values())), 2),
+        "facturas":            facturas,
+        "notas":               notas,
+        "pep":                 {"cedis": cedis_pep, "suma": suma_pep},
+        "total_facturas":      round(float(sum(facturas["suma"].values())), 2),
+        "total_notas":         round(float(sum(notas["suma"].values())), 2),
+        "total_pep":           round(float(sum(suma_pep.values())), 2),
+        "total_importe_gallo": round(float(importe_num.sum()), 2),
     }
 
 
 def _escribir_matriz_td(ws_td, td_resumen):
     """
-    Write the two matrices onto the 'TD' worksheet.
+    Write the three matrices onto the 'TD' worksheet.
 
     Layout (rows 1-3 = stakeholder labels, row 4 = block title, row 5 = headers,
     row 6+ = data, and a 'Grand Total' row right below the last cedis):
 
         Facturas         → A: cedis, B: sum(C1), C: sum(C5), D: Grand Total (B+C)
         Notas de Crédito → L: cedis, M: sum(C2), N: sum(C6), O: Grand Total (M+N)
+        PEP vouchers     → W: cedis, X: sum(C2 con Referencia 2 == 'PP')
 
     Extras:
         - 'Grand Total' column per block (D / O): per-row sum of its two classes.
@@ -546,19 +872,20 @@ def _escribir_matriz_td(ws_td, td_resumen):
         - Analysis labels 'Monitor' / 'Contabilidad' / 'Diferencias' in D1:D3 and
           O1:O3 for the stakeholder's later work (labels only, no values).
 
-    Both blocks share the SAME sorted cedis list, so a given row is the same
-    centro on the left and the right. Body cells are real numbers (values, not
-    formulas) with a thousands/2-decimals number format.
+    Each block owns its cedis list (derived from its OWN filters), so the blocks
+    can differ in which centros they show and in how many rows they have — every
+    block therefore computes its own 'Grand Total' row position. Body cells are
+    real numbers (values, not formulas) with a thousands/2-decimals format.
     """
-    cedis = td_resumen["cedis"]
-    suma  = td_resumen["suma"]
-    n_cedis = len(cedis)
-    fila_total = TD_FILA_INICIO + n_cedis   # row right below the last cedis
-
-    for bloque in (TD_FACTURAS, TD_NOTAS):
-        col_cedis = bloque["col_cedis"]
-        col_gt    = bloque["col_grand_total"]
-        clases    = bloque["clases"]
+    for bloque, datos in ((TD_FACTURAS, td_resumen["facturas"]),
+                          (TD_NOTAS,    td_resumen["notas"])):
+        cedis      = datos["cedis"]
+        suma       = datos["suma"]
+        n_cedis    = len(cedis)
+        fila_total = TD_FILA_INICIO + n_cedis   # row right below the last cedis
+        col_cedis  = bloque["col_cedis"]
+        col_gt     = bloque["col_grand_total"]
+        clases     = bloque["clases"]
 
         # Analysis labels for the stakeholder (rows 1-3, in the Grand Total col).
         for fila, texto in TD_LABELS_ANALISIS:
@@ -601,10 +928,12 @@ def _escribir_matriz_td(ws_td, td_resumen):
             celda_gt.number_format = TD_FORMATO_NUMERO
             celda_gt.font = Font(bold=True)
 
-    # --- Third matrix: PEP vouchers (single value column, keyed by centro) ---
-    col_cedis_pep = TD_PEP["col_cedis"]
-    col_valor_pep = TD_PEP["col_valor"]
-    suma_pep = td_resumen["suma_pep"]
+    # --- Third matrix: PEP vouchers (its own cedis, single value column) ---
+    cedis_pep      = td_resumen["pep"]["cedis"]
+    suma_pep       = td_resumen["pep"]["suma"]
+    col_cedis_pep  = TD_PEP["col_cedis"]
+    col_valor_pep  = TD_PEP["col_valor"]
+    fila_total_pep = TD_FILA_INICIO + len(cedis_pep)
 
     ws_td.cell(row=4, column=col_cedis_pep, value=TD_PEP["titulo"]).font = Font(bold=True)
     ws_td.cell(row=TD_FILA_ENCABEZADO, column=col_cedis_pep, value="Centro").font = Font(bold=True)
@@ -612,24 +941,182 @@ def _escribir_matriz_td(ws_td, td_resumen):
                value=TD_PEP["encabezado_valor"]).font = Font(bold=True)
 
     total_pep = 0.0
-    for i, centro in enumerate(cedis):
+    for i, centro in enumerate(cedis_pep):
         fila = TD_FILA_INICIO + i
         ws_td.cell(row=fila, column=col_cedis_pep, value=centro)
         valor = round(suma_pep.get(centro, 0.0), 2)
         ws_td.cell(row=fila, column=col_valor_pep, value=valor).number_format = TD_FORMATO_NUMERO
         total_pep += valor
-    if n_cedis > 0:
-        ws_td.cell(row=fila_total, column=col_cedis_pep, value="Grand Total").font = Font(bold=True)
-        celda_pep = ws_td.cell(row=fila_total, column=col_valor_pep, value=round(total_pep, 2))
+    if cedis_pep:
+        ws_td.cell(row=fila_total_pep, column=col_cedis_pep, value="Grand Total").font = Font(bold=True)
+        celda_pep = ws_td.cell(row=fila_total_pep, column=col_valor_pep, value=round(total_pep, 2))
         celda_pep.number_format = TD_FORMATO_NUMERO
         celda_pep.font = Font(bold=True)
 
-    # Comfortable widths (incl. the Grand Total columns D/O and the PEP V/W).
+    # Comfortable widths (incl. the Grand Total columns D/O and the PEP W/X).
     anchos = {"A": 12, "B": 16, "C": 16, "D": 16,
               "L": 12, "M": 16, "N": 16, "O": 16,
-              "V": 12, "W": 16}
+              "W": 12, "X": 16}
     for letra, ancho in anchos.items():
         ws_td.column_dimensions[letra].width = ancho
+
+
+# ----------------------------------------------------------------------
+# Pestañas 'Venta DSD' / 'Venta EIAP' — cálculo y escritura
+# ----------------------------------------------------------------------
+def _preparar_ventas(gallo, col_clase, col_cuenta, col_fecha, importe_num, fechas_sel):
+    """
+    Build the two date × amount matrices ('Venta DSD' and 'Venta EIAP').
+
+    TWO filters, both required (AND): 'Clase de documento' and 'Cuenta'
+    (stakeholder's call). Unlike the 'TD' sheet, these blocks do NOT require
+    Referencia 3=='Global' and do NOT exclude 'MX Commercial'.
+
+        Venta DSD  → clase in {C1, C2, C5, C6, X0} or blank,
+                     AND cuenta in {4000010, 4000005}
+        Venta EIAP → clase == RV,
+                     AND cuenta in {4000010, 4000020, 4000802, 4300013}
+
+    Accounts are compared normalized (no leading zeros, no trailing '.0'), so
+    the export's number formatting cannot silently empty the sheet.
+
+    Rows are the union of (a) the dates the user selected in the GUI — always
+    present, 0.00 when the day has no matching rows — and (b) the dates actually
+    found in 'Fe.contabilización', so nothing that exists in the data is
+    silently dropped. That column ships as 'dd/mm/aaaa hh:mm': the time is
+    trimmed, so all the movements of one day land on one row. Rows with an empty
+    date are kept apart under a 'Sin fecha' label so the block's 'Grand Total'
+    always reconciles with the filters.
+
+    Args:
+        importe_num (pd.Series): amounts already parsed to float.
+        fechas_sel (list[date]): GUI-selected dates, already validated.
+
+    Returns:
+        dict: {'dsd': bloque, 'eiap': bloque, 'avisos': [str]} where each bloque
+        is {'filas': [(date, float)], 'sin_fecha_n': int,
+            'sin_fecha_importe': float, 'total': float, 'fuera_rango': [date]}.
+    """
+    clase_norm  = gallo[col_clase].astype(str).str.strip().str.upper()
+    cuenta_norm = gallo[col_cuenta].map(_normalizar_cuenta)
+    # Trim the time BEFORE detecting the format: '01/09/2026 14:35' is a day.
+    fecha_raw   = gallo[col_fecha].map(_solo_fecha)
+
+    # Detect the date format ONCE, over the distinct values of the whole column.
+    distintas = sorted({valor for valor in fecha_raw.unique() if valor})
+    formato = _detectar_formato_fecha(distintas, fechas_sel)
+    mapa_fechas = (
+        {valor: datetime.strptime(valor, formato).date() for valor in distintas}
+        if formato else {}
+    )
+    # Blank dates map to None so they can be reported instead of vanishing.
+    fecha_norm = fecha_raw.map(lambda valor: mapa_fechas.get(valor))
+
+    cuentas_presentes = set(cuenta_norm.unique())
+    seleccionadas = set(fechas_sel)
+    avisos = []
+    bloques = {}
+
+    for clave, (etiqueta, clases, cuentas) in (
+        ("dsd",  ("Venta DSD",  VENTA_CLASES_DSD,  VENTA_CUENTAS_DSD)),
+        ("eiap", ("Venta EIAP", VENTA_CLASES_EIAP, VENTA_CUENTAS_EIAP)),
+    ):
+        cuentas_buscadas = {_normalizar_cuenta(c) for c in cuentas}
+        mascara = clase_norm.isin(clases) & cuenta_norm.isin(cuentas_buscadas)
+
+        # Una cuenta pedida que NO existe en el archivo casi siempre significa
+        # que ese día no tuvo movimientos... o que el layout de SAP cambió.
+        # Vale más avisarlo que entregar una matriz vacía sin explicación.
+        faltantes = sorted(c for c in cuentas_buscadas if c not in cuentas_presentes)
+        if faltantes:
+            avisos.append(
+                f"{etiqueta}: la(s) cuenta(s) {', '.join(faltantes)} no "
+                f"aparece(n) en el archivo de Gallo."
+            )
+
+        datos = pd.DataFrame({
+            "_fecha":   fecha_norm[mascara],
+            "_importe": importe_num[mascara],
+        })
+
+        sin_fecha = datos["_fecha"].isna()
+        sin_fecha_n = int(sin_fecha.sum())
+        sin_fecha_importe = round(float(datos.loc[sin_fecha, "_importe"].sum()), 2)
+
+        con_fecha = datos.loc[~sin_fecha]
+        if con_fecha.empty:
+            suma = {}
+        else:
+            serie = con_fecha.groupby("_fecha")["_importe"].sum()
+            suma = {fecha: round(float(valor), 2) for fecha, valor in serie.items()}
+
+        # Selected days always show up (0.00 if empty); data-only days too.
+        filas = [(fecha, suma.get(fecha, 0.0))
+                 for fecha in sorted(set(suma) | seleccionadas)]
+        fuera_rango = sorted(f for f in suma if seleccionadas and f not in seleccionadas)
+
+        total = round(sum(valor for _, valor in filas) + sin_fecha_importe, 2)
+
+        if sin_fecha_n:
+            avisos.append(
+                f"{etiqueta}: {sin_fecha_n:,} fila(s) sin fecha de contabilización "
+                f"(se muestran como '{VENTA_ETIQUETA_SIN_FECHA}')."
+            )
+        if fuera_rango:
+            listado = ", ".join(f.strftime("%d.%m.%Y") for f in fuera_rango[:5])
+            extra = "..." if len(fuera_rango) > 5 else ""
+            avisos.append(
+                f"{etiqueta}: hay fechas fuera de las seleccionadas "
+                f"({listado}{extra}); se incluyeron de todas formas."
+            )
+
+        bloques[clave] = {
+            "filas":             filas,
+            "sin_fecha_n":       sin_fecha_n,
+            "sin_fecha_importe": sin_fecha_importe,
+            "total":             total,
+            "fuera_rango":       fuera_rango,
+        }
+
+    bloques["avisos"] = avisos
+    return bloques
+
+
+def _escribir_hoja_venta(ws, bloque):
+    """
+    Write one 'Venta ...' sheet: column A = date, column B = summed amount.
+
+    Row 1 = headers, row 2+ = one row per day, then (only if it exists) a
+    'Sin fecha' row, and finally a bold 'Grand Total' row. Dates are written as
+    REAL dates formatted DD.MM.YYYY, so the stakeholder can sort and filter them
+    as dates; amounts are values (not formulas) with 2 decimals.
+    """
+    ws.cell(row=1, column=1, value=VENTA_ENCABEZADO_FECHA).font = Font(bold=True)
+    ws.cell(row=1, column=2, value=VENTA_ENCABEZADO_IMPORTE).font = Font(bold=True)
+
+    fila = 2
+    for fecha, valor in bloque["filas"]:
+        celda_fecha = ws.cell(row=fila, column=1, value=fecha)
+        celda_fecha.number_format = VENTA_FORMATO_FECHA_EXCEL
+        ws.cell(row=fila, column=2, value=valor).number_format = TD_FORMATO_NUMERO
+        fila += 1
+
+    # Rows whose date was blank: shown apart so the total still reconciles.
+    if bloque["sin_fecha_n"]:
+        ws.cell(row=fila, column=1, value=VENTA_ETIQUETA_SIN_FECHA).font = Font(italic=True)
+        celda = ws.cell(row=fila, column=2, value=bloque["sin_fecha_importe"])
+        celda.number_format = TD_FORMATO_NUMERO
+        celda.font = Font(italic=True)
+        fila += 1
+
+    if fila > 2:   # there is at least one data row
+        ws.cell(row=fila, column=1, value=VENTA_ETIQUETA_TOTAL).font = Font(bold=True)
+        celda_total = ws.cell(row=fila, column=2, value=bloque["total"])
+        celda_total.number_format = TD_FORMATO_NUMERO
+        celda_total.font = Font(bold=True)
+
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 24
 
 
 # ----------------------------------------------------------------------
@@ -639,12 +1126,18 @@ if __name__ == "__main__":
     print("=== Prueba de consolidación (standalone) ===")
     ruta_gallo   = input("Ruta del CSV de Gallo   : ").strip().strip('"')
     ruta_monivoi = input("Ruta del CSV de Monivoi : ").strip().strip('"')
+    fechas_txt   = input(
+        "Fechas seleccionadas 'DD.MM.YYYY' separadas por coma (Enter = ninguna): "
+    ).strip()
+    fechas = [f.strip() for f in fechas_txt.split(",") if f.strip()] or None
 
     salida = carpeta_output_desde_input(os.path.dirname(ruta_gallo))
 
     try:
         resumen = consolidar_gallo_monivoi(
-            ruta_gallo, ruta_monivoi, salida, callback_status=print
+            ruta_gallo, ruta_monivoi, salida,
+            callback_status=print,
+            fechas_seleccionadas=fechas,
         )
         print("\n🎉 CONSOLIDACIÓN COMPLETADA 🎉")
         for clave, valor in resumen.items():

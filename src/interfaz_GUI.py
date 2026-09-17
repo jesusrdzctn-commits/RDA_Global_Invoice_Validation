@@ -29,10 +29,15 @@ def _ruta_config():
 
 
 class ValidacionFacturaGUI:
+    # Design size of the window. It is the MINIMUM: if the content needs more
+    # room (display scaling, extra rows), _ajustar_alto_ventana enlarges it.
+    ANCHO_BASE = 580
+    ALTO_BASE  = 660
+
     def __init__(self, root):
         self.root = root
         self.root.title("Validación Factura Global")
-        self.root.geometry("580x660")
+        self.root.geometry(f"{self.ANCHO_BASE}x{self.ALTO_BASE}")
         self.root.resizable(False, False)
 
         # Esquema de colores
@@ -46,8 +51,10 @@ class ValidacionFacturaGUI:
         self.root.configure(bg=self.bg_color)
 
         # Callbacks que el controller conectará
-        self.on_download_ambos = None   # descarga Gallo + Monivoi desde SAP
-        self.on_consolidar     = None   # consolidación de los CSV descargados
+        self.on_download_gallo   = None   # downloads ONLY Gallo from SAP
+        self.on_download_monivoi = None   # downloads ONLY Monivoi from SAP
+        self.on_download_ambos   = None   # descarga Gallo + Monivoi desde SAP
+        self.on_consolidar       = None   # consolidación de los CSV descargados
 
         # Modo de intervalo: "single" (un día) o "range" (varios días)
         self.mode_var = tk.StringVar(value="single")
@@ -78,6 +85,7 @@ class ValidacionFacturaGUI:
         os.makedirs(ruta_input_default, exist_ok=True)  # asegura que la default exista
 
         self._build_ui()
+        self._ajustar_alto_ventana()  # keep everything visible (DPI / extra row)
         self._on_mode_change()  # muestra el frame correcto + preview inicial
 
     # ------------------------------------------------------------------
@@ -264,6 +272,32 @@ class ValidacionFacturaGUI:
             relief=tk.RAISED, bd=2, pady=12, cursor="hand2",
             activebackground=self.secondary_color, activeforeground=self.bg_color,
         )
+
+        # Row of single-transaction downloads (above the combined button).
+        # Same blue because they are the same SAP downloads, but narrower,
+        # shorter and in italics so they read as "variants" of the main one.
+        _btn_individual_kwargs = dict(
+            _btn_kwargs, font=("Segoe UI", 10, "bold italic"), pady=6,
+        )
+        fila_individual = tk.Frame(btn_frame, bg=self.bg_color)
+        fila_individual.pack(fill="x", pady=(0, 8))
+        # uniform= forces both columns to the exact same width, even though
+        # the button labels have different lengths.
+        fila_individual.columnconfigure(0, weight=1, uniform="descargas")
+        fila_individual.columnconfigure(1, weight=1, uniform="descargas")
+
+        self.download_gallo_btn = tk.Button(
+            fila_individual, text="🐓 Solo Gallo",
+            command=self._handle_gallo, **_btn_individual_kwargs,
+        )
+        self.download_gallo_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        self.download_monivoi_btn = tk.Button(
+            fila_individual, text="📊 Solo Monivoi",
+            command=self._handle_monivoi, **_btn_individual_kwargs,
+        )
+        self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
         self.download_btn = tk.Button(
             btn_frame, text="🐓📊 Descargar Gallo + Monivoi",
             command=self._handle_ambos, **_btn_kwargs,
@@ -421,6 +455,22 @@ class ValidacionFacturaGUI:
             self.range_frame.pack(fill="x")
         self._update_filename_preview()
 
+    def _ajustar_alto_ventana(self):
+        """
+        The window is fixed-size, but with display scaling (125%/150%) the
+        content can require more height than the design size and the bottom
+        buttons would be clipped. Measure with the "Varios días" frame (the
+        taller of the two) and grow ONLY when needed; never below the base
+        size. _on_mode_change() then re-shows the correct frame.
+        """
+        self.single_frame.pack_forget()
+        self.range_frame.pack(fill="x")
+        self.root.update_idletasks()
+        ancho = max(self.ANCHO_BASE, self.root.winfo_reqwidth())
+        alto  = max(self.ALTO_BASE,  self.root.winfo_reqheight())
+        self.root.geometry(f"{ancho}x{alto}")
+        self.range_frame.pack_forget()
+
     # ------------------------------------------------------------------
     # Validación y configuración
     # ------------------------------------------------------------------
@@ -487,34 +537,46 @@ class ValidacionFacturaGUI:
         self.root.update_idletasks()
 
     # --- Estado de los botones ---
+    def _botones_accion(self):
+        """(button, enabled color) for EVERY button that starts a process."""
+        return (
+            (self.download_gallo_btn,   self.primary_color),
+            (self.download_monivoi_btn, self.primary_color),
+            (self.download_btn,         self.primary_color),
+            (self.consolidar_btn,       self.success_color),
+        )
+
     def disable_buttons(self):
-        self.download_btn.config(state="disabled", bg="#666666")
-        self.consolidar_btn.config(state="disabled", bg="#666666")
+        for btn, _ in self._botones_accion():
+            btn.config(state="disabled", bg="#666666")
 
     def enable_buttons(self):
-        self.download_btn.config(state="normal", bg=self.primary_color)
-        self.consolidar_btn.config(state="normal", bg=self.success_color)
+        for btn, color in self._botones_accion():
+            btn.config(state="normal", bg=color)
 
     # --- Handlers ---
-    def _handle_ambos(self):
+    def _disparar(self, callback, transaccion="gallo"):
+        """Validate inputs and call the controller callback (or warn if unwired)."""
         if not self.validate_dates():
             return
-        if self.on_download_ambos:
-            self.on_download_ambos()
+        if callback:
+            callback()
         else:
             messagebox.showinfo(
-                "Info", f"Funcionalidad no conectada\n\n{self.get_config('gallo')}"
+                "Info", f"Funcionalidad no conectada\n\n{self.get_config(transaccion)}"
             )
 
+    def _handle_gallo(self):
+        self._disparar(self.on_download_gallo, "gallo")
+
+    def _handle_monivoi(self):
+        self._disparar(self.on_download_monivoi, "monivoi")
+
+    def _handle_ambos(self):
+        self._disparar(self.on_download_ambos, "gallo")
+
     def _handle_consolidar(self):
-        if not self.validate_dates():
-            return
-        if self.on_consolidar:
-            self.on_consolidar()
-        else:
-            messagebox.showinfo(
-                "Info", f"Funcionalidad no conectada\n\n{self.get_config('gallo')}"
-            )
+        self._disparar(self.on_consolidar, "gallo")
 
 
 def main():
