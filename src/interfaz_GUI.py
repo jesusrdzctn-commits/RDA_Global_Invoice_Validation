@@ -1,3 +1,13 @@
+"""
+Validación Factura Global — GUI (tkinter)
+=========================================
+
+Only the window: dates, folders and buttons. It knows nothing about SAP or
+pandas; the controller (controller.py) plugs the actions into the on_*
+callbacks. That keeps this file importable and testable on its own:
+`python interfaz_GUI.py` opens the window without the controller.
+"""
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
@@ -6,8 +16,8 @@ import sys
 import json
 
 
-# Helpers de nombrado compartidos. Viven en utils.py (sin dependencias de SAP
-# ni de tkinter), así la GUI se puede abrir y probar sola en cualquier equipo.
+# Shared naming helpers. They live in utils.py (no SAP or tkinter
+# dependencies), so the GUI can be opened and tested on its own on any machine.
 from utils import (
     nombre_archivo_dia,          nombre_archivo_rango,
     nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
@@ -16,14 +26,14 @@ from utils import (
 
 def _ruta_config():
     """
-    Ubicación del config.json donde recordamos la última carpeta de descarga.
-    Se guarda JUNTO al ejecutable (cuando está empaquetado con PyInstaller) o
-    junto a este .py (cuando se corre como script). Así cada equipo conserva su
-    propia ruta sin tocar el código.
+    Location of the config.json where the last folders used (download and
+    consolidation) are remembered. It is saved NEXT TO the executable (when
+    packaged with PyInstaller) or next to this .py (when run as a script).
+    This way each machine keeps its own folders without touching the code.
     """
-    if getattr(sys, "frozen", False):        # corriendo como .exe (PyInstaller)
+    if getattr(sys, "frozen", False):        # running as .exe (PyInstaller)
         base = os.path.dirname(sys.executable)
-    else:                                    # corriendo como script .py
+    else:                                    # running as a .py script
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "config.json")
 
@@ -40,7 +50,7 @@ class ValidacionFacturaGUI:
         self.root.geometry(f"{self.ANCHO_BASE}x{self.ALTO_BASE}")
         self.root.resizable(False, False)
 
-        # Esquema de colores
+        # Color scheme
         self.bg_color        = "#FFFFFF"
         self.primary_color   = "#00094F"
         self.secondary_color = "#333333"
@@ -50,20 +60,20 @@ class ValidacionFacturaGUI:
 
         self.root.configure(bg=self.bg_color)
 
-        # Callbacks que el controller conectará
+        # Callbacks the controller will wire up
         self.on_download_gallo   = None   # downloads ONLY Gallo from SAP
         self.on_download_monivoi = None   # downloads ONLY Monivoi from SAP
-        self.on_download_ambos   = None   # descarga Gallo + Monivoi desde SAP
-        self.on_consolidar       = None   # consolidación de los CSV descargados
+        self.on_download_ambos   = None   # downloads Gallo + Monivoi from SAP
+        self.on_consolidar       = None   # consolidates the downloaded CSVs
 
-        # Modo de intervalo: "single" (un día) o "range" (varios días)
+        # Interval mode: "single" (one day) or "range" (several days)
         self.mode_var = tk.StringVar(value="single")
 
-        # --- Ruta de descarga ---------------------------------------------
-        # Arranca en una ruta por defecto según el usuario del sistema, pero el
-        # stakeholder la puede cambiar (p. ej. a una carpeta de SharePoint
-        # sincronizada con OneDrive) con el botón "Examinar...". Si ya se usó
-        # una ruta antes, se recupera del config.json.
+        # --- Download folder ------------------------------------------------
+        # Starts at a default path based on the system user, but the
+        # stakeholder can change it (e.g. to a SharePoint folder synced with
+        # OneDrive) with the "Examinar..." button. If a folder was used
+        # before, it is restored from config.json.
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
         user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
@@ -73,26 +83,26 @@ class ValidacionFacturaGUI:
         ruta_input_default  = os.path.join(base_proyecto, "Input")
         ruta_output_default = os.path.join(base_proyecto, "Output")
 
-        # Ruta de descarga (dónde SAP deja los CSV) y ruta de consolidación
-        # (dónde se guarda el Excel consolidado). Ambas se recuerdan en
-        # config.json y ambas se pueden cambiar con su botón "Examinar...".
+        # Download folder (where SAP leaves the CSVs) and consolidation folder
+        # (where the consolidated workbook is saved). Both are remembered in
+        # config.json and both can be changed with their "Examinar..." button.
         self.path_var = tk.StringVar(
             value=(cfg.get("ruta_descarga") or "").strip() or ruta_input_default
         )
         self.consolidacion_path_var = tk.StringVar(
             value=(cfg.get("ruta_consolidacion") or "").strip() or ruta_output_default
         )
-        os.makedirs(ruta_input_default, exist_ok=True)  # asegura que la default exista
+        os.makedirs(ruta_input_default, exist_ok=True)  # make sure the default one exists
 
         self._build_ui()
         self._ajustar_alto_ventana()  # keep everything visible (DPI / extra row)
-        self._on_mode_change()  # muestra el frame correcto + preview inicial
+        self._on_mode_change()  # shows the right frame + the first preview
 
     # ------------------------------------------------------------------
-    # Persistencia de la última ruta usada (config.json)
+    # Persistence of the last folders used (config.json)
     # ------------------------------------------------------------------
     def _cargar_config(self):
-        """Lee el config.json completo (dict). Si no existe o falla → {}."""
+        """Read the whole config.json (dict). If it does not exist or fails → {}."""
         try:
             with open(self._config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -101,7 +111,7 @@ class ValidacionFacturaGUI:
             return {}
 
     def _guardar_config(self):
-        """Guarda ambas rutas (descarga y consolidación) en config.json."""
+        """Save both folders (download and consolidation) to config.json."""
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(
@@ -112,22 +122,22 @@ class ValidacionFacturaGUI:
                     f, ensure_ascii=False, indent=2,
                 )
         except OSError as e:
-            # No es crítico: si no se puede guardar, la app sigue funcionando.
+            # Not critical: if it cannot be saved, the app keeps working.
             print(f"[CONFIG] No se pudo guardar la configuración: {e}")
 
     # ------------------------------------------------------------------
-    # Construcción de la interfaz
+    # Building the interface
     #
-    # Estructura: un encabezado fijo arriba, un Notebook con dos pestañas en
-    # medio ("Descarga y Consolidación" y "Configuración") y la barra de estado
-    # SIEMPRE visible abajo (fuera del Notebook), para que el estatus se vea sin
-    # importar en qué pestaña estés.
+    # Structure: a fixed header on top, a Notebook with two tabs in the middle
+    # ("Descarga y Consolidación" and "Configuración") and the status bar
+    # ALWAYS visible at the bottom (outside the Notebook), so the status shows
+    # no matter which tab you are on.
     # ------------------------------------------------------------------
     def _build_ui(self):
         main = tk.Frame(self.root, bg=self.bg_color, padx=24, pady=18)
         main.pack(fill="both", expand=True)
 
-        # --- Encabezado (fijo) ---
+        # --- Header (fixed) ---
         tk.Label(
             main, text="Validación Factura Global",
             font=("Segoe UI", 16, "bold"),
@@ -139,13 +149,13 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg=self.secondary_color,
         ).pack(pady=(0, 14))
 
-        # --- Notebook con las dos pestañas ---
+        # --- Notebook with the two tabs ---
         style = ttk.Style()
         try:
             style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
                             padding=(16, 8))
         except Exception:
-            pass  # si el tema del equipo ignora el estilo, no pasa nada
+            pass  # if the machine's theme ignores the style, no harm done
 
         notebook = ttk.Notebook(main)
         notebook.pack(fill="both", expand=True)
@@ -158,7 +168,7 @@ class ValidacionFacturaGUI:
         self._build_tab_descarga(tab_descarga)
         self._build_tab_config(tab_config)
 
-        # --- Barra de estado (fija, debajo del Notebook) ---
+        # --- Status bar (fixed, below the Notebook) ---
         self.status_var = tk.StringVar(value="✓ Listo para comenzar")
         tk.Label(
             main, textvariable=self.status_var, font=("Segoe UI", 10),
@@ -166,13 +176,13 @@ class ValidacionFacturaGUI:
         ).pack(pady=(12, 0))
 
     # ------------------------------------------------------------------
-    # Pestaña 1: Descarga y Consolidación (modo, fechas, nombres, botones)
+    # Tab 1: "Descarga y Consolidación" (mode, dates, file names, buttons)
     # ------------------------------------------------------------------
     def _build_tab_descarga(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
 
-        # --- Selector de modo ---
+        # --- Mode selector ---
         mode_frame = tk.LabelFrame(
             cont, text="  Tipo de intervalo  ",
             font=("Segoe UI", 10, "bold"),
@@ -189,13 +199,13 @@ class ValidacionFacturaGUI:
                 cursor="hand2", command=self._on_mode_change,
             ).pack(side=tk.LEFT, padx=(0, 16))
 
-        # --- Contenedor de fechas (alterna single/range) ---
+        # --- Date container (switches between single/range) ---
         self.date_container = tk.Frame(cont, bg=self.bg_color)
         self.date_container.pack(fill="x", pady=(0, 12))
 
         hoy = datetime.now().strftime("%d.%m.%Y")
 
-        # Frame "un solo día"
+        # "Single day" frame
         self.single_frame = tk.LabelFrame(
             self.date_container, text="  Fecha  ",
             font=("Segoe UI", 10, "bold"),
@@ -218,7 +228,7 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg="#999999",
         ).grid(row=0, column=2, sticky="w")
 
-        # Frame "varios días"
+        # "Several days" frame
         self.range_frame = tk.LabelFrame(
             self.date_container, text="  Intervalo de Tiempo  ",
             font=("Segoe UI", 10, "bold"),
@@ -246,11 +256,11 @@ class ValidacionFacturaGUI:
                 bg=self.bg_color, fg="#999999",
             ).grid(row=row, column=2, sticky="w")
 
-        # Recalcular vista previa cuando cambie cualquier fecha
+        # Recompute the preview whenever any date changes
         for var in (self.date_single_var, self.date_from_var, self.date_to_var):
             var.trace_add("write", lambda *_: self._update_filename_preview())
 
-        # --- Info de salida (SÓLO los nombres; la ruta vive en Configuración) ---
+        # --- Output info (file names ONLY; the folder lives in the "Configuración" tab) ---
         info_frame = tk.Frame(cont, bg=self.light_gray, bd=1, relief=tk.SOLID)
         info_frame.pack(fill="x", pady=(0, 14))
 
@@ -262,7 +272,7 @@ class ValidacionFacturaGUI:
             wraplength=500,
         ).pack(fill="x", padx=12, pady=10)
 
-        # --- Botones de acción: descargar y consolidar (separados) ---
+        # --- Action buttons: download and consolidate (separate) ---
         btn_frame = tk.Frame(cont, bg=self.bg_color)
         btn_frame.pack(fill="x", pady=(4, 0))
 
@@ -304,8 +314,8 @@ class ValidacionFacturaGUI:
         )
         self.download_btn.pack(fill="x")
 
-        # El botón de consolidación va en verde para distinguir "traer datos"
-        # (azul) de "procesar datos" (verde).
+        # The consolidation button is green to tell "bring data" (blue) apart
+        # from "process data" (green).
         _btn_consolidar_kwargs = dict(_btn_kwargs, bg=self.success_color)
         self.consolidar_btn = tk.Button(
             btn_frame, text="🧩 Consolidar...!",
@@ -314,13 +324,13 @@ class ValidacionFacturaGUI:
         self.consolidar_btn.pack(fill="x", pady=(10, 0))
 
     # ------------------------------------------------------------------
-    # Pestaña 2: Configuración (sociedad + carpetas de descarga/consolidación)
+    # Tab 2: "Configuración" (company code + download/consolidation folders)
     # ------------------------------------------------------------------
     def _build_tab_config(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
 
-        # --- Parámetros (sociedad) ---
+        # --- Parameters (company code) ---
         param_frame = tk.LabelFrame(
             cont, text="  Parámetros  ",
             font=("Segoe UI", 10, "bold"),
@@ -341,7 +351,7 @@ class ValidacionFacturaGUI:
             highlightbackground=self.border_color, highlightcolor=self.primary_color,
         ).grid(row=0, column=1, padx=10, pady=6, sticky="w")
 
-        # --- Carpeta de descarga (editable por el stakeholder) ---
+        # --- Download folder (editable by the stakeholder) ---
         path_frame = tk.LabelFrame(
             cont, text="  Carpeta de descarga  ",
             font=("Segoe UI", 10, "bold"),
@@ -363,10 +373,10 @@ class ValidacionFacturaGUI:
             cursor="hand2", padx=12, command=self._elegir_carpeta,
         ).pack(side=tk.LEFT)
 
-        # --- Carpeta de consolidación (dónde se guarda el Excel consolidado) ---
-        # Igual que la de descarga: se puede escribir a mano o elegir con
-        # "Examinar...". El botón va en verde para amarrarlo visualmente con el
-        # botón de consolidar.
+        # --- Consolidation folder (where the consolidated workbook is saved) ---
+        # Same as the download one: it can be typed by hand or picked with
+        # "Examinar...". The button is green to tie it visually to the
+        # consolidate button.
         cons_path_frame = tk.LabelFrame(
             cont, text="  Carpeta de consolidación  ",
             font=("Segoe UI", 10, "bold"),
@@ -389,20 +399,20 @@ class ValidacionFacturaGUI:
         ).pack(side=tk.LEFT)
 
     # ------------------------------------------------------------------
-    # Selección de carpeta de descarga
+    # Folder selection (download and consolidation)
     # ------------------------------------------------------------------
     def _elegir_carpeta(self):
-        """Abre el explorador para que el stakeholder elija la carpeta de descarga."""
+        """Open the file browser so the stakeholder can pick the download folder."""
         carpeta = filedialog.askdirectory(
             title="Elige la carpeta donde se descargarán los archivos",
             initialdir=self.path_var.get() or os.path.expanduser("~"),
         )
-        if carpeta:  # si el usuario cancela, no tocamos nada
+        if carpeta:  # if the user cancels, nothing is touched
             self.path_var.set(os.path.normpath(carpeta))
-            self._guardar_config()  # recuerda la elección para la próxima vez
+            self._guardar_config()  # remember the choice for next time
 
     def _elegir_carpeta_consolidacion(self):
-        """Explorador para elegir dónde se guardará el Excel consolidado."""
+        """File browser to pick where the consolidated workbook will be saved."""
         carpeta = filedialog.askdirectory(
             title="Elige la carpeta donde se guardará el Excel consolidado",
             initialdir=self.consolidacion_path_var.get() or os.path.expanduser("~"),
@@ -412,8 +422,8 @@ class ValidacionFacturaGUI:
             self._guardar_config()
 
     # ------------------------------------------------------------------
-    # Vista previa de nombres de archivo (sin desfase para Gallo; el -1 de
-    # Monivoi ya viene aplicado dentro de utils.py)
+    # File-name preview. Neither name carries a date offset: Monivoi's +1 day
+    # only applies to the SAP query (utils.fecha_efectiva_monivoi)
     # ------------------------------------------------------------------
     def _preview_nombre(self):
         try:
@@ -444,7 +454,7 @@ class ValidacionFacturaGUI:
         )
 
     # ------------------------------------------------------------------
-    # Alternar modo
+    # Switch mode
     # ------------------------------------------------------------------
     def _on_mode_change(self):
         if self.mode_var.get() == "single":
@@ -472,7 +482,7 @@ class ValidacionFacturaGUI:
         self.range_frame.pack_forget()
 
     # ------------------------------------------------------------------
-    # Validación y configuración
+    # Validation and configuration
     # ------------------------------------------------------------------
     def validate_dates(self):
         try:
@@ -488,13 +498,13 @@ class ValidacionFacturaGUI:
             messagebox.showerror("Error", "Formato de fecha inválido. Use DD.MM.YYYY")
             return False
 
-        # --- Validar la carpeta de descarga ---
+        # --- Validate the download folder ---
         ruta = self.path_var.get().strip()
         if not ruta:
             messagebox.showerror("Error", "Indica una carpeta de descarga válida.")
             return False
         try:
-            os.makedirs(ruta, exist_ok=True)  # la crea si aún no existe
+            os.makedirs(ruta, exist_ok=True)  # creates it if it does not exist yet
         except OSError as e:
             messagebox.showerror(
                 "Error", f"No se pudo usar la carpeta de descarga:\n{ruta}\n\n{e}"
@@ -510,8 +520,8 @@ class ValidacionFacturaGUI:
             else self._preview_nombre()
         )
         input_path = self.path_var.get().strip()
-        os.makedirs(input_path, exist_ok=True)  # crea la carpeta si aún no existe
-        self._guardar_config()  # recuerda la ruta usada en esta corrida
+        os.makedirs(input_path, exist_ok=True)  # creates the folder if it does not exist yet
+        self._guardar_config()  # remember the folder used in this run
         cfg = {
             "mode":       mode,
             "sociedad":   self.sociedad_var.get().strip().upper() or "MX21",
@@ -526,17 +536,17 @@ class ValidacionFacturaGUI:
         return cfg
 
     def get_consolidacion_path(self):
-        """Ruta donde se guardará el Excel consolidado (la crea si no existe)."""
+        """Folder where the consolidated workbook will be saved (created if missing)."""
         ruta = self.consolidacion_path_var.get().strip()
         os.makedirs(ruta, exist_ok=True)
-        self._guardar_config()  # recuerda la ruta usada
+        self._guardar_config()  # remember the folder used
         return ruta
 
     def set_status(self, message):
         self.status_var.set(message)
         self.root.update_idletasks()
 
-    # --- Estado de los botones ---
+    # --- Button state ---
     def _botones_accion(self):
         """(button, enabled color) for EVERY button that starts a process."""
         return (
@@ -580,7 +590,7 @@ class ValidacionFacturaGUI:
 
 
 def main():
-    # Punto de entrada standalone para ver la GUI sin el controller.
+    # Standalone entry point to see the GUI without the controller.
     root = tk.Tk()
     ValidacionFacturaGUI(root)
     root.mainloop()

@@ -2,10 +2,10 @@
 Validación Factura Global
 ==========================
 
-Punto de entrada principal de la aplicación.
-Conecta la interfaz gráfica (GUI) con la lógica de negocio (Controller).
+Main entry point of the application.
+Connects the graphical interface (GUI) with the business logic (Controller).
 
-Fecha: 2026
+Date: 2026
 """
 
 import tkinter as tk
@@ -16,7 +16,7 @@ from controller import ValidacionFacturaController
 def main():
     root = tk.Tk()
     gui = ValidacionFacturaGUI(root)
-    ValidacionFacturaController(gui)   # engancha los callbacks de la GUI
+    ValidacionFacturaController(gui)   # hooks up the GUI callbacks
     root.mainloop()
 
 

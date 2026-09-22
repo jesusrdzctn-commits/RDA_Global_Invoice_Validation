@@ -2,20 +2,20 @@
 Validación Factura Global — Descargas SAP
 ==========================================
 
-Módulo de extracción de transacciones SAP para el proyecto
-'Validación Factura Global'.
+SAP transaction extraction module for the 'Validación Factura Global'
+project.
 
-Transacciones implementadas:
+Implemented transactions:
   - 'Gallo'   (FAGLL03)
   - 'Monivoi' (ZLMXCOM_TRN_MONINVOI)
 
-Basado en las grabaciones VBS originales, con estas mejoras:
-  1. Las fechas las ingresa el usuario (ya no van fijas).
-  2. El nombre del archivo usa la MISMA fecha del usuario, en formato
-     DD_mmm_YY (mes en español).
-  3. Soporta descarga de un solo día o de un rango (día por día).
-  4. La ruta y el nombre del archivo se escriben directo en el diálogo de
-     exportación (más robusto que navegar con F4 como hacía el VBS).
+Based on the original VBS recordings, with these improvements:
+  1. The dates are entered by the user (no longer hard-coded).
+  2. The file name uses the SAME date the user typed, in D_mmm_YY format
+     (Spanish month, no leading zero on the day; see utils.py).
+  3. Supports downloading a single day or a range (day by day).
+  4. The folder and the file name are typed straight into the export dialog
+     (more robust than navigating with F4 like the VBS did).
 """
 
 import os
@@ -23,7 +23,7 @@ import time
 import traceback
 from datetime import datetime
 
-import openpyxl as _oxl          # asegura que PyInstaller incluya el motor de Excel
+import openpyxl as _oxl          # makes PyInstaller bundle the Excel engine (also used below)
 import pandas as pd
 import win32com.client
 import win32clipboard
@@ -33,36 +33,36 @@ import ctypes
 from ctypes import wintypes
 
 from utils import (
-    nombre_archivo_dia,          nombre_archivo_rango,
-    nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
+    nombre_archivo_dia,
+    nombre_archivo_dia_monivoi,
     fecha_efectiva_monivoi_str,
 )
 
 # ----------------------------------------------------------------------
-# Constantes de la transacción (tomadas de la grabación VBS original)
+# Transaction constants (taken from the original VBS recording)
 # ----------------------------------------------------------------------
 
-# Cuentas que vienen en el multiple-selection (SD_SAKNR) del VBS.
+# Accounts in the VBS multiple selection (SD_SAKNR).
 _CUENTAS_GALLO = [
     "4000005", "4000010", "4000020", "4000802",
     "4150000", "4200000", "4200004", "4200015",
     "4260000", "4300013", "7000005",
 ]
 
-# Sociedad por defecto (BUKRS) que trae el VBS.
+# Default company code (BUKRS) from the VBS.
 _SOCIEDAD_DEFAULT = "MX21"
 
-# Layout / variante de visualización por defecto (PA_VARI).
+# Default display layout / variant (PA_VARI).
 _VARIANTE_DEFAULT = "BASE/VALID"
 
 
 # ----------------------------------------------------------------------
-# Constantes de la transacción Monivoi (ZLMXCOM_TRN_MONINVOI)
+# Monivoi transaction constants (ZLMXCOM_TRN_MONINVOI)
 # ----------------------------------------------------------------------
-_TX_MONIVOI    = "ZLMXCOM_TRN_MONINVOI"   # transacción custom (Z)
-_VKORG_DEFAULT = "MX21"                    # organización de ventas
-_VTWEG_DEFAULT = "01"                      # canal de distribución
-_RFC_DEFAULT   = "XAXX010101000"           # RFC genérico ("público en general")
+_TX_MONIVOI    = "ZLMXCOM_TRN_MONINVOI"   # custom (Z) transaction
+_VKORG_DEFAULT = "MX21"                    # sales organization
+_VTWEG_DEFAULT = "01"                      # distribution channel
+_RFC_DEFAULT   = "XAXX010101000"           # generic RFC ("público en general" = general public)
 
 
 # ----------------------------------------------------------------------
@@ -70,10 +70,11 @@ _RFC_DEFAULT   = "XAXX010101000"           # RFC genérico ("público en general
 # ----------------------------------------------------------------------
 def ruta_input_default():
     """
-    Devuelve la carpeta de entrada del proyecto:
-        C:\\Users\\<usuario>\\Documents\\Validacion Factura Global\\src\\Input
+    Return the project's input folder:
+        C:\\Users\\<user>\\Documents\\Validacion Factura Global\\src\\Input
 
-    Usa el usuario del sistema, así corre en cualquier equipo sin tocar el código.
+    It uses the system user, so it runs on any machine without touching the
+    code.
     """
     user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
     return os.path.join(
@@ -83,9 +84,9 @@ def ruta_input_default():
 
 def _xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True):
     """
-    Convierte a CSV (utf-8-sig) el .xlsx que SAP genera al exportar, para que
-    TODOS los archivos descargados queden en el mismo formato. Luego borra el
-    .xlsx intermedio. utf-8-sig hace que Excel muestre bien los acentos.
+    Convert the .xlsx that SAP generates on export into CSV (utf-8-sig), so
+    that ALL downloaded files end up in the same format. Then delete the
+    intermediate .xlsx. utf-8-sig makes Excel display accents correctly.
     """
     df = pd.read_excel(ruta_xlsx, dtype=str, engine="openpyxl")
     df.to_csv(ruta_csv, index=False, encoding="utf-8-sig")
@@ -93,7 +94,7 @@ def _xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True):
         _borrar_xlsx_con_reintentos(ruta_xlsx)
 
 def _terminar_proceso(pid):
-    """Cierra por la fuerza el proceso 'pid' (Windows). True si lo logró."""
+    """Force-close process 'pid' (Windows). True if it succeeded."""
     PROCESS_TERMINATE = 0x0001
     k32 = ctypes.windll.kernel32
     k32.OpenProcess.restype  = wintypes.HANDLE
@@ -112,21 +113,24 @@ def _terminar_proceso(pid):
 
 def _liberar_archivo_con_restart_manager(ruta_archivo):
     """
-    Último recurso cuando el .xlsx queda BLOQUEADO y COM no lo pudo cerrar.
+    Last resort when the .xlsx stays LOCKED and COM could not close it.
 
-    ¿Por qué? En Gallo, Excel abre el archivo exportado y a veces se queda con
-    un DIÁLOGO modal esperando un clic (el ícono parpadea en DORADO: Windows
-    diciendo "esta ventana quiere tu atención"). Un Excel en modo modal NO
-    responde a COM, pero SÍ mantiene el archivo agarrado → os.remove falla.
+    Why? In Gallo, Excel opens the exported file and sometimes gets stuck on a
+    modal DIALOG waiting for a click (the taskbar icon flashes AMBER: Windows
+    saying "this window wants your attention"). An Excel in a modal state does
+    NOT answer COM, but it DOES keep holding the file → os.remove fails.
 
-    Este helper usa el Windows Restart Manager (la misma API del "este archivo
-    está siendo usado por: Excel"). Pregunta QUÉ procesos tienen agarrado ESTE
-    archivo en específico y cierra SÓLO los que sean EXCEL.EXE. Jamás toca SAP:
-      - si el que lo tiene es SAP (caso 'in place', como Monivoi) → no hace nada;
-      - si es un Excel standalone atorado en un diálogo (Gallo) → lo cierra.
+    This helper uses the Windows Restart Manager (the same API behind "this
+    file is in use by: Excel"). It asks WHICH processes are holding THIS
+    specific file and closes ONLY those whose application name contains
+    "Excel". It never touches SAP:
+      - if SAP is the one holding it ('in place' case, like Monivoi) → nothing;
+      - if it is a standalone Excel stuck on a dialog (Gallo) → it is closed.
 
-    Seguro: los datos YA están en disco (por eso el .csv se genera bien); ese
-    Excel solo MUESTRA el archivo, no tiene cambios que valga la pena guardar.
+    Safe: the data is ALREADY on disk (that is why the .csv comes out fine);
+    that Excel only DISPLAYS the file, it has no changes worth saving.
+    Caveat: TerminateProcess ends the WHOLE Excel process, so if that same
+    instance also had other workbooks open, their unsaved changes are lost.
     """
     try:
         rstrtmgr = ctypes.WinDLL("rstrtmgr")
@@ -168,7 +172,7 @@ def _liberar_archivo_con_restart_manager(ruta_archivo):
             cuantos    = wintypes.UINT(0)
             razon      = wintypes.DWORD(0)
 
-            # 1er llamado: ¿cuántos procesos? (devuelve ERROR_MORE_DATA)
+            # 1st call: how many processes? (returns ERROR_MORE_DATA)
             rstrtmgr.RmGetList(sesion, ctypes.byref(necesarios),
                                ctypes.byref(cuantos), None, ctypes.byref(razon))
 
@@ -189,7 +193,7 @@ def _liberar_archivo_con_restart_manager(ruta_archivo):
                 pid    = int(infos[i].Process.dwProcessId)
                 print(f"[RM] '{os.path.basename(ruta_archivo)}' lo tiene: "
                       f"{nombre} (PID {pid})")
-                # SÓLO Excel; nunca SAP ni otros procesos.
+                # ONLY Excel; never SAP or any other process.
                 if "excel" in nombre.lower():
                     if _terminar_proceso(pid):
                         print(f"[RM] Excel cerrado (PID {pid}) → archivo liberado.")
@@ -207,19 +211,18 @@ def _liberar_archivo_con_restart_manager(ruta_archivo):
 
 def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=10, espera=2):
     """
-    Borra el .xlsx intermedio. En Windows, si Excel todavía lo tiene abierto,
-    el archivo queda BLOQUEADO y os.remove falla. Por eso en cada intento
-    primero re-intentamos cerrar el archivo en Excel y luego borrar, dándole
-    tiempo a que lo suelte.
+    Delete the intermediate .xlsx. On Windows, if Excel still has it open, the
+    file stays LOCKED and os.remove fails. That is why every attempt first
+    tries to close the file in Excel again and then deletes it, giving Excel
+    time to let go of it.
 
-    Ventana amplia (intentos=10) a propósito: Gallo es el reporte grande y el
-    primero de la corrida, así que arranca Excel "en frío" y puede tardar varios
-    segundos en terminar de abrir el archivo; hasta que no lo abre del todo, no
-    lo podemos cerrar. Sale en cuanto logra borrar, así que en el caso normal es
-    rápido.
+    Wide window (intentos=10) on purpose: Gallo is the big report and the
+    first one of the run, so Excel starts "cold" and can take several seconds
+    to finish opening the file; until it is fully open, we cannot close it.
+    It exits as soon as the delete succeeds, so the normal case is fast.
     """
     for intento in range(1, intentos + 1):
-        _cerrar_excel_workbook(ruta_xlsx)        # reintenta cerrarlo en Excel
+        _cerrar_excel_workbook(ruta_xlsx)        # try closing it in Excel again
         try:
             if os.path.exists(ruta_xlsx):
                 os.remove(ruta_xlsx)
@@ -228,16 +231,17 @@ def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=10, espera=2):
         except OSError as e:
             print(f"[XLSX] Aún bloqueado (intento {intento}/{intentos}): {e}")
 
-            # Si COM no lo suelta (típico de Gallo: Excel atorado en un diálogo
-            # DORADO que COM no puede cerrar), escalamos al Restart Manager para
-            # cerrar SÓLO ese Excel y liberar el archivo. Lo hacemos a la mitad
-            # de los intentos, no en el primero, por si se libera solo.
+            # If COM does not let go (typical in Gallo: Excel stuck on an AMBER
+            # dialog that COM cannot close), escalate to the Restart Manager to
+            # close ONLY that Excel and free the file. It happens halfway
+            # through the attempts, not on the first one, in case the file
+            # frees itself.
             if intento == max(1, intentos // 2):
                 _liberar_archivo_con_restart_manager(ruta_xlsx)
 
             time.sleep(espera)
 
-    # Si llegamos aquí, no se pudo borrar: volcamos qué tiene Excel abierto.
+    # Getting here means it could not be deleted: dump what Excel has open.
     print(f"[XLSX] ⚠️ No se pudo borrar (sigue abierto/bloqueado): {ruta_xlsx}")
     _diagnostico_excel(ruta_xlsx)
     return False
@@ -245,23 +249,23 @@ def _borrar_xlsx_con_reintentos(ruta_xlsx, intentos=10, espera=2):
 
 def _instancias_excel_abiertas():
     """
-    Devuelve TODAS las instancias de Excel abiertas en el equipo, no sólo la
-    primera. Esto es CLAVE para el bug de "el .xlsx se queda abierto y no se
-    puede borrar": cuando SAP exporta, abre el archivo en Excel, y muchas veces
-    lo hace en una instancia DISTINTA a la que el usuario ya tenía abierta.
-    win32com.GetObject(Class="Excel.Application") sólo alcanza UNA instancia, así
-    que si el libro está en otra, nunca lo cerramos.
+    Return ALL the Excel instances open on the machine, not just the first
+    one. This is KEY for the "the .xlsx stays open and cannot be deleted" bug:
+    when SAP exports, it opens the file in Excel, and it often does so in an
+    instance DIFFERENT from the one the user already had open.
+    win32com.GetObject(Class="Excel.Application") only reaches ONE instance,
+    so if the workbook is in another one, we would never close it.
 
-    Para verlas todas escaneamos la Running Object Table (ROT) de Windows: ahí
-    cada libro abierto aparece registrado por su ruta; de cada libro tomamos su
-    .Application y las juntamos sin repetir (usando el Hwnd como identidad).
+    To see them all we scan the Windows Running Object Table (ROT): every open
+    workbook is registered there by its path; from each workbook we take its
+    .Application and collect them without repeats (using Hwnd as identity).
 
-    Degrada con elegancia: si el escaneo de la ROT falla por lo que sea, al menos
-    devuelve la instancia principal vía GetObject.
+    Degrades gracefully: if the ROT scan fails for whatever reason, it at
+    least returns the main instance via GetObject.
     """
     instancias = {}
 
-    # 1) Vía ROT: descubre TODAS las instancias a partir de los libros abiertos.
+    # 1) Via the ROT: find ALL the instances from the open workbooks.
     try:
         import pythoncom
         rot = pythoncom.GetRunningObjectTable()
@@ -273,7 +277,7 @@ def _instancias_excel_abiertas():
                 continue
             if not nombre:
                 continue
-            # Los libros abiertos se registran por su ruta de archivo.
+            # Open workbooks are registered by their file path.
             if not nombre.lower().endswith((".xls", ".xlsx", ".xlsm", ".xlsb", ".csv")):
                 continue
             try:
@@ -286,7 +290,7 @@ def _instancias_excel_abiertas():
     except Exception:
         pass
 
-    # 2) Fallback / complemento: la instancia principal registrada.
+    # 2) Fallback / complement: the registered main instance.
     try:
         app = win32com.client.GetObject(Class="Excel.Application")
         instancias[int(app.Hwnd)] = app
@@ -298,28 +302,29 @@ def _instancias_excel_abiertas():
 
 def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
     """
-    Cierra (sin guardar) el archivo que SAP/Excel deja abierto tras la
-    exportación, para que no quede bloqueado (si sigue abierto, Windows no deja
-    borrar el .xlsx temporal).
+    Close (without saving) the file that SAP/Excel leaves open after the
+    export, so it does not stay locked (while it is open, Windows does not let
+    us delete the temporary .xlsx).
 
-    Barre TODAS las instancias de Excel (ver _instancias_excel_abiertas), no sólo
-    una, porque SAP suele abrir el archivo en una instancia aparte. En cada
-    instancia busca el archivo en DOS lugares:
-      A) Los libros normales (colección Workbooks), calzando por RUTA COMPLETA y,
-         si falla, por NOMBRE de archivo (SAP a veces reporta la ruta con otra
-         forma: mayúsculas, ruta corta 8.3, etc.).
-      B) Las ventanas en VISTA PROTEGIDA (ProtectedViewWindows). ¡Esto es clave
-         para Gallo! Excel abre en "Vista protegida" los archivos recién
-         exportados/grandes, y esas ventanas NO aparecen en Workbooks, así que
-         antes ni las tocábamos y el archivo quedaba bloqueado.
+    Sweeps ALL Excel instances (see _instancias_excel_abiertas), not just one,
+    because SAP usually opens the file in a separate instance. In each
+    instance it looks for the file in TWO places:
+      A) Regular workbooks (Workbooks collection), matching by FULL PATH and,
+         if that fails, by file NAME (SAP sometimes reports the path in a
+         different shape: upper case, 8.3 short path, etc.).
+      B) PROTECTED VIEW windows (ProtectedViewWindows). This is key for
+         Gallo! Excel opens freshly exported/large files in "Protected View",
+         and those windows do NOT show up in Workbooks, so before this we did
+         not even touch them and the file stayed locked.
 
-    Si tras cerrar una instancia queda SIN libros ni vistas protegidas, la cierra
-    para no dejar una ventana vacía. NUNCA cierra una instancia que todavía tenga
-    otros libros del usuario.
+    If, after closing, an instance is left with NO workbooks or protected
+    views, it is closed so no empty window is left behind. It NEVER closes an
+    instance that still holds other workbooks of the user.
 
-    Reintenta unas veces por si Excel aún no terminaba de abrir el archivo (Gallo,
-    al ser el reporte grande y el primero, arranca Excel "en frío" y tarda más).
-    Devuelve True si logró cerrar algo que calzaba; False si no encontró nada.
+    Retries a few times in case Excel had not finished opening the file yet
+    (Gallo, being the big report and the first one, starts Excel "cold" and
+    takes longer). Returns True if it closed something that matched; False if
+    it found nothing.
     """
     ruta_abs      = os.path.normcase(os.path.abspath(ruta_archivo))
     objetivo_base = os.path.normcase(os.path.basename(ruta_archivo))
@@ -327,7 +332,7 @@ def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
     for _ in range(intentos):
         instancias = _instancias_excel_abiertas()
         if not instancias:
-            return False  # no hay Excel abierto → nada que cerrar
+            return False  # no Excel open → nothing to close
 
         cerrado = False
         for excel in instancias:
@@ -337,7 +342,7 @@ def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
                 pass
 
             try:
-                # === A) Libros normales ===
+                # === A) Regular workbooks ===
                 for wb in list(excel.Workbooks):
                     try:
                         calza = (
@@ -351,7 +356,7 @@ def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
                     except Exception:
                         continue
 
-                # === B) Ventanas en Vista Protegida (no están en Workbooks) ===
+                # === B) Protected View windows (not in Workbooks) ===
                 try:
                     for pvw in list(excel.ProtectedViewWindows):
                         try:
@@ -368,9 +373,9 @@ def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
                         except Exception:
                             continue
                 except Exception:
-                    pass  # la instancia puede no exponer ProtectedViewWindows
+                    pass  # the instance may not expose ProtectedViewWindows
 
-                # === Si la instancia quedó totalmente vacía, ciérrala ===
+                # === If the instance was left completely empty, close it ===
                 try:
                     sin_libros = int(excel.Workbooks.Count) == 0
                     sin_vista_prot = True
@@ -391,17 +396,18 @@ def _cerrar_excel_workbook(ruta_archivo, intentos=3, espera=1):
 
         if cerrado:
             return True
-        time.sleep(espera)  # tal vez aún no terminaba de abrir; reintenta
+        time.sleep(espera)  # maybe it had not finished opening yet; retry
 
     return False
 
 
 def _diagnostico_excel(ruta_archivo):
     """
-    Vuelca en consola QUÉ tiene Excel abierto cuando no se pudo cerrar/borrar el
-    archivo. Sirve para depurar en el equipo del usuario sin adivinar: dice
-    cuántas instancias hay y, en cada una, qué libros y qué vistas protegidas
-    tiene. Si algún día Gallo vuelve a no cerrarse, este log es la pista.
+    Dump to the console WHAT Excel has open when the file could not be
+    closed/deleted. Useful to debug on the user's machine without guessing:
+    it tells how many instances there are and, for each one, which workbooks
+    and protected views it has. If Gallo ever stops closing again, this log is
+    the clue.
     """
     try:
         instancias = _instancias_excel_abiertas()
@@ -426,13 +432,13 @@ def _diagnostico_excel(ruta_archivo):
 
 def _verificar_sin_partidas(session, ruta_archivo):
     """
-    Detecta el mensaje SAP de 'No se ha seleccionado ninguna partida'.
-    Si aparece: cierra el popup, crea un Excel/CSV vacío como placeholder y
-    devuelve True para que el llamador sepa que no hay datos.
+    Detect SAP's 'No se ha seleccionado ninguna partida' (no items selected)
+    message. If it shows up: close the popup, create an empty Excel/CSV as a
+    placeholder and return True so the caller knows there is no data.
 
-    NOTA: los códigos de mensaje están afinados para FAGLL03 (Gallo). Para
-    Monivoi (Z) el texto de 'sin datos' puede ser distinto; si en tus pruebas
-    ves que no lo detecta, agrega el mensaje exacto a MENSAJES_SIN_DATOS.
+    NOTE: the message codes are tuned for FAGLL03 (Gallo). For Monivoi (Z)
+    the 'no data' text may be different; if your tests show it is not
+    detected, add the exact message to MENSAJES_SIN_DATOS.
     """
     try:
         sin_partidas = False
@@ -486,9 +492,9 @@ def _verificar_sin_partidas(session, ruta_archivo):
 
 def _copiar_al_portapapeles(texto, intentos=5, espera=0.3):
     """
-    Pone 'texto' en el portapapeles de Windows (Unicode). Reintenta unas veces
-    porque a veces otra app tiene el portapapeles ocupado un instante.
-    OJO: esto SOBRESCRIBE lo que el usuario tuviera copiado en ese momento.
+    Put 'texto' on the Windows clipboard (Unicode). Retries a few times
+    because another app sometimes holds the clipboard for an instant.
+    NOTE: this OVERWRITES whatever the user had copied at that moment.
     """
     ultimo_error = None
     for _ in range(intentos):
@@ -508,8 +514,9 @@ def _copiar_al_portapapeles(texto, intentos=5, espera=0.3):
 
 def _importar_cuentas_desde_popup(session):
     """
-    Pulsa el botón 'Importar desde portapapeles' del popup de selección
-    múltiple. Prueba los IDs conocidos por si cambia entre sistemas SAP.
+    Press the 'Importar desde portapapeles' (import from clipboard) button of
+    the multiple-selection popup. Tries the known IDs in case it changes
+    between SAP systems.
     """
     for btn_id in ("wnd[1]/tbar[0]/btn[24]", "wnd[1]/tbar[0]/btn[25]"):
         try:
@@ -523,7 +530,7 @@ def _importar_cuentas_desde_popup(session):
     )
 
 # ----------------------------------------------------------------------
-# Transacción Gallo (FAGLL03)
+# Gallo transaction (FAGLL03)
 # ----------------------------------------------------------------------
 def Gallo_FAGLL03(
     DateFrom,
@@ -535,44 +542,44 @@ def Gallo_FAGLL03(
     variante=_VARIANTE_DEFAULT,
 ):
     """
-    Descarga la transacción FAGLL03 ('Gallo') desde SAP a un archivo .csv.
+    Download transaction FAGLL03 ('Gallo') from SAP into a .csv file.
 
     Args:
-        DateFrom (str): Fecha inicial del rango, formato 'DD.MM.YYYY'.
-        DateTo   (str): Fecha final del rango,   formato 'DD.MM.YYYY'.
-        FolderPath (str|None): Carpeta destino. Si None → ruta_input_default().
-        FileName   (str|None): Nombre del archivo. Si None → nombre_archivo_dia(DateTo).
-        sociedad   (str): Sociedad (BUKRS). Default 'MX21'.
-        cuentas    (list|None): Cuentas a filtrar. Si None → las del VBS.
-        variante   (str|None): Nombre del layout/variante (PA_VARI).
-            Default 'BASE/VALID'. Si llega None o vacío, usa el default.
-            Siempre se escribe por nombre (ROBUSTO).
+        DateFrom (str): Start date of the range, 'DD.MM.YYYY' format.
+        DateTo   (str): End date of the range,   'DD.MM.YYYY' format.
+        FolderPath (str|None): Target folder. If None → ruta_input_default().
+        FileName   (str|None): File name. If None → nombre_archivo_dia(DateTo).
+        sociedad   (str): Company code (BUKRS). Default 'MX21'.
+        cuentas    (list|None): Accounts to filter. If None → the VBS ones.
+        variante   (str|None): Name of the layout/variant (PA_VARI).
+            Default 'BASE/VALID'. If None or empty, the default is used.
+            It is always typed by name (ROBUST).
 
     Returns:
-        bool: True si descargó con datos, False si no hubo datos o error.
+        bool: True if it downloaded data, False if there was no data or an error.
     """
     session = None
     cuentas       = cuentas or _CUENTAS_GALLO
     FolderPath    = FolderPath or ruta_input_default()
     FileName      = FileName or nombre_archivo_dia(DateTo)
-    ruta_completa = os.path.join(FolderPath, FileName)   # destino final (puede ser .csv)
+    ruta_completa = os.path.join(FolderPath, FileName)   # final target (may be .csv)
 
-    # SAP sólo exporta en formato hoja de cálculo (.xlsx). Si el archivo final
-    # que queremos es .csv, exportamos primero a un .xlsx temporal y al terminar
-    # lo convertimos. Así TODOS los archivos quedan en el mismo formato.
+    # SAP only exports in spreadsheet format (.xlsx). If the final file we
+    # want is .csv, we first export to a temporary .xlsx and convert it at the
+    # end. This way ALL the files end up in the same format.
     _base, _ext     = os.path.splitext(FileName)
     _exportar_a_csv = _ext.lower() == ".csv"
     _nombre_xlsx    = (_base + ".xlsx") if _exportar_a_csv else FileName
     _ruta_xlsx      = os.path.join(FolderPath, _nombre_xlsx)
 
     try:
-        # === Validaciones mínimas ===
+        # === Minimal validation ===
         for etiqueta, fecha in (("DateFrom", DateFrom), ("DateTo", DateTo)):
-            datetime.strptime(fecha, "%d.%m.%Y")  # lanza ValueError si el formato es inválido
+            datetime.strptime(fecha, "%d.%m.%Y")  # raises ValueError if the format is invalid
 
         os.makedirs(FolderPath, exist_ok=True)
 
-        # === Conexión SAP ===
+        # === SAP connection ===
         try:
             SapGuiAuto  = win32com.client.GetObject("SAPGUI")
             application = SapGuiAuto.GetScriptingEngine
@@ -584,69 +591,69 @@ def Gallo_FAGLL03(
                 "Verifica que SAP esté abierto y con una sesión activa."
             ) from e
 
-        # === Abrir transacción FAGLL03 ===
+        # === Open transaction FAGLL03 ===
         session.findById("wnd[0]").maximize()
         session.findById("wnd[0]/tbar[0]/okcd").text = "/nFAGLL03"
         session.findById("wnd[0]").sendVKey(0)
 
-        # === Cargar cuentas (multiple selection SD_SAKNR) vía PORTAPAPELES ===
-        # En vez de escribir fila por fila (y tener que lidiar con el scroll cuando
-        # hay muchas cuentas), copiamos TODAS las cuentas al portapapeles —una por
-        # línea— y usamos el botón 'Importar desde portapapeles' del popup. Así no
-        # importa cuántas cuentas sean: entran de un solo jalón.
+        # === Load the accounts (multiple selection SD_SAKNR) via the CLIPBOARD ===
+        # Instead of typing row by row (and having to deal with scrolling when
+        # there are many accounts), we copy ALL the accounts to the clipboard —one
+        # per line— and use the popup's 'Importar desde portapapeles' button. This
+        # way it does not matter how many accounts there are: they go in at once.
         session.findById("wnd[0]/usr/btn%_SD_SAKNR_%_APP_%-VALU_PUSH").press()
 
         _copiar_al_portapapeles("\r\n".join(str(c).strip() for c in cuentas))
         _importar_cuentas_desde_popup(session)
-        time.sleep(1)                                       # deja que SAP pinte las cuentas
+        time.sleep(1)                                       # let SAP paint the accounts
 
-        session.findById("wnd[1]/tbar[0]/btn[0]").press()  # copiar/adoptar
-        session.findById("wnd[1]/tbar[0]/btn[8]").press()  # ejecutar y cerrar popup
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()  # copy/adopt
+        session.findById("wnd[1]/tbar[0]/btn[8]").press()  # execute and close the popup
 
-         # === Parámetros de selección ===
-        session.findById("wnd[0]/usr/radX_AISEL").select()          # todas las partidas
+        # === Selection parameters ===
+        session.findById("wnd[0]/usr/radX_AISEL").select()          # all items
         session.findById("wnd[0]/usr/ctxtSD_BUKRS-LOW").text  = sociedad
         session.findById("wnd[0]/usr/ctxtSO_BUDAT-LOW").text  = DateFrom
         session.findById("wnd[0]/usr/ctxtSO_BUDAT-HIGH").text = DateTo
 
-        # Layout/variante SIEMPRE por nombre (robusto). Si llega vacío o None,
-        # usa el default en lugar del camino frágil F4+scroll+coordenada.
+        # Layout/variant ALWAYS by name (robust). If it is empty or None, use
+        # the default instead of the fragile F4 + scroll + coordinate path.
         variante = variante or _VARIANTE_DEFAULT
         campo_vari = session.findById("wnd[0]/usr/ctxtPA_VARI")
         campo_vari.text          = variante
         campo_vari.setFocus()
         campo_vari.caretPosition = len(variante)
 
-        # === Ejecutar reporte ===
+        # === Run the report ===
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
         time.sleep(4)
 
-        # === ¿Sin partidas? ===
+        # === No items? ===
         if _verificar_sin_partidas(session, ruta_completa):
-            return False  # archivo vacío ya creado
+            return False  # empty file already created
 
-        # === Exportar a Excel (forma robusta: path + filename directos) ===
+        # === Export to Excel (robust way: folder + file name typed directly) ===
         session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
         session.findById("wnd[1]/tbar[0]/btn[0]").press()
         session.findById("wnd[1]/usr/ctxtDY_PATH").text     = FolderPath
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = _nombre_xlsx
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(_nombre_xlsx)
         session.findById("wnd[1]/tbar[0]/btn[11]").press()
-        time.sleep(3)  # deja que SAP termine de ESCRIBIR el archivo
+        time.sleep(3)  # let SAP finish WRITING the file
 
-        # === PRIMERO salir de la lista en SAP → suelta el .xlsx ===
-        # Si SAP muestra el resultado con "Excel in place", es SAP quien tiene
-        # el archivo agarrado (no un Excel que podamos cerrar por COM). Al
-        # regresar a la pantalla inicial, SAP suelta ese Excel incrustado y el
-        # archivo queda libre para convertir/borrar.
+        # === FIRST leave the list in SAP → it releases the .xlsx ===
+        # If SAP shows the result with "Excel in place", SAP itself is the one
+        # holding the file (not an Excel we could close through COM). Going
+        # back to the initial screen makes SAP release that embedded Excel and
+        # the file is free to convert/delete.
         session.findById("wnd[0]/tbar[0]/btn[3]").press()
         session.findById("wnd[0]/tbar[0]/btn[3]").press()
         time.sleep(2)
 
-        # === LUEGO cerrar cualquier Excel normal que haya quedado abierto ===
+        # === THEN close any regular Excel that was left open ===
         _cerrar_excel_workbook(_ruta_xlsx)
 
-        # === Convertir el .xlsx temporal a .csv (consistencia de formato) ===
+        # === Convert the temporary .xlsx to .csv (format consistency) ===
         if _exportar_a_csv:
             _xlsx_a_csv(_ruta_xlsx, ruta_completa)
 
@@ -672,7 +679,7 @@ def Gallo_FAGLL03(
 
 
 # ----------------------------------------------------------------------
-# Transacción Monivoi (ZLMXCOM_TRN_MONINVOI)
+# Monivoi transaction (ZLMXCOM_TRN_MONINVOI)
 # ----------------------------------------------------------------------
 def Monivoi_ZLMXCOM(
     DateFrom,
@@ -685,47 +692,48 @@ def Monivoi_ZLMXCOM(
     rfc=_RFC_DEFAULT,
 ):
     """
-    Descarga la transacción ZLMXCOM_TRN_MONINVOI ('Monivoi') desde SAP a .csv.
+    Download transaction ZLMXCOM_TRN_MONINVOI ('Monivoi') from SAP into .csv.
 
-    Diferencias vs Gallo (FAGLL03):
-      - Sociedad por P_BUKRS (no SD_BUKRS-LOW).
-      - Filtra por fecha de CREACIÓN (SO_ERDAT), no de contabilización.
-      - Lleva org. de ventas (VKORG), canal (VTWEG) y RFC (STCD1).
-      - Sin cuentas ni layout/variante.
-      - Al exportar, SAP muestra primero un selector de formato (cmbG_LISTBOX).
+    Differences vs Gallo (FAGLL03):
+      - Company code through P_BUKRS (not SD_BUKRS-LOW).
+      - Filters by CREATION date (SO_ERDAT), not by posting date.
+      - Carries sales org. (VKORG), channel (VTWEG) and RFC (STCD1).
+      - No accounts and no layout/variant.
+      - On export, SAP first shows a format selector (cmbG_LISTBOX).
 
     Args:
-        DateFrom, DateTo (str): rango de fechas 'DD.MM.YYYY' (ERDAT).
-        FolderPath (str|None): carpeta destino. Si None → ruta_input_default().
-        FileName   (str|None): nombre del archivo. Si None → nombre_archivo_dia_monivoi(DateTo).
+        DateFrom, DateTo (str): 'DD.MM.YYYY' dates as the user typed them;
+            SO_ERDAT gets them +1 day (see utils.fecha_efectiva_monivoi).
+        FolderPath (str|None): target folder. If None → ruta_input_default().
+        FileName   (str|None): file name. If None → nombre_archivo_dia_monivoi(DateTo).
         sociedad (str): P_BUKRS. Default 'MX21'.
-        vkorg (str): organización de ventas (SO_VKORG). Default 'MX21'.
-        vtweg (str): canal de distribución (SO_VTWEG). Default '01'.
-        rfc   (str): RFC a filtrar (SO_STCD1). Default 'XAXX010101000'.
+        vkorg (str): sales organization (SO_VKORG). Default 'MX21'.
+        vtweg (str): distribution channel (SO_VTWEG). Default '01'.
+        rfc   (str): RFC to filter (SO_STCD1). Default 'XAXX010101000'.
 
     Returns:
-        bool: True si descargó con datos, False si no hubo datos o hubo error.
+        bool: True if it downloaded data, False if there was no data or an error.
     """
     session = None
     FolderPath    = FolderPath or ruta_input_default()
     FileName      = FileName or nombre_archivo_dia_monivoi(DateTo)
     ruta_completa = os.path.join(FolderPath, FileName)
 
-    # Igual que Gallo: SAP exporta a .xlsx; si el destino es .csv, exportamos a
-    # un .xlsx temporal y al terminar lo convertimos.
+    # Same as Gallo: SAP exports to .xlsx; if the target is .csv, we export to
+    # a temporary .xlsx and convert it at the end.
     _base, _ext     = os.path.splitext(FileName)
     _exportar_a_csv = _ext.lower() == ".csv"
     _nombre_xlsx    = (_base + ".xlsx") if _exportar_a_csv else FileName
     _ruta_xlsx      = os.path.join(FolderPath, _nombre_xlsx)
 
     try:
-        # === Validar fechas ===
+        # === Validate the dates ===
         for _etq, fecha in (("DateFrom", DateFrom), ("DateTo", DateTo)):
             datetime.strptime(fecha, "%d.%m.%Y")
 
         os.makedirs(FolderPath, exist_ok=True)
 
-        # === Conexión SAP ===
+        # === SAP connection ===
         try:
             SapGuiAuto  = win32com.client.GetObject("SAPGUI")
             application = SapGuiAuto.GetScriptingEngine
@@ -737,12 +745,12 @@ def Monivoi_ZLMXCOM(
                 "Verifica que SAP esté abierto y con una sesión activa."
             ) from e
 
-        # === Abrir la transacción (con /n para arrancar desde cualquier pantalla) ===
+        # === Open the transaction (with /n so it starts from any screen) ===
         session.findById("wnd[0]").maximize()
         session.findById("wnd[0]/tbar[0]/okcd").text = "/n" + _TX_MONIVOI
         session.findById("wnd[0]").sendVKey(0)
 
-        # === Parámetros de selección ===
+        # === Selection parameters ===
         session.findById("wnd[0]/usr/ctxtP_BUKRS").text      = sociedad
         session.findById("wnd[0]/usr/ctxtSO_ERDAT-LOW").text  = fecha_efectiva_monivoi_str(DateFrom)
         session.findById("wnd[0]/usr/ctxtSO_ERDAT-HIGH").text = fecha_efectiva_monivoi_str(DateTo)
@@ -754,26 +762,26 @@ def Monivoi_ZLMXCOM(
         campo_rfc.setFocus()
         campo_rfc.caretPosition = len(rfc)
 
-        # === Ejecutar reporte ===
+        # === Run the report ===
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
         time.sleep(4)
 
-        # === ¿Sin datos? (reusa el helper de Gallo; ver nota en la función) ===
+        # === No data? (reuses the Gallo helper; see the note in that function) ===
         if _verificar_sin_partidas(session, ruta_completa):
             return False
 
-        # === Exportar a hoja de cálculo ===
-        # OJO: aquí Monivoi difiere de Gallo. SAP abre primero un diálogo con un
-        # selector de formato (cmbG_LISTBOX); tomamos el valor por defecto y OK.
+        # === Export to spreadsheet ===
+        # NOTE: here Monivoi differs from Gallo. SAP first opens a dialog with a
+        # format selector (cmbG_LISTBOX); we take the default value and press OK.
         session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
         try:
             session.findById("wnd[1]/usr/cmbG_LISTBOX").setFocus()
         except Exception:
-            pass  # por si en algún equipo no aparece el selector de formato
+            pass  # in case the format selector does not show up on some machine
         session.findById("wnd[1]/tbar[0]/btn[0]").press()
 
-        # === Diálogo de guardar ===
-        # El VBS no fijaba la ruta; nosotros SÍ, para dejar el archivo en Input.
+        # === Save dialog ===
+        # The VBS did not set the folder; we DO, to leave the file in Input.
         try:
             session.findById("wnd[1]/usr/ctxtDY_PATH").text = FolderPath
         except Exception:
@@ -782,13 +790,13 @@ def Monivoi_ZLMXCOM(
         session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(_nombre_xlsx)
         session.findById("wnd[1]/tbar[0]/btn[0]").press()
 
-        # === Cerrar el Excel que SAP abre + convertir a CSV ===
+        # === Close the Excel that SAP opens + convert to CSV ===
         time.sleep(3)
         _cerrar_excel_workbook(_ruta_xlsx)
         if _exportar_a_csv:
             _xlsx_a_csv(_ruta_xlsx, ruta_completa)
 
-        # === Regresar a la pantalla inicial ===
+        # === Go back to the initial screen ===
         session.findById("wnd[0]/tbar[0]/btn[3]").press()
         session.findById("wnd[0]/tbar[0]/btn[3]").press()
 
@@ -814,7 +822,7 @@ def Monivoi_ZLMXCOM(
 
 
 # ----------------------------------------------------------------------
-# Ejecución directa (prueba rápida sin GUI ni controller)
+# Direct run (quick test without GUI or controller)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     print("=== Prueba de descarga (standalone) ===")

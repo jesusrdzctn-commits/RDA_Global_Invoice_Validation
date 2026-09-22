@@ -1,3 +1,18 @@
+"""
+Validación Factura Global — Controller
+======================================
+
+Glue between the GUI (interfaz_GUI.py) and the business logic:
+
+    download buttons    → Descargas_SAP.Gallo_FAGLL03 / Monivoi_ZLMXCOM
+                          (one day, or a range downloaded day by day and then
+                          stacked into a single CSV)
+    'Consolidar' button → Consolidacion.consolidar_gallo_monivoi
+
+The GUI knows nothing about SAP: it only exposes the on_* callbacks that this
+class wires up.
+"""
+
 import os
 import time
 from datetime import datetime, timedelta
@@ -6,23 +21,24 @@ from tkinter import messagebox, filedialog
 import pandas as pd
 
 from Descargas_SAP import (
-    Gallo_FAGLL03,   nombre_archivo_dia,          nombre_archivo_rango,
-    Monivoi_ZLMXCOM, nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
+    Gallo_FAGLL03,   nombre_archivo_dia,
+    Monivoi_ZLMXCOM, nombre_archivo_dia_monivoi,
 )
 from Consolidacion import consolidar_gallo_monivoi
 
 
 class ValidacionFacturaController:
-    """Conecta la GUI con la lógica de descarga SAP (Gallo y Monivoi)."""
+    """Connects the GUI with the SAP downloads (Gallo and Monivoi) and the consolidation."""
 
     def __init__(self, gui):
         self.gui = gui
 
-        # --- Perfiles de transacción ---
-        # Qué función SAP usar y cómo nombrar los archivos por día. Ambas
-        # funciones comparten firma (DateFrom, DateTo, FolderPath, FileName,
-        # sociedad); sus extras (cuentas/variante en Gallo, vkorg/vtweg/rfc en
-        # Monivoi) viajan como defaults, así que el controller no los toca.
+        # --- Transaction profiles ---
+        # Which SAP function to use and how to name the per-day files. Both
+        # functions share the same signature (DateFrom, DateTo, FolderPath,
+        # FileName, sociedad); their extras (cuentas/variante in Gallo,
+        # vkorg/vtweg/rfc in Monivoi) travel as defaults, so the controller
+        # never touches them.
         self._TX_GALLO = {
             "clave":      "gallo",
             "nombre":     "Gallo (FAGLL03)",
@@ -44,7 +60,7 @@ class ValidacionFacturaController:
         self.gui.on_download_gallo   = self.execute_download_gallo
         self.gui.on_download_monivoi = self.execute_download_monivoi
         self.gui.on_download_ambos   = self.execute_download_ambos
-        # Botón aparte para consolidar los CSV ya descargados.
+        # Separate button to consolidate the CSVs that were already downloaded.
         self.gui.on_consolidar = self.execute_consolidacion
 
     # =================================================================
@@ -75,7 +91,7 @@ class ValidacionFacturaController:
         if not self.gui.validate_dates():
             return
 
-        base = self.gui.get_config(txs[0]["clave"])   # fechas/sociedad/modo comunes
+        base = self.gui.get_config(txs[0]["clave"])   # shared dates/company code/mode
         mode = base["mode"]
 
         periodo = (
@@ -118,10 +134,10 @@ class ValidacionFacturaController:
                 self.gui.set_status(
                     f"⏳ {prefijo}Descargando {tx['nombre']}... (no cierre SAP)"
                 )
-                # Cada transacción va en su propio try: si una truena, la otra
-                # igual se ejecuta. Al final, un solo resumen dice qué pasó.
+                # Each transaction gets its own try: if one blows up, the other
+                # one still runs. At the end, one single summary says what happened.
                 try:
-                    config = self.gui.get_config(tx["clave"])   # filename correcto por tx
+                    config = self.gui.get_config(tx["clave"])   # the right filename for each tx
                     if config["mode"] == "single":
                         con_datos = self._run_single_download(tx, config)
                         if con_datos:
@@ -171,13 +187,13 @@ class ValidacionFacturaController:
                 self.gui.set_status("✓ Listo para comenzar")
 
     # =================================================================
-    # CONSOLIDACIÓN: junta los CSV descargados en un solo Excel
+    # CONSOLIDATION: merges the downloaded CSVs into one Excel workbook
     # =================================================================
     def execute_consolidacion(self):
         """
-        Toma los CSV de Gallo y Monivoi (según las fechas de la GUI) y genera
-        el Excel consolidado con la pestaña 'Validación - Doc.'.
-        Si algún CSV no está donde se espera, ofrece elegirlo manualmente.
+        Take the Gallo and Monivoi CSVs (named after the GUI dates) and build
+        the consolidated workbook (see Consolidacion.py for its seven sheets).
+        If a CSV is not where it is expected, offer to pick it manually.
         """
         if self._ocupado:
             return
@@ -188,7 +204,7 @@ class ValidacionFacturaController:
         cfg_monivoi = self.gui.get_config("monivoi")
         input_path  = cfg_gallo["input_path"]
 
-        # --- Localizar archivos: automático por fechas, respaldo manual ---
+        # --- Locate the files: automatically by date, manual fallback ---
         ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
         if not ruta_gallo:
             return
@@ -196,13 +212,13 @@ class ValidacionFacturaController:
         if not ruta_monivoi:
             return
 
-        # --- Fechas elegidas por el usuario (para 'Venta DSD' y 'Venta EIAP') ---
-        # En modo día es una sola; en rango, TODOS los días del periodo. Así esos
-        # días siempre aparecen en las matrices de venta aunque no traigan
-        # importes, y el módulo puede desempatar el formato de fecha del CSV.
+        # --- Dates picked by the user (for 'Venta DSD' and 'Venta EIAP') ---
+        # One in single-day mode; EVERY day of the period in range mode. This
+        # way those days always show up in the sales matrices even without
+        # amounts, and the module can break ties on the CSV date format.
         fechas_seleccionadas = self._fechas_seleccionadas(cfg_gallo)
 
-        # --- Salida: carpeta de consolidación elegida por el usuario en la GUI ---
+        # --- Output: consolidation folder chosen by the user in the GUI ---
         try:
             ruta_output = self.gui.get_consolidacion_path()
         except OSError as e:
@@ -237,10 +253,16 @@ class ValidacionFacturaController:
                 "\n⚠️ El archivo de Monivoi venía sin datos; su pestaña quedó vacía."
                 if resumen["monivoi_sin_datos"] else ""
             )
-            # Avisos de las pestañas de venta (filas sin fecha, fechas fuera del
-            # periodo elegido). No son errores: son cosas que el stakeholder
-            # debe ver antes de comparar contra el monitor.
-            avisos = resumen.get("venta_avisos") or []
+            # Warnings from the sales sheets (rows without a date, dates outside
+            # the chosen period), from 'TD' (rows without Centro), from 'MTD'
+            # and from the TD × MTD cross. They are not errors: they are things
+            # the stakeholder must see before comparing against the monitor.
+            avisos = (
+                (resumen.get("venta_avisos") or [])
+                + (resumen.get("td_avisos") or [])
+                + (resumen.get("mtd_avisos") or [])
+                + (resumen.get("cruce_avisos") or [])
+            )
             nota_ventas = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
 
             self.gui.set_status("✅ ¡Consolidación completada!")
@@ -271,8 +293,8 @@ class ValidacionFacturaController:
 
     def _fechas_seleccionadas(self, config):
         """
-        Lista de fechas 'DD.MM.YYYY' que el usuario eligió en la GUI:
-        una sola en modo día, todas las del periodo en modo rango.
+        List of 'DD.MM.YYYY' dates the user picked in the GUI: a single one in
+        single-day mode, every day of the period in range mode.
         """
         if config["mode"] == "single":
             return [config["fecha"]]
@@ -280,9 +302,9 @@ class ValidacionFacturaController:
 
     def _localizar_archivo(self, input_path, filename, etiqueta):
         """
-        Busca el CSV con el nombre esperado (según fechas de la GUI). Si no
-        está, pregunta si se quiere elegir manualmente con el explorador.
-        Devuelve la ruta encontrada/elegida, o None para cancelar.
+        Look for the CSV with the expected name (from the GUI dates). If it is
+        not there, ask whether to pick it manually with the file browser.
+        Returns the path found/picked, or None to cancel.
         """
         ruta = os.path.join(input_path, filename)
         if os.path.exists(ruta):
@@ -305,11 +327,11 @@ class ValidacionFacturaController:
         return ruta_manual or None
 
     # =================================================================
-    # NÚCLEOS DE DESCARGA (sin confirm ni popup: sólo ejecutan)
+    # DOWNLOAD CORES (no confirmation or popup: they just run)
     # =================================================================
     def _run_single_download(self, tx, config):
-        """Descarga UN día de una transacción.
-        Devuelve True (con datos) / False (sin datos o error controlado)."""
+        """Download ONE day of a transaction.
+        Returns True (with data) / False (no data or a handled error)."""
         fecha = config["fecha"]
         return tx["descarga"](
             DateFrom=fecha,
@@ -320,10 +342,15 @@ class ValidacionFacturaController:
         )
 
     def _run_range_download(self, tx, config, dias):
+        """
+        Download a range day by day (one CSV per day, kept in a 'Dias_<range>'
+        subfolder) and stack the days with data into one single CSV.
+        Returns (days_with_data, total_rows).
+        """
         input_path = config["input_path"]
         sociedad   = config["sociedad"]
 
-        # Subcarpeta donde se guardan los archivos por día (se conservan)
+        # Subfolder where the per-day files are saved (they are kept)
         nombre_consolidado = config["filename"]
         nombre_subcarpeta  = "Dias_" + os.path.splitext(nombre_consolidado)[0]
         carpeta_dias = os.path.join(input_path, nombre_subcarpeta)
@@ -344,7 +371,7 @@ class ValidacionFacturaController:
                 FileName=fname,
                 sociedad=sociedad,
             )
-            time.sleep(3)  # respiro entre descargas para que SAP libere la pantalla
+            time.sleep(3)  # breather between downloads so SAP frees the screen
 
             if con_datos and os.path.exists(ruta_dia):
                 archivos_con_datos.append(ruta_dia)
@@ -352,7 +379,7 @@ class ValidacionFacturaController:
             else:
                 print(f"[RANGO {tx['clave'].upper()}] {dia}: sin datos → se omite")
 
-        # Apilar todos los días con datos en un solo CSV (una sola tabla)
+        # Stack every day with data into one CSV (one single table)
         self.gui.set_status("📋 Apilando todos los días en un solo CSV...")
         ruta_consolidado = os.path.join(input_path, nombre_consolidado)
         n_dias, total_filas = self._apilar_a_csv(archivos_con_datos, ruta_consolidado)
@@ -363,11 +390,11 @@ class ValidacionFacturaController:
         return n_dias, total_filas
 
     # =================================================================
-    # HELPERS (agnósticos de transacción)
+    # HELPERS (transaction-agnostic)
     # =================================================================
     @staticmethod
     def _iterar_dias(desde, hasta):
-        """Devuelve la lista de fechas 'DD.MM.YYYY' entre desde y hasta (inclusive)."""
+        """Return the list of 'DD.MM.YYYY' dates between desde and hasta (inclusive)."""
         d = datetime.strptime(desde, "%d.%m.%Y")
         h = datetime.strptime(hasta, "%d.%m.%Y")
         dias = []
@@ -379,9 +406,9 @@ class ValidacionFacturaController:
     @staticmethod
     def _apilar_a_csv(rutas, ruta_final):
         """
-        Lee todos los CSV por día, los concatena en UNA SOLA tabla y la guarda
-        en CSV (utf-8-sig). Ignora placeholders 'Sin datos'.
-        Devuelve (n_archivos_con_datos, total_filas).
+        Read every per-day CSV, concatenate them into ONE SINGLE table and save
+        it as CSV (utf-8-sig). 'Sin datos' placeholders are skipped.
+        Returns (n_files_with_data, total_rows).
         """
         dfs = []
         for ruta in rutas:
