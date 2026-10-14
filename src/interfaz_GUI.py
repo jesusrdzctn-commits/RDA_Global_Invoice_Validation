@@ -21,6 +21,8 @@ import json
 from utils import (
     nombre_archivo_dia,          nombre_archivo_rango,
     nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
+    nombre_archivo_dia_vbrl,     nombre_archivo_rango_vbrl,
+    nombre_archivo_rango_eiap,
 )
 
 
@@ -63,7 +65,8 @@ class ValidacionFacturaGUI:
         # Callbacks the controller will wire up
         self.on_download_gallo   = None   # downloads ONLY Gallo from SAP
         self.on_download_monivoi = None   # downloads ONLY Monivoi from SAP
-        self.on_download_ambos   = None   # downloads Gallo + Monivoi from SAP
+        self.on_download_eiap    = None   # downloads ONLY Venta EIAP (Gallo, EIAP accounts) from SAP
+        self.on_download_todos   = None   # downloads Gallo + Monivoi + VBRL from SAP
         self.on_consolidar       = None   # consolidates the downloaded CSVs
 
         # Interval mode: "single" (one day) or "range" (several days)
@@ -144,7 +147,7 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg=self.primary_color,
         ).pack(pady=(0, 4))
         tk.Label(
-            main, text="Automatización de descarga y consolidación - Transacciones desde SAP",
+            main, text="Automatización de Descarga y Consolidación - Contabilidad vs Monitoreo de Facturas",
             font=("Segoe UI", 10),
             bg=self.bg_color, fg=self.secondary_color,
         ).pack(pady=(0, 14))
@@ -291,26 +294,33 @@ class ValidacionFacturaGUI:
         )
         fila_individual = tk.Frame(btn_frame, bg=self.bg_color)
         fila_individual.pack(fill="x", pady=(0, 8))
-        # uniform= forces both columns to the exact same width, even though
-        # the button labels have different lengths.
+        # uniform= forces the three columns to the exact same width, even
+        # though the button labels have different lengths.
         fila_individual.columnconfigure(0, weight=1, uniform="descargas")
         fila_individual.columnconfigure(1, weight=1, uniform="descargas")
+        fila_individual.columnconfigure(2, weight=1, uniform="descargas")
 
         self.download_gallo_btn = tk.Button(
             fila_individual, text="🐓 Solo Gallo",
             command=self._handle_gallo, **_btn_individual_kwargs,
         )
-        self.download_gallo_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.download_gallo_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.download_monivoi_btn = tk.Button(
             fila_individual, text="📊 Solo Monivoi",
             command=self._handle_monivoi, **_btn_individual_kwargs,
         )
-        self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=4)
+
+        self.download_eiap_btn = tk.Button(
+            fila_individual, text="📈 Solo Venta EIAP",
+            command=self._handle_eiap, **_btn_individual_kwargs,
+        )
+        self.download_eiap_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.download_btn = tk.Button(
-            btn_frame, text="🐓📊 Descargar Gallo + Monivoi",
-            command=self._handle_ambos, **_btn_kwargs,
+            btn_frame, text="🐓📊🧾 Descargar Gallo + Monivoi + VBRL",
+            command=self._handle_todos, **_btn_kwargs,
         )
         self.download_btn.pack(fill="x")
 
@@ -422,8 +432,10 @@ class ValidacionFacturaGUI:
             self._guardar_config()
 
     # ------------------------------------------------------------------
-    # File-name preview. Neither name carries a date offset: Monivoi's +1 day
-    # only applies to the SAP query (utils.fecha_efectiva_monivoi)
+    # File-name preview. None of the names carries a date offset: Monivoi's +1
+    # day only applies to the SAP query (utils.fecha_efectiva_monivoi). VBRL is
+    # not downloaded by date; it carries the same dates as the Monivoi file it
+    # is built from.
     # ------------------------------------------------------------------
     def _preview_nombre(self):
         try:
@@ -447,10 +459,36 @@ class ValidacionFacturaGUI:
         except ValueError:
             return "(fecha inválida)"
 
+    def _preview_nombre_vbrl(self):
+        try:
+            if self.mode_var.get() == "single":
+                return nombre_archivo_dia_vbrl(self.date_single_var.get().strip())
+            return nombre_archivo_rango_vbrl(
+                self.date_from_var.get().strip(),
+                self.date_to_var.get().strip(),
+            )
+        except ValueError:
+            return "(fecha inválida)"
+
+    def _preview_nombre_eiap(self):
+        # 'Solo Venta EIAP' only works with a range; the name carries the dates
+        # as typed (the -1 day on the end date only applies to the SAP query).
+        if self.mode_var.get() == "single":
+            return "(sólo con 'Varios días')"
+        try:
+            return nombre_archivo_rango_eiap(
+                self.date_from_var.get().strip(),
+                self.date_to_var.get().strip(),
+            )
+        except ValueError:
+            return "(fecha inválida)"
+
     def _update_filename_preview(self):
         self.filename_var.set(
             f"📄 Gallo:      {self._preview_nombre()}\n"
-            f"📄 Monivoi:  {self._preview_nombre_monivoi()}"
+            f"📄 Monivoi:  {self._preview_nombre_monivoi()}\n"
+            f"📄 VBRL:       {self._preview_nombre_vbrl()}\n"
+            f"📄 Venta EIAP: {self._preview_nombre_eiap()}"
         )
 
     # ------------------------------------------------------------------
@@ -515,10 +553,13 @@ class ValidacionFacturaGUI:
 
     def get_config(self, transaccion="gallo"):
         mode = self.mode_var.get()
-        filename = (
-            self._preview_nombre_monivoi() if transaccion == "monivoi"
-            else self._preview_nombre()
-        )
+        # Any other value falls back to the Gallo name (the default).
+        nombres = {
+            "monivoi": self._preview_nombre_monivoi,
+            "vbrl":    self._preview_nombre_vbrl,
+            "eiap":    self._preview_nombre_eiap,
+        }
+        filename = nombres.get(transaccion, self._preview_nombre)()
         input_path = self.path_var.get().strip()
         os.makedirs(input_path, exist_ok=True)  # creates the folder if it does not exist yet
         self._guardar_config()  # remember the folder used in this run
@@ -552,6 +593,7 @@ class ValidacionFacturaGUI:
         return (
             (self.download_gallo_btn,   self.primary_color),
             (self.download_monivoi_btn, self.primary_color),
+            (self.download_eiap_btn,    self.primary_color),
             (self.download_btn,         self.primary_color),
             (self.consolidar_btn,       self.success_color),
         )
@@ -582,8 +624,11 @@ class ValidacionFacturaGUI:
     def _handle_monivoi(self):
         self._disparar(self.on_download_monivoi, "monivoi")
 
-    def _handle_ambos(self):
-        self._disparar(self.on_download_ambos, "gallo")
+    def _handle_eiap(self):
+        self._disparar(self.on_download_eiap, "eiap")
+
+    def _handle_todos(self):
+        self._disparar(self.on_download_todos, "gallo")
 
     def _handle_consolidar(self):
         self._disparar(self.on_consolidar, "gallo")

@@ -161,9 +161,6 @@ def check_source_files():
         "controller.py",
         "Descargas_SAP.py",
         "Consolidacion.py",
-        "Consolidacion_Comun.py",
-        "Consolidacion_Gallo.py",
-        "Consolidacion_Monivoi.py",
         "utils.py",
     ]
 
