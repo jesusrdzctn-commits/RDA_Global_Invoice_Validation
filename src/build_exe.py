@@ -1,37 +1,19 @@
-"""
-Script that builds the Validación Factura Global executable.
-
-Run it from the folder that holds the .py files, WITH THE VIRTUAL ENVIRONMENT
-ACTIVE:
-
-    .venv\\Scripts\\activate
-    python build_exe.py
-
-PyInstaller bundles what the interpreter that runs it can import, so the
-environment decides the size of dist/: from the project venv (pandas, openpyxl,
-pywin32, pyinstaller + their dependencies) it only packs those; from the global
-Python it would pack everything installed there.
+r"""Builds the Validación Factura Global executable. Run it from the folder of the .py files
+WITH THE VIRTUAL ENVIRONMENT ACTIVE (.venv\Scripts\activate, then python build_exe.py):
+PyInstaller packs what the running interpreter can import, so the venv keeps dist/ small.
 """
 
 import subprocess
 import sys
 import os
 
-# --- Build configuration ----------------------------------------------
-# APP_NAME is PyInstaller's --name, and together with the build mode it decides
-# WHERE the .exe ends up:
-#     --onedir  → dist/<APP_NAME>/<APP_NAME>.exe   (folder: .exe + _internal/)
-#     --onefile → dist/<APP_NAME>.exe              (single file, slower to start)
-# --onedir is the default here because corporate antivirus tends to be less
-# nervous about it; the whole folder is what gets zipped and handed over.
+# --onedir → dist/<APP_NAME>/<APP_NAME>.exe (folder: .exe + _internal/, zipped to hand over);
+# --onefile → dist/<APP_NAME>.exe (slower to start). Corporate antivirus prefers --onedir.
 APP_NAME = "ValidacionFacturaGlobal"
 MODO_BUILD = "--onedir"
 
-# Heavy libraries the app never imports. They only sneak into dist/ when the
-# environment used for the build has them installed (pandas declares several of
-# them as optional extras), and they add hundreds of MB. Building from a clean
-# virtual environment makes this list unnecessary, but it does no harm there.
-# If a build ever fails with ModuleNotFoundError for one of these, remove it.
+# Heavy libraries the app never imports (they sneak in from a non-clean environment).
+# If a build fails with ModuleNotFoundError for one of these, remove it from the list.
 MODULOS_EXCLUIDOS = [
     "matplotlib", "scipy", "IPython", "jedi", "parso", "tornado", "zmq",
     "nbformat", "jsonschema", "prompt_toolkit", "psutil", "PIL",
@@ -40,10 +22,7 @@ MODULOS_EXCLUIDOS = [
 
 
 def ruta_ejecutable():
-    """
-    Where PyInstaller leaves the .exe for the current build mode (see
-    MODO_BUILD). Used to check the build really produced it.
-    """
+    """Where PyInstaller leaves the .exe for MODO_BUILD (to check the build produced it)."""
     if MODO_BUILD == "--onefile":
         return os.path.join("dist", f"{APP_NAME}.exe")
     return os.path.join("dist", APP_NAME, f"{APP_NAME}.exe")
@@ -74,31 +53,21 @@ def install_pyinstaller():
 
 
 def create_executable():
-    """
-    Build the executable.
-
-    Returns True only if PyInstaller finished AND the .exe really showed up
-    where the current build mode leaves it (ruta_ejecutable).
-    """
+    """Build the executable. True only if PyInstaller finished AND the .exe is where it should be."""
     print("🚀 Creando ejecutable...")
 
-    # PyInstaller is invoked as a MODULE of the interpreter that is running this
-    # script (sys.executable), never as the loose 'pyinstaller' command: what
-    # ends up inside dist/ is whatever THAT interpreter can import. Calling the
-    # command found on PATH could be the global Python's PyInstaller, which
-    # would bundle the global site-packages and silently undo the isolation of
-    # the virtual environment (that is also why this must be run with the venv
-    # active: .venv\Scripts\activate && python build_exe.py).
+    # As a MODULE of THIS interpreter (sys.executable), never the 'pyinstaller' on PATH: that one
+    # could be the global Python's and would bundle its whole site-packages.
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        MODO_BUILD,              # --onedir / --onefile (see the constants above)
-        "--windowed",            # No console window (GUI app)
-        f"--name={APP_NAME}",    # Name of the executable
-        "--icon=NONE",           # No custom icon (change it if there is a .ico)
-        "--clean",               # Clears the cache of previous builds
-        "--noconfirm",           # Does not ask before overwriting dist/ and build/
+        MODO_BUILD,
+        "--windowed",  # no console window (GUI app)
+        f"--name={APP_NAME}",
+        "--icon=NONE",
+        "--clean",
+        "--noconfirm",
 
-        # Hidden imports that PyInstaller does not detect automatically
+        # Hidden imports PyInstaller does not detect
         "--hidden-import=openpyxl",
         "--hidden-import=openpyxl.cell._writer",
         "--hidden-import=pandas",
@@ -106,9 +75,7 @@ def create_executable():
         "--hidden-import=win32com.client",
         "--hidden-import=pywintypes",
     ]
-    # Heavy libraries the app never imports (see MODULOS_EXCLUIDOS).
     cmd += [f"--exclude-module={modulo}" for modulo in MODULOS_EXCLUIDOS]
-    # Entry point
     cmd.append("main.py")
 
     try:
@@ -180,7 +147,6 @@ def main():
     print("🔨 CONSTRUCCIÓN DE EJECUTABLE - VALIDACIÓN FACTURA GLOBAL")
     print("=" * 60)
 
-    # Check the source files
     if not check_source_files():
         print("\n❌ Faltan archivos fuente. Asegúrate de ejecutar este script")
         print("   desde la carpeta donde están todos los archivos .py del proyecto.")
@@ -188,12 +154,10 @@ def main():
 
     print()
 
-    # Install PyInstaller if needed
     install_pyinstaller()
 
     print()
 
-    # Build the executable
     ok = create_executable()
 
     print("\n🎉 ¡Proceso completado!" if ok

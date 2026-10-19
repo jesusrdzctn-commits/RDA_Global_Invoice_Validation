@@ -1,12 +1,4 @@
-"""
-Validación Factura Global
-==========================
-
-Main entry point of the application.
-Connects the graphical interface (GUI) with the business logic (Controller).
-
-Date: 2026
-"""
+"""Validación Factura Global — entry point: the GUI wired to the controller."""
 
 import tkinter as tk
 from interfaz_GUI import ValidacionFacturaGUI
@@ -16,7 +8,7 @@ from controller import ValidacionFacturaController
 def main():
     root = tk.Tk()
     gui = ValidacionFacturaGUI(root)
-    ValidacionFacturaController(gui)   # hooks up the GUI callbacks
+    ValidacionFacturaController(gui)
     root.mainloop()
 
 

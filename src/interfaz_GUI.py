@@ -1,11 +1,5 @@
-"""
-Validación Factura Global — GUI (tkinter)
-=========================================
-
-Only the window: dates, folders and buttons. It knows nothing about SAP or
-pandas; the controller (controller.py) plugs the actions into the on_*
-callbacks. That keeps this file importable and testable on its own:
-`python interfaz_GUI.py` opens the window without the controller.
+"""Validación Factura Global — GUI (tkinter): dates, folders and buttons only. The controller
+wires the on_* callbacks; `python interfaz_GUI.py` opens the window on its own.
 """
 
 import tkinter as tk
@@ -16,35 +10,28 @@ import sys
 import json
 
 
-# Shared naming helpers. They live in utils.py (no SAP or tkinter
-# dependencies), so the GUI can be opened and tested on its own on any machine.
 from utils import (
     nombre_archivo_dia,          nombre_archivo_rango,
     nombre_archivo_dia_monivoi,  nombre_archivo_rango_monivoi,
     nombre_archivo_dia_vbrl,     nombre_archivo_rango_vbrl,
+    nombre_archivo_dia_fb03,     nombre_archivo_rango_fb03,
     nombre_archivo_rango_eiap,
 )
 
 
 def _ruta_config():
-    """
-    Location of the config.json where the last folders used (download and
-    consolidation) are remembered. It is saved NEXT TO the executable (when
-    packaged with PyInstaller) or next to this .py (when run as a script).
-    This way each machine keeps its own folders without touching the code.
-    """
-    if getattr(sys, "frozen", False):        # running as .exe (PyInstaller)
+    """config.json (last download/consolidation folders) next to the .exe (PyInstaller) or to this .py."""
+    if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
-    else:                                    # running as a .py script
+    else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "config.json")
 
 
 class ValidacionFacturaGUI:
-    # Design size of the window. It is the MINIMUM: if the content needs more
-    # room (display scaling, extra rows), _ajustar_alto_ventana enlarges it.
+    # Design size = MINIMUM size: _ajustar_alto_ventana grows it when the content needs more room.
     ANCHO_BASE = 580
-    ALTO_BASE  = 660
+    ALTO_BASE  = 690
 
     def __init__(self, root):
         self.root = root
@@ -52,7 +39,6 @@ class ValidacionFacturaGUI:
         self.root.geometry(f"{self.ANCHO_BASE}x{self.ALTO_BASE}")
         self.root.resizable(False, False)
 
-        # Color scheme
         self.bg_color        = "#FFFFFF"
         self.primary_color   = "#00094F"
         self.secondary_color = "#333333"
@@ -62,21 +48,20 @@ class ValidacionFacturaGUI:
 
         self.root.configure(bg=self.bg_color)
 
-        # Callbacks the controller will wire up
-        self.on_download_gallo   = None   # downloads ONLY Gallo from SAP
-        self.on_download_monivoi = None   # downloads ONLY Monivoi from SAP
-        self.on_download_eiap    = None   # downloads ONLY Venta EIAP (Gallo, EIAP accounts) from SAP
-        self.on_download_todos   = None   # downloads Gallo + Monivoi + VBRL from SAP
-        self.on_consolidar       = None   # consolidates the downloaded CSVs
+        # Callbacks the controller wires up
+        self.on_download_gallo   = None
+        self.on_download_monivoi = None
+        self.on_download_eiap    = None
+        self.on_download_todos   = None
+        self.on_consolidar       = None
 
-        # Interval mode: "single" (one day) or "range" (several days)
         self.mode_var = tk.StringVar(value="single")
 
-        # --- Download folder ------------------------------------------------
-        # Starts at a default path based on the system user, but the
-        # stakeholder can change it (e.g. to a SharePoint folder synced with
-        # OneDrive) with the "Examinar..." button. If a folder was used
-        # before, it is restored from config.json.
+        # Parallel run by passes (opt-in): it always starts unchecked (sequential is the safe default).
+        self.paralelo_var = tk.BooleanVar(value=False)
+
+        # Download folder: the user's Documents path by default; it can be changed (e.g. a synced SharePoint
+        # folder) and is remembered in config.json, like the consolidation folder.
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
         user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
@@ -86,24 +71,19 @@ class ValidacionFacturaGUI:
         ruta_input_default  = os.path.join(base_proyecto, "Input")
         ruta_output_default = os.path.join(base_proyecto, "Output")
 
-        # Download folder (where SAP leaves the CSVs) and consolidation folder
-        # (where the consolidated workbook is saved). Both are remembered in
-        # config.json and both can be changed with their "Examinar..." button.
         self.path_var = tk.StringVar(
             value=(cfg.get("ruta_descarga") or "").strip() or ruta_input_default
         )
         self.consolidacion_path_var = tk.StringVar(
             value=(cfg.get("ruta_consolidacion") or "").strip() or ruta_output_default
         )
-        os.makedirs(ruta_input_default, exist_ok=True)  # make sure the default one exists
+        os.makedirs(ruta_input_default, exist_ok=True)
 
         self._build_ui()
-        self._ajustar_alto_ventana()  # keep everything visible (DPI / extra row)
-        self._on_mode_change()  # shows the right frame + the first preview
+        self._ajustar_alto_ventana()
+        self._on_mode_change()
 
-    # ------------------------------------------------------------------
-    # Persistence of the last folders used (config.json)
-    # ------------------------------------------------------------------
+    # --- config.json (last folders used) ---
     def _cargar_config(self):
         """Read the whole config.json (dict). If it does not exist or fails → {}."""
         try:
@@ -125,17 +105,9 @@ class ValidacionFacturaGUI:
                     f, ensure_ascii=False, indent=2,
                 )
         except OSError as e:
-            # Not critical: if it cannot be saved, the app keeps working.
             print(f"[CONFIG] No se pudo guardar la configuración: {e}")
 
-    # ------------------------------------------------------------------
-    # Building the interface
-    #
-    # Structure: a fixed header on top, a Notebook with two tabs in the middle
-    # ("Descarga y Consolidación" and "Configuración") and the status bar
-    # ALWAYS visible at the bottom (outside the Notebook), so the status shows
-    # no matter which tab you are on.
-    # ------------------------------------------------------------------
+    # --- Interface: header, Notebook with two tabs, status bar always visible below ---
     def _build_ui(self):
         main = tk.Frame(self.root, bg=self.bg_color, padx=24, pady=18)
         main.pack(fill="both", expand=True)
@@ -158,7 +130,7 @@ class ValidacionFacturaGUI:
             style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"),
                             padding=(16, 8))
         except Exception:
-            pass  # if the machine's theme ignores the style, no harm done
+            pass
 
         notebook = ttk.Notebook(main)
         notebook.pack(fill="both", expand=True)
@@ -178,9 +150,7 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg="#666666",
         ).pack(pady=(12, 0))
 
-    # ------------------------------------------------------------------
-    # Tab 1: "Descarga y Consolidación" (mode, dates, file names, buttons)
-    # ------------------------------------------------------------------
+    # --- Tab 1: Descarga y Consolidación ---
     def _build_tab_descarga(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
@@ -259,11 +229,10 @@ class ValidacionFacturaGUI:
                 bg=self.bg_color, fg="#999999",
             ).grid(row=row, column=2, sticky="w")
 
-        # Recompute the preview whenever any date changes
         for var in (self.date_single_var, self.date_from_var, self.date_to_var):
             var.trace_add("write", lambda *_: self._update_filename_preview())
 
-        # --- Output info (file names ONLY; the folder lives in the "Configuración" tab) ---
+        # --- Output file names (the folder is in the Configuración tab) ---
         info_frame = tk.Frame(cont, bg=self.light_gray, bd=1, relief=tk.SOLID)
         info_frame.pack(fill="x", pady=(0, 14))
 
@@ -275,7 +244,7 @@ class ValidacionFacturaGUI:
             wraplength=500,
         ).pack(fill="x", padx=12, pady=10)
 
-        # --- Action buttons: download and consolidate (separate) ---
+        # --- Action buttons ---
         btn_frame = tk.Frame(cont, bg=self.bg_color)
         btn_frame.pack(fill="x", pady=(4, 0))
 
@@ -286,46 +255,51 @@ class ValidacionFacturaGUI:
             activebackground=self.secondary_color, activeforeground=self.bg_color,
         )
 
-        # Row of single-transaction downloads (above the combined button).
-        # Same blue because they are the same SAP downloads, but narrower,
-        # shorter and in italics so they read as "variants" of the main one.
+        # Single-transaction buttons: same blue, smaller and in italics (variants of the main one).
         _btn_individual_kwargs = dict(
             _btn_kwargs, font=("Segoe UI", 10, "bold italic"), pady=6,
         )
         fila_individual = tk.Frame(btn_frame, bg=self.bg_color)
         fila_individual.pack(fill="x", pady=(0, 8))
-        # uniform= forces the three columns to the exact same width, even
-        # though the button labels have different lengths.
+        # uniform= gives the three columns the same width whatever their labels.
         fila_individual.columnconfigure(0, weight=1, uniform="descargas")
         fila_individual.columnconfigure(1, weight=1, uniform="descargas")
         fila_individual.columnconfigure(2, weight=1, uniform="descargas")
 
         self.download_gallo_btn = tk.Button(
-            fila_individual, text="🐓 Solo Gallo",
+            fila_individual, text="🐓 Gallo",
             command=self._handle_gallo, **_btn_individual_kwargs,
         )
         self.download_gallo_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.download_monivoi_btn = tk.Button(
-            fila_individual, text="📊 Solo Monivoi",
+            fila_individual, text="📊 Monivoi",
             command=self._handle_monivoi, **_btn_individual_kwargs,
         )
         self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=4)
 
         self.download_eiap_btn = tk.Button(
-            fila_individual, text="📈 Solo Venta EIAP",
+            fila_individual, text="📈 Venta EIAP",
             command=self._handle_eiap, **_btn_individual_kwargs,
         )
         self.download_eiap_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.download_btn = tk.Button(
-            btn_frame, text="🐓📊🧾 Descargar Gallo + Monivoi + VBRL",
+            btn_frame, text="🐓📊🧾📑 Descargar Gallo + Monivoi + VBRL + FB03",
             command=self._handle_todos, **_btn_kwargs,
         )
         self.download_btn.pack(fill="x")
 
-        # The consolidation button is green to tell "bring data" (blue) apart
-        # from "process data" (green).
+        self.paralelo_chk = tk.Checkbutton(
+            btn_frame, text="⚡ En paralelo (prueba): por pasadas, en varias ventanas de SAP",
+            variable=self.paralelo_var,
+            font=("Segoe UI", 9), bg=self.bg_color, fg=self.primary_color,
+            activebackground=self.bg_color, selectcolor=self.light_gray,
+            cursor="hand2", anchor="w",
+        )
+        self.paralelo_chk.pack(fill="x", pady=(6, 0))
+
+        # Green 'process data', as opposed to the blue 'bring data' buttons.
         _btn_consolidar_kwargs = dict(_btn_kwargs, bg=self.success_color)
         self.consolidar_btn = tk.Button(
             btn_frame, text="🧩 Consolidar...!",
@@ -333,9 +307,7 @@ class ValidacionFacturaGUI:
         )
         self.consolidar_btn.pack(fill="x", pady=(10, 0))
 
-    # ------------------------------------------------------------------
-    # Tab 2: "Configuración" (company code + download/consolidation folders)
-    # ------------------------------------------------------------------
+    # --- Tab 2: Configuración (company code and folders) ---
     def _build_tab_config(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
@@ -383,10 +355,7 @@ class ValidacionFacturaGUI:
             cursor="hand2", padx=12, command=self._elegir_carpeta,
         ).pack(side=tk.LEFT)
 
-        # --- Consolidation folder (where the consolidated workbook is saved) ---
-        # Same as the download one: it can be typed by hand or picked with
-        # "Examinar...". The button is green to tie it visually to the
-        # consolidate button.
+        # --- Consolidation folder (green, like the consolidate button) ---
         cons_path_frame = tk.LabelFrame(
             cont, text="  Carpeta de consolidación  ",
             font=("Segoe UI", 10, "bold"),
@@ -408,18 +377,16 @@ class ValidacionFacturaGUI:
             cursor="hand2", padx=12, command=self._elegir_carpeta_consolidacion,
         ).pack(side=tk.LEFT)
 
-    # ------------------------------------------------------------------
-    # Folder selection (download and consolidation)
-    # ------------------------------------------------------------------
+    # --- Folder pickers ---
     def _elegir_carpeta(self):
         """Open the file browser so the stakeholder can pick the download folder."""
         carpeta = filedialog.askdirectory(
             title="Elige la carpeta donde se descargarán los archivos",
             initialdir=self.path_var.get() or os.path.expanduser("~"),
         )
-        if carpeta:  # if the user cancels, nothing is touched
+        if carpeta:
             self.path_var.set(os.path.normpath(carpeta))
-            self._guardar_config()  # remember the choice for next time
+            self._guardar_config()
 
     def _elegir_carpeta_consolidacion(self):
         """File browser to pick where the consolidated workbook will be saved."""
@@ -431,12 +398,7 @@ class ValidacionFacturaGUI:
             self.consolidacion_path_var.set(os.path.normpath(carpeta))
             self._guardar_config()
 
-    # ------------------------------------------------------------------
-    # File-name preview. None of the names carries a date offset: Monivoi's +1
-    # day only applies to the SAP query (utils.fecha_efectiva_monivoi). VBRL is
-    # not downloaded by date; it carries the same dates as the Monivoi file it
-    # is built from.
-    # ------------------------------------------------------------------
+    # --- File names: the typed dates, no offsets (those only apply to the SAP queries) ---
     def _preview_nombre(self):
         try:
             if self.mode_var.get() == "single":
@@ -470,9 +432,19 @@ class ValidacionFacturaGUI:
         except ValueError:
             return "(fecha inválida)"
 
+    def _preview_nombre_fb03(self):
+        try:
+            if self.mode_var.get() == "single":
+                return nombre_archivo_dia_fb03(self.date_single_var.get().strip())
+            return nombre_archivo_rango_fb03(
+                self.date_from_var.get().strip(),
+                self.date_to_var.get().strip(),
+            )
+        except ValueError:
+            return "(fecha inválida)"
+
     def _preview_nombre_eiap(self):
-        # 'Solo Venta EIAP' only works with a range; the name carries the dates
-        # as typed (the -1 day on the end date only applies to the SAP query).
+        # 'Venta EIAP' only works with a range.
         if self.mode_var.get() == "single":
             return "(sólo con 'Varios días')"
         try:
@@ -488,12 +460,10 @@ class ValidacionFacturaGUI:
             f"📄 Gallo:      {self._preview_nombre()}\n"
             f"📄 Monivoi:  {self._preview_nombre_monivoi()}\n"
             f"📄 VBRL:       {self._preview_nombre_vbrl()}\n"
+            f"📄 FB03:       {self._preview_nombre_fb03()}\n"
             f"📄 Venta EIAP: {self._preview_nombre_eiap()}"
         )
 
-    # ------------------------------------------------------------------
-    # Switch mode
-    # ------------------------------------------------------------------
     def _on_mode_change(self):
         if self.mode_var.get() == "single":
             self.range_frame.pack_forget()
@@ -504,12 +474,8 @@ class ValidacionFacturaGUI:
         self._update_filename_preview()
 
     def _ajustar_alto_ventana(self):
-        """
-        The window is fixed-size, but with display scaling (125%/150%) the
-        content can require more height than the design size and the bottom
-        buttons would be clipped. Measure with the "Varios días" frame (the
-        taller of the two) and grow ONLY when needed; never below the base
-        size. _on_mode_change() then re-shows the correct frame.
+        """Grow the window ONLY when display scaling makes the content taller than the design size
+        (measured with the taller 'Varios días' frame).
         """
         self.single_frame.pack_forget()
         self.range_frame.pack(fill="x")
@@ -519,9 +485,7 @@ class ValidacionFacturaGUI:
         self.root.geometry(f"{ancho}x{alto}")
         self.range_frame.pack_forget()
 
-    # ------------------------------------------------------------------
-    # Validation and configuration
-    # ------------------------------------------------------------------
+    # --- Validation and configuration ---
     def validate_dates(self):
         try:
             if self.mode_var.get() == "single":
@@ -536,13 +500,12 @@ class ValidacionFacturaGUI:
             messagebox.showerror("Error", "Formato de fecha inválido. Use DD.MM.YYYY")
             return False
 
-        # --- Validate the download folder ---
         ruta = self.path_var.get().strip()
         if not ruta:
             messagebox.showerror("Error", "Indica una carpeta de descarga válida.")
             return False
         try:
-            os.makedirs(ruta, exist_ok=True)  # creates it if it does not exist yet
+            os.makedirs(ruta, exist_ok=True)
         except OSError as e:
             messagebox.showerror(
                 "Error", f"No se pudo usar la carpeta de descarga:\n{ruta}\n\n{e}"
@@ -553,16 +516,17 @@ class ValidacionFacturaGUI:
 
     def get_config(self, transaccion="gallo"):
         mode = self.mode_var.get()
-        # Any other value falls back to the Gallo name (the default).
+        # Any other value falls back to the Gallo name.
         nombres = {
             "monivoi": self._preview_nombre_monivoi,
             "vbrl":    self._preview_nombre_vbrl,
+            "fb03":    self._preview_nombre_fb03,
             "eiap":    self._preview_nombre_eiap,
         }
         filename = nombres.get(transaccion, self._preview_nombre)()
         input_path = self.path_var.get().strip()
-        os.makedirs(input_path, exist_ok=True)  # creates the folder if it does not exist yet
-        self._guardar_config()  # remember the folder used in this run
+        os.makedirs(input_path, exist_ok=True)
+        self._guardar_config()
         cfg = {
             "mode":       mode,
             "sociedad":   self.sociedad_var.get().strip().upper() or "MX21",
@@ -580,7 +544,7 @@ class ValidacionFacturaGUI:
         """Folder where the consolidated workbook will be saved (created if missing)."""
         ruta = self.consolidacion_path_var.get().strip()
         os.makedirs(ruta, exist_ok=True)
-        self._guardar_config()  # remember the folder used
+        self._guardar_config()
         return ruta
 
     def set_status(self, message):
@@ -601,10 +565,16 @@ class ValidacionFacturaGUI:
     def disable_buttons(self):
         for btn, _ in self._botones_accion():
             btn.config(state="disabled", bg="#666666")
+        self.paralelo_chk.config(state="disabled")
 
     def enable_buttons(self):
         for btn, color in self._botones_accion():
             btn.config(state="normal", bg=color)
+        self.paralelo_chk.config(state="normal")
+
+    def usar_paralelo(self):
+        """True if the 'en paralelo' checkbox is ticked (read by the controller)."""
+        return bool(self.paralelo_var.get())
 
     # --- Handlers ---
     def _disparar(self, callback, transaccion="gallo"):
@@ -635,7 +605,6 @@ class ValidacionFacturaGUI:
 
 
 def main():
-    # Standalone entry point to see the GUI without the controller.
     root = tk.Tk()
     ValidacionFacturaGUI(root)
     root.mainloop()
