@@ -14,13 +14,13 @@ from tkinter import messagebox, filedialog
 import pandas as pd
 
 from Descargas_SAP import (
-    Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, CUENTAS_EIAP,
+    Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, CUENTAS_EIAP, CLASES_EIAP,
     VBRL_ZSE16, FB03_Documentos, DescargaPorRevisarError,
     Archivos, Excel, Paralelo, MAX_VENTANAS_SAP,
 )
 from Consolidacion import (
-    consolidar_gallo_monivoi, leer_documentos_monivoi, leer_documentos_gallo_fb03,
-    EtapaDocumentosFB03,
+    consolidar_gallo_monivoi, consolidar_venta_eiap, leer_documentos_monivoi,
+    leer_documentos_gallo_fb03, EtapaDocumentosFB03,
 )
 from utils import FORMATO_FECHA, parse_fecha, fecha_efectiva_eiap
 
@@ -491,8 +491,8 @@ class ValidacionFacturaController:
 
     # --- Consolidation ---
     def execute_consolidacion(self):
-        """Consolidate the Gallo and Monivoi CSVs of the GUI dates (VBRL optional), offering to pick
-        by hand a file that is not where it is expected.
+        """Consolidate the Gallo and Monivoi CSVs of the GUI dates (VBRL and FB03 optional), offering to
+        pick by hand a file that is not where it is expected.
         """
         if self._ocupado:
             return
@@ -502,7 +502,12 @@ class ValidacionFacturaController:
         cfg_gallo   = self.gui.get_config("gallo")
         cfg_monivoi = self.gui.get_config("monivoi")
         cfg_vbrl    = self.gui.get_config("vbrl")
+        cfg_eiap    = self.gui.get_config("eiap")
         input_path  = cfg_gallo["input_path"]
+
+        if self._solo_eiap(cfg_eiap, cfg_gallo, cfg_monivoi):
+            self._consolidar_solo_eiap(cfg_eiap)
+            return
 
         ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
         if not ruta_gallo:
@@ -513,6 +518,14 @@ class ValidacionFacturaController:
         ruta_vbrl, cancelar = self._resolver_vbrl(input_path, cfg_vbrl["filename"], ruta_monivoi)
         if cancelar:
             return
+        # The FB03 only matters together with the VBRL (the Notas de crédito / PEP Vouchers tables
+        # read both): without a VBRL it is not even asked for.
+        ruta_fb03 = None
+        if ruta_vbrl:
+            cfg_fb03 = self.gui.get_config("fb03")
+            ruta_fb03, cancelar = self._resolver_fb03(input_path, cfg_fb03["filename"], ruta_gallo)
+            if cancelar:
+                return
 
         # Every day of the period, so they show in the sales matrices even without amounts.
         fechas_seleccionadas = self._fechas_seleccionadas(cfg_gallo)
@@ -530,12 +543,19 @@ class ValidacionFacturaController:
             f"  🧾 VBRL    : {os.path.basename(ruta_vbrl)}\n" if ruta_vbrl
             else "  🧾 VBRL    : (sin VBRL: no se generan 'VBRL' ni 'TD.Diferencias_Referencias')\n"
         )
+        if ruta_fb03:
+            linea_fb03 = f"  📑 FB03    : {os.path.basename(ruta_fb03)}\n"
+        elif ruta_vbrl:
+            linea_fb03 = ("  📑 FB03    : (sin FB03: no se generan 'FB', 'Notas de crédito' "
+                          "ni 'PEP Vouchers')\n")
+        else:
+            linea_fb03 = ""
         confirm = messagebox.askyesno(
             "Confirmar consolidación",
             f"¿Consolidar estos archivos en un solo Excel?\n\n"
             f"  🐓 Gallo   : {os.path.basename(ruta_gallo)}\n"
             f"  📊 Monivoi : {os.path.basename(ruta_monivoi)}\n"
-            f"{linea_vbrl}\n"
+            f"{linea_vbrl}{linea_fb03}\n"
             f"Se generará:\n  {nombre_salida}\n\n"
             f"En la carpeta:\n  {ruta_output}"
         )
@@ -551,6 +571,7 @@ class ValidacionFacturaController:
                 callback_status=self.gui.set_status,
                 fechas_seleccionadas=fechas_seleccionadas,
                 ruta_vbrl=ruta_vbrl,
+                ruta_fb03=ruta_fb03,
             )
 
             nota_monivoi = (
@@ -565,6 +586,7 @@ class ValidacionFacturaController:
                 + (resumen.get("cruce_avisos") or [])
                 + (resumen.get("vbrl_avisos") or [])
                 + (resumen.get("td_referencias_avisos") or [])
+                + (resumen.get("notas_pep_avisos") or [])
             )
             nota_ventas = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
 
@@ -577,6 +599,16 @@ class ValidacionFacturaController:
                 )
                 if resumen["vbrl_sin_datos"]:
                     lineas_vbrl += "\n⚠️ El archivo de VBRL venía sin datos; su pestaña quedó vacía."
+                if resumen.get("fb03_incluido"):
+                    lineas_vbrl += (
+                        f"\n  • Filas FB03               : {resumen['filas_fb']:,}"
+                        f"\n  • Notas de crédito         : {resumen['filas_notas_ref']:,}"
+                        f"  (Σ {resumen['total_notas_ref']:,.2f})"
+                        f"\n      …en #N/A               : {resumen['notas_ref_na']:,}"
+                        f"\n  • PEP Vouchers             : {resumen['filas_pep_ref']:,}"
+                        f"  (Σ {resumen['total_pep_ref']:,.2f})"
+                        f"\n      …en #N/A               : {resumen['pep_ref_na']:,}"
+                    )
 
             self.gui.set_status("✅ ¡Consolidación completada!")
             messagebox.showinfo(
@@ -589,6 +621,79 @@ class ValidacionFacturaController:
                 f"  • Globales (filtro final)  : {resumen['filas_globales']:,}\n"
                 f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}"
                 f"{lineas_vbrl}{nota_monivoi}{nota_ventas}"
+            )
+        except (FileNotFoundError, ValueError) as e:
+            self.gui.set_status("❌ Error en la consolidación")
+            messagebox.showerror("Error en la consolidación", str(e))
+        except Exception as e:
+            self.gui.set_status("❌ Error en la consolidación")
+            messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
+        finally:
+            self._ocupado = False
+            self.gui.enable_buttons()
+            if "completada" not in self.gui.status_var.get():
+                self.gui.set_status("✓ Listo para comenzar")
+
+    def _solo_eiap(self, cfg_eiap, cfg_gallo, cfg_monivoi):
+        """True when the folder has the EIAP file of the GUI range and neither the Gallo nor the Monivoi
+        one: only 'Solo Venta EIAP' was downloaded. (With any of those two, the usual flow runs.)
+        """
+        if cfg_eiap["mode"] != "range":
+            return False
+        def existe(cfg):
+            return os.path.exists(os.path.join(cfg["input_path"], cfg["filename"]))
+        return existe(cfg_eiap) and not existe(cfg_gallo) and not existe(cfg_monivoi)
+
+    def _consolidar_solo_eiap(self, cfg):
+        """Consolidate ONLY the 'Venta EIAP' download: a workbook with its single tab."""
+        error = self._validar_eiap(cfg)
+        if error:
+            messagebox.showerror("Venta EIAP", error)
+            return
+        ruta_eiap = os.path.join(cfg["input_path"], cfg["filename"])
+        hasta = fecha_efectiva_eiap(cfg["date_to"]).strftime(FORMATO_FECHA)
+        # Every day SAP was queried for (Hasta - 1), so they all show even without amounts.
+        fechas_seleccionadas = self._iterar_dias(cfg["date_from"], hasta)
+
+        try:
+            ruta_output = self.gui.get_consolidacion_path()
+        except OSError as e:
+            messagebox.showerror(
+                "Error", f"No se pudo usar la carpeta de consolidación:\n{e}"
+            )
+            return
+        nombre_salida = f"Consolidado_{os.path.splitext(cfg['filename'])[0]}.xlsx"
+
+        confirm = messagebox.askyesno(
+            "Confirmar consolidación",
+            f"Sólo se encontró la descarga de Venta EIAP (no hay Gallo ni Monivoi).\n"
+            f"Se generará un Excel con la pestaña 'Venta EIAP' únicamente.\n\n"
+            f"  🛒 Venta EIAP: {cfg['filename']}\n"
+            f"  Periodo       : {cfg['date_from']} — {hasta}\n\n"
+            f"Se generará:\n  {nombre_salida}\n\n"
+            f"En la carpeta:\n  {ruta_output}"
+        )
+        if not confirm:
+            return
+
+        self._ocupado = True
+        try:
+            self.gui.disable_buttons()
+            resumen = consolidar_venta_eiap(
+                ruta_eiap, ruta_output,
+                nombre_salida=nombre_salida,
+                callback_status=self.gui.set_status,
+                fechas_seleccionadas=fechas_seleccionadas,
+            )
+            avisos = resumen.get("venta_avisos") or []
+            nota = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
+            self.gui.set_status("✅ ¡Consolidación completada!")
+            messagebox.showinfo(
+                "Consolidación completada",
+                f"Archivo generado:\n{resumen['ruta']}\n\n"
+                f"  • Filas Venta EIAP         : {resumen['filas_eiap']:,}\n"
+                f"  • Σ Importe en moneda local: {resumen['total_venta_eiap']:,.2f}"
+                f"{nota}"
             )
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la consolidación")
@@ -640,6 +745,55 @@ class ValidacionFacturaController:
                 "Probablemente no cubre las facturas actuales y saldrían 'Sin timbre' de más.\n\n"
                 "Sí = usarlo de todos modos\n"
                 "No = consolidar SIN VBRL\n"
+                "Cancelar = no consolidar",
+            )
+            if decision is None:
+                return None, True
+            if not decision:
+                return None, False
+        return ruta, False
+
+    def _resolver_fb03(self, input_path, filename, ruta_gallo):
+        """The FB03 CSV (OPTIONAL, only asked for together with a VBRL) → (ruta or None = without FB03,
+        cancelar = do not consolidate).
+        """
+        ruta = os.path.join(input_path, filename)
+        if not os.path.exists(ruta):
+            decision = messagebox.askyesnocancel(
+                "Archivo de FB03 no encontrado",
+                f"No encontré el archivo esperado:\n\n  {filename}\n\n"
+                f"en la carpeta:\n  {input_path}\n\n"
+                "Sin FB03 el Excel sale sin las tablas 'Notas de crédito' y 'PEP Vouchers' "
+                "(ni la pestaña 'FB').\n\n"
+                "Sí = consolidar SIN FB03\n"
+                "No = seleccionar el archivo manualmente\n"
+                "Cancelar = no consolidar",
+            )
+            if decision is None:
+                return None, True
+            if decision:
+                return None, False
+            ruta = filedialog.askopenfilename(
+                title="Selecciona el CSV de FB03",
+                initialdir=input_path,
+                filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
+            )
+            if not ruta:
+                return None, True
+
+        # The FB03 list comes from the Gallo: one OLDER than it may not cover its documents (#N/A).
+        try:
+            fb03_anterior = os.path.getmtime(ruta) < os.path.getmtime(ruta_gallo) - 2
+        except OSError:
+            fb03_anterior = False
+        if fb03_anterior:
+            decision = messagebox.askyesnocancel(
+                "FB03 anterior al archivo de Gallo",
+                f"El archivo de FB03:\n  {os.path.basename(ruta)}\n"
+                f"se descargó ANTES que el de Gallo:\n  {os.path.basename(ruta_gallo)}\n\n"
+                "Probablemente no cubre los documentos actuales y saldrían #N/A de más.\n\n"
+                "Sí = usarlo de todos modos\n"
+                "No = consolidar SIN FB03\n"
                 "Cancelar = no consolidar",
             )
             if decision is None:
@@ -836,5 +990,6 @@ class ValidacionFacturaController:
         return (
             f"Consulta en SAP : {config['date_from']} — {hasta}\n"
             "(a la Fecha Hasta se le resta 1 día, sólo en este botón)\n"
-            f"Cuentas         : {', '.join(CUENTAS_EIAP)}\n\n"
+            f"Cuentas         : {', '.join(CUENTAS_EIAP)}\n"
+            f"Clases de doc.  : {', '.join(CLASES_EIAP)}\n\n"
         )

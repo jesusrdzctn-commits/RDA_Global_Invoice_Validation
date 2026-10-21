@@ -37,9 +37,10 @@ from utils import (
     nombre_archivo_rango_eiap,
     fecha_efectiva_monivoi_str,
     fecha_efectiva_eiap,
+    CUENTAS_EIAP,
+    CLASES_EIAP,
 )
 
-CUENTAS_EIAP = ("4000010", "4000020", "4000802", "4300013")   # 'Solo Venta EIAP' (shown in the confirmation)
 MAX_VENTANAS_SAP = 4                                           # corporate limit of SAP windows per user
 _SOCIEDAD = "MX21"                                             # default company code (BUKRS)
 _ESPERA_CONSULTA = 1800        # upper bound (s) for a report; the wait returns as soon as SAP is free
@@ -994,15 +995,42 @@ class Gallo(Descarga):
     """FAGLL03 ('Gallo'): GL line items of the Gallo accounts for the period, ONE query → ONE file."""
     NOMBRE = "Gallo_FAGLL03"
     MARCA = "FAGLL03"
-    CUENTAS = ["4000005", "4000010", "4150000", "4200000", "4200004", "4200015", "4260000", "7000005"]
+    CUENTAS = ["4000005", "4150000", "4200000", "4200004", "4200015", "4260000", "7000005"]
     VARIANTE = "BASE/VALID"
 
-    def __init__(self, desde, hasta, carpeta, archivo, sociedad, cuentas, variante, session):
+    # 'Dynamic selections' (EIAP only). Tree node keys come from a recording: they are system-specific.
+    ARBOL = "wnd[0]/shellcont/shellcont/shell/shellcont[0]/shell"
+    NODO_PADRE, NODO_CLASE = " " * 9 + "23", " " * 9 + "30"
+    BTN_CLASES = "wnd[0]/usr/btn%_%%DYN001_%_APP_%-VALU_PUSH"
+    FILA_CLASE = ("wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssubSCREEN_HEADER:SAPLALDB:3010/"
+                  "tblSAPLALDBSINGLE/ctxtRSCSEL_255-SLOW_I[1,{}]")
+
+    def __init__(self, desde, hasta, carpeta, archivo, sociedad, cuentas, variante, session, clases=None):
         super().__init__(carpeta, archivo or nombre_archivo_dia(hasta), session)
         self.desde, self.hasta = desde, hasta
         self.sociedad = sociedad
         self.cuentas = cuentas or self.CUENTAS
         self.variante = variante or self.VARIANTE
+        self.clases = tuple(clases or ())              # document classes to filter by (empty = all)
+
+    def filtrar_clases(self, s):
+        """Dynamic selections > document class = self.clases (port of the EIAP recording)."""
+        s.findById("wnd[0]/tbar[1]/btn[25]").press()
+        arbol = s.findById(self.ARBOL)
+        arbol.expandNode(self.NODO_PADRE)
+        arbol.selectNode(self.NODO_CLASE)
+        arbol.topNode = self.NODO_PADRE
+        arbol.doubleClickNode(self.NODO_CLASE)
+        s.findById(self.BTN_CLASES).press()
+        for i, clase in enumerate(self.clases):
+            fila = s.findById(self.FILA_CLASE.format(i))
+            fila.text = clase
+            fila.setFocus()
+            fila.caretPosition = len(clase)
+        s.findById("wnd[1]/tbar[0]/btn[8]").press()                   # copy
+        if not SAP.esperar_cierre(s):
+            raise RuntimeError("El popup de selección de clases de documento sigue abierto.")
+        s.findById("wnd[0]/tbar[0]/btn[11]").press()
 
     def pasos(self):
         for fecha in (self.desde, self.hasta):
@@ -1012,6 +1040,8 @@ class Gallo(Descarga):
         s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFAGLL03"
         s.findById("wnd[0]").sendVKey(0)
+        if self.clases:
+            self.filtrar_clases(s)
 
         # Accounts: all at once through the clipboard (no row-by-row typing or scrolling).
         s.findById("wnd[0]/usr/btn%_SD_SAKNR_%_APP_%-VALU_PUSH").press()
@@ -1504,7 +1534,10 @@ class VBRL(DescargaConLista):
     # XLOOKUP): keep these in sync with Consolidacion.EtapaVBRL.COL_FACTURA / COL_IMPORTE.
     MIN_COLUMNAS = 5
     COL_FACTURA = 3                # 0-based: column D
+    # Share of column D that must look like an invoice as SAP exports it: 'C' + digits ('C270043678'),
+    # or the bare digits of a billing document (~0.2% of the rows).
     MIN_NUMERICA = 0.9
+    PATRON_FACTURA = r"[Cc]?[0-9]+(\.0+)?"
     MENSAJES_SIN_DATOS = (
         "no table entries",
         "ninguna entrada de tabla",
@@ -1578,10 +1611,10 @@ class VBRL(DescargaConLista):
         col = col[col != ""]
         if col.empty:
             raise RuntimeError(f"la columna D del archivo de VBRL está vacía. Columnas: {columnas}")
-        fraccion = float(col.str.fullmatch(r"[0-9]+(\.0+)?").mean())
+        fraccion = float(col.str.fullmatch(cls.PATRON_FACTURA).mean())
         if fraccion < cls.MIN_NUMERICA:
             raise RuntimeError(f"la columna D del archivo de VBRL no parece de facturas (sólo {fraccion:.0%} "
-                               f"de sus valores son numéricos; primero: {col.iloc[0]!r}). "
+                               f"de sus valores son 'C' + dígitos o un número; primero: {col.iloc[0]!r}). "
                                f"Columnas: {columnas}")
 
 
@@ -1676,9 +1709,9 @@ class FB03(DescargaConLista):
 # handled error (printed in the console). `session`: the SAP window of a parallel run.
 # ======================================================================
 def Gallo_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD,
-                  cuentas=None, variante=Gallo.VARIANTE, session=None):
+                  cuentas=None, variante=Gallo.VARIANTE, session=None, clases=None):
     """FAGLL03 for 'DD.MM.YYYY' dates → FileName (default: nombre_archivo_dia(DateTo))."""
-    return Gallo(DateFrom, DateTo, FolderPath, FileName, sociedad, cuentas, variante, session).ejecutar()
+    return Gallo(DateFrom, DateTo, FolderPath, FileName, sociedad, cuentas, variante, session, clases).ejecutar()
 
 
 def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD, session=None):
@@ -1702,6 +1735,7 @@ def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad
         sociedad=sociedad,
         cuentas=list(CUENTAS_EIAP),
         session=session,
+        clases=CLASES_EIAP,
     )
 
 

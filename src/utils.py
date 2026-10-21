@@ -1,7 +1,8 @@
 """Validación Factura Global — helpers without SAP or tkinter (the GUI opens and tests on its own).
 
 The ONLY place for the Spanish months, the file-name formats and the two date offsets of the
-SAP queries: Monivoi +1 day and 'Solo Venta EIAP' −1 day on the end date. File NAMES always
+SAP queries: Monivoi +1 day and 'Solo Venta EIAP' −1 day on the end date, plus the accounts and
+document classes of 'Solo Venta EIAP' (asked to SAP AND summed by its tab). File NAMES always
 keep the dates the user typed.
 """
 
@@ -9,6 +10,10 @@ from datetime import datetime, timedelta
 
 # Date format the user types everywhere in the app.
 FORMATO_FECHA = "%d.%m.%Y"
+
+# 'Solo Venta EIAP': what SAP is asked for AND what its consolidated tab sums (one source for both).
+CUENTAS_EIAP = ("4000010", "4000020", "4000802", "4300013")
+CLASES_EIAP = ("RV", "DA")
 
 MESES_ES = {
     1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
