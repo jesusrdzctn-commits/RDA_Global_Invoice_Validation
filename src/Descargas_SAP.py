@@ -2,12 +2,14 @@
 Validación Factura Global — SAP downloads (SAP GUI scripting)
 
 Gallo (FAGLL03), Monivoi (ZLMXCOM_TRN_MONINVOI), VBRL (ZSE16), FB03 (document list) and
-Venta EIAP (FAGLL03 with the EIAP accounts). Every download follows its VBS recording; the
-extra steps are guards that stop the run instead of exporting wrong data.
+Venta EIAP (FAGLL03 with the EIAP accounts); after the consolidation, the 2nd run: VBRP, VBRK,
+VBRL (2nd run), KNVP, BKPF (ZSE16) and FBL5N (customer search help). Every download follows its
+VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
 
     SAP, Portapapeles, Excel, Archivos      helpers shared by every download
     Paralelo                                several SAP windows at once (the P&L way)
-    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03
+    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03, FBL5N, TablaZSE16 → VBRP, VBRK,
+    VBRL2, KNVP, BKPF
     Gallo_FAGLL03(), Monivoi_ZLMXCOM()...   the entry points the controller calls
 """
 
@@ -19,6 +21,7 @@ import re
 import threading
 import time
 import traceback
+import unicodedata
 from ctypes import wintypes
 from datetime import datetime
 
@@ -55,7 +58,9 @@ class ExportacionTruncadaError(RuntimeError):
 
 
 class DescargaPorRevisarError(RuntimeError):
-    """SAP exported, but something failed afterwards; the message says what, and which file was kept."""
+    """The user must review this download (the summary shows the message): SAP exported but something
+    failed afterwards (the message says which file was kept), or SAP answered in a way that leaves no
+    file to save (FBL5N with a single hit)."""
 
 
 # ======================================================================
@@ -154,11 +159,11 @@ class SAP:
     @staticmethod
     def sin_partidas(session, ruta_archivo, mensajes_extra=()):
         """
-        SAP said "no items" (FAGLL03 codes, or the texts a transaction passes, lower case):
+        SAP said "no entries" (one of the texts the transaction passes, lower case):
         close the message, write the 'Sin datos' placeholder and return True. Never raises.
         """
         try:
-            mensajes = ("MSITEM033", "MSITEM030", "ninguna partida", "ninguna cuenta") + tuple(mensajes_extra)
+            mensajes = tuple(mensajes_extra)
             textos = [SAP.aviso(session)]
             try:
                 textos.append(session.findById("wnd[1]/usr/txtMESSTXT1").Text.strip())
@@ -651,7 +656,8 @@ class Archivos:
             carpeta = os.path.dirname(ruta_archivo)
             if carpeta:
                 os.makedirs(carpeta, exist_ok=True)
-            if ruta_archivo.lower().endswith(".csv"):
+            # .xls / .txt: the TEXT files SAP writes for a classic list (FBL5N), not real workbooks.
+            if ruta_archivo.lower().endswith((".csv", ".txt", ".xls")):
                 pd.DataFrame({"Sin datos": []}).to_csv(ruta_archivo, index=False, encoding="utf-8-sig")
             else:
                 wb = _oxl.Workbook()
@@ -690,6 +696,14 @@ class Archivos:
         """Big exports (Gallo, Monivoi) are written in bursts: size unchanged for 3 s; late → RuntimeError."""
         if not Archivos.esperar_nuevo(ruta_xlsx, desde, timeout=Archivos.ESPERA_EXPORTACION, estable=3.0):
             raise RuntimeError(f"SAP no terminó de escribir el archivo exportado: {ruta_xlsx}")
+
+    @staticmethod
+    def normalizar_encabezado(texto):
+        """A header compared without accents, dots, spaces or case ('Solic.' == 'solic'): the same rule
+        as Consolidacion.Comun.normalizar_encabezado, which reads these files afterwards."""
+        sin_acentos = unicodedata.normalize("NFKD", str(texto))
+        sin_acentos = "".join(c for c in sin_acentos if not unicodedata.combining(c))
+        return "".join(c for c in sin_acentos.lower() if c.isalnum())
 
     @staticmethod
     def normalizar_documentos(documentos, etiqueta):
@@ -842,13 +856,15 @@ class Paralelo:
             pendientes.extend((actual.__cause__, actual.__context__))
 
     @classmethod
-    def correr(cls, trabajos, al_esperar=None, intervalo=1.0):
+    def correr(cls, trabajos, al_esperar=None, intervalo=1.0, al_terminar=None):
         """
         Run every job — (window index, function, args) — in its own thread at the same time and
         wait for all of them. Returns, in order, (True, result) or (False, exception) per job.
         `al_esperar(positions still running)` is called from THIS thread about every `intervalo`
         s (Tk must only be touched by its own thread); if it raises, the windows are still
-        waited for before the error goes up.
+        waited for before the error goes up. `al_terminar(position)` runs in the job's own
+        thread as soon as it ends, WHATEVER happened (even if its window could not be reached):
+        the place to release another window that waits for this one. Never Tk there.
         """
         salidas = [None] * len(trabajos)
 
@@ -857,6 +873,12 @@ class Paralelo:
                 salidas[posicion] = (True, cls.en_ventana(indice, funcion, *args))
             except BaseException as e:
                 salidas[posicion] = (False, e)
+            finally:
+                if al_terminar is not None:
+                    try:
+                        al_terminar(posicion)
+                    except Exception as e:
+                        print(f"[PARALELO] al_terminar falló en el trabajo {posicion}: {e}")
 
         hilos = []
         for posicion, (indice, funcion, args) in enumerate(trabajos):
@@ -971,20 +993,20 @@ class Descarga:
         Paralelo.marca(f"{self.MARCA}: SAP respondió la consulta")
         time.sleep(4)
 
-    def dialogo_guardar(self, boton, carpeta_obligatoria=False):
-        """The 'save as' dialog: folder and file typed in, then `boton`.
+    def dialogo_guardar(self, boton, carpeta_obligatoria=False, ventana="wnd[1]"):
+        """The 'save as' dialog (`ventana`): folder and file typed in, then `boton`.
         Returns (time just before saving, whether the folder field was there)."""
         s = self.session
         con_carpeta = True
         if carpeta_obligatoria:
-            s.findById("wnd[1]/usr/ctxtDY_PATH").text = self.carpeta
+            s.findById(f"{ventana}/usr/ctxtDY_PATH").text = self.carpeta
         else:
             try:
-                s.findById("wnd[1]/usr/ctxtDY_PATH").text = self.carpeta
+                s.findById(f"{ventana}/usr/ctxtDY_PATH").text = self.carpeta
             except Exception:
                 con_carpeta = False               # then SAP saves in its own default folder
-        s.findById("wnd[1]/usr/ctxtDY_FILENAME").text = self.nombre_xlsx
-        s.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(self.nombre_xlsx)
+        s.findById(f"{ventana}/usr/ctxtDY_FILENAME").text = self.nombre_xlsx
+        s.findById(f"{ventana}/usr/ctxtDY_FILENAME").caretPosition = len(self.nombre_xlsx)
         desde = time.time()
         Paralelo.marca(f"{self.MARCA}: exportando {self.nombre_xlsx}")
         s.findById(boton).press()
@@ -1062,8 +1084,6 @@ class Gallo(Descarga):
         campo.caretPosition = len(self.variante)
 
         self.consultar()
-        if SAP.sin_partidas(s, self.ruta):
-            return False
 
         s.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
         s.findById("wnd[1]/tbar[0]/btn[0]").press()
@@ -1115,8 +1135,6 @@ class Monivoi(Descarga):
         campo.caretPosition = len(self.rfc)
 
         self.consultar()
-        if SAP.sin_partidas(s, self.ruta):
-            return False
 
         s.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
         try:
@@ -1288,11 +1306,7 @@ class ZSE16:
         casilla.setFocus()
         if not bool(casilla.selected):
             raise RuntimeError(f"No pude marcar el campo '{campo}' en 'Campos para selección'.")
-        session.findById("wnd[1]/tbar[0]/btn[0]").press()                 # OK
-        SAP.esperar_libre(session)
-
-        if not SAP.esperar_cierre(session):
-            raise RuntimeError("La ventana 'Campos para selección' sigue abierta después de OK.")
+        ZSE16.confirmar_campos(session)
         if not SAP.existe(session, "wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH"):
             raise RuntimeError(f"ZSE16 no mostró el campo de selección '{campo}' (I1).")
         if SAP.existe(session, "wnd[0]/usr/btn%_I2_%_APP_%-VALU_PUSH"):
@@ -1301,6 +1315,123 @@ class ZSE16:
                 f"ZSE16 quedó con más de un campo de selección ({campos}); "
                 f"esperaba sólo '{campo}'. Revisa 'Opciones > Campos para selección'."
             )
+
+    @staticmethod
+    def confirmar_campos(session):
+        """OK of 'Fields for selection'. If the SAME popup is still there, OK once more (VBRP.vbs
+        presses it twice); any other popup, or one that never closes, is an error.
+        """
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()                 # OK
+        SAP.esperar_libre(session)
+        if not SAP.esperar_cierre(session) and SAP.existe(session, ZSE16.BTN_DESMARCAR):
+            session.findById("wnd[1]/tbar[0]/btn[0]").press()             # OK again, as recorded
+            SAP.esperar_libre(session)
+        if not SAP.esperar_cierre(session):
+            raise RuntimeError("La ventana 'Campos para selección' sigue abierta después de OK.")
+
+    @staticmethod
+    def _abrir_campos_desmarcados(session):
+        """Settings > Fields for selection → Deselect all → its lines by row (SAP.renglones_de_lista)."""
+        session.findById(ZSE16.MENU_CAMPOS).select()
+        if not SAP.esperar(session, ZSE16.BTN_DESMARCAR, 10):
+            raise RuntimeError("SAP no abrió la ventana 'Campos para selección' de ZSE16.")
+        session.findById(ZSE16.BTN_DESMARCAR).press()
+        return SAP.renglones_de_lista(SAP.elementos_de_lista(session, "wnd[1]/usr"))
+
+    @staticmethod
+    def _marcar_renglones(session, renglones, filas, que):
+        """Tick EXACTLY the lines `filas` (one checkbox each, nothing else left ticked), read every tick
+        back, OK, and check the selection screen shows I1..In and no I(n+1). Returns their texts.
+        """
+        for fila in filas:
+            casillas = renglones.get(fila, {}).get("casillas", [])
+            if len(casillas) != 1:
+                raise RuntimeError(
+                    f"En 'Campos para selección' esperaba UNA casilla en el renglón {fila} ({que}) y "
+                    f"hay {len(casillas)}. Renglones: {SAP.resumen_renglones(renglones)}"
+                )
+        otras = [renglones[f]["texto"][:40] for f in sorted(renglones) if f not in filas
+                 for c in renglones[f]["casillas"] if bool(c.selected)]
+        if otras:
+            raise RuntimeError("El botón 'Desmarcar todo' de 'Campos para selección' dejó campos "
+                               "marcados: " + "; ".join(repr(t) for t in otras))
+        for fila in filas:
+            casilla = renglones[fila]["casillas"][0]
+            casilla.selected = True
+            if not bool(casilla.selected):
+                raise RuntimeError(f"No pude marcar el renglón {fila} ({que}) en 'Campos para selección'.")
+        renglones[filas[-1]]["casillas"][0].setFocus()
+        textos = [renglones[f]["texto"] for f in filas]
+        ZSE16.confirmar_campos(session)
+        for n in range(1, len(filas) + 1):
+            if not SAP.existe(session, f"wnd[0]/usr/btn%_I{n}_%_APP_%-VALU_PUSH"):
+                raise RuntimeError(f"ZSE16 no mostró el campo de selección I{n} ({que}).")
+        if SAP.existe(session, f"wnd[0]/usr/btn%_I{len(filas) + 1}_%_APP_%-VALU_PUSH"):
+            raise RuntimeError(
+                f"ZSE16 quedó con más campos de selección de los {len(filas)} marcados "
+                f"({', '.join(ZSE16.campos_en_pantalla(session, maximo=len(filas) + 5))}); "
+                f"esperaba sólo {que}."
+            )
+        return textos
+
+    @staticmethod
+    def marcar_campos(session, campos):
+        """`campos` (technical names, in TABLE order) as the ONLY selection fields, so they become
+        I1..In in that order. They are the first fields of the table, so they must all be on screen
+        when the popup opens (no Find: it would scroll the others away) and their lines must follow
+        the given order; otherwise I1..In would not be those fields. Returns their rows.
+        """
+        renglones = ZSE16._abrir_campos_desmarcados(session)
+        filas = []
+        for campo in campos:
+            patron = ZSE16.patron(campo)
+            candidatos = sorted(f for f, r in renglones.items()
+                                if r["casillas"] and patron.search(r["texto"].upper()))
+            if len(candidatos) != 1:
+                raise RuntimeError(
+                    f"En 'Campos para selección' esperaba UN renglón del campo '{campo}' a la vista y "
+                    f"hay {len(candidatos)}. Renglones: {SAP.resumen_renglones(renglones, maximo=25)}"
+                )
+            filas.append(candidatos[0])
+        if filas != sorted(set(filas)):
+            raise RuntimeError(
+                f"Los campos {', '.join(campos)} no aparecen en ese orden en 'Campos para selección' "
+                f"(renglones {filas}): los campos I1..I{len(campos)} no serían esos."
+            )
+        ZSE16._marcar_renglones(session, renglones, filas, ", ".join(campos))
+        return filas
+
+    @staticmethod
+    def marcar_renglones(session, filas):
+        """The lines `filas` of 'Fields for selection' (as recorded, when their field names are not
+        known) as the ONLY selection fields, I1..In. Returns their texts, so they can be reported.
+        """
+        renglones = ZSE16._abrir_campos_desmarcados(session)
+        return ZSE16._marcar_renglones(session, renglones, list(filas),
+                                       "renglones " + ", ".join(str(f) for f in filas))
+
+    @staticmethod
+    def elegir_layout_por_renglon(session, id_grid, fila):
+        """Row `fila` of the ALV grid of layouts, as recorded, when the layout's NAME is not known yet.
+        Returns the name it chose (to be reported, so it can be fixed BY NAME later); the popup must
+        close after the click.
+        """
+        grid = session.findById(id_grid)
+        filas = int(grid.RowCount)
+        if not 0 <= int(fila) < filas:
+            raise RuntimeError(f"La lista de layouts tiene {filas} renglón(es); la grabación elige "
+                               f"el renglón {fila}.")
+        try:
+            nombre = str(grid.GetCellValue(int(fila), ZSE16.COLUMNA_LAYOUT)).strip()
+        except Exception as e:
+            raise RuntimeError(f"No pude leer el nombre del layout del renglón {fila}: {e}") from e
+        grid.currentCellRow = int(fila)
+        grid.selectedRows = str(int(fila))
+        grid.clickCurrentCell()
+        SAP.esperar_libre(session)
+        if not SAP.esperar_cierre(session):
+            raise RuntimeError(f"El popup de layouts sigue abierto después de elegir '{nombre}'.")
+        return nombre
 
     @staticmethod
     def elegir_layout_en_grid(session, id_grid, nombre):
@@ -1648,10 +1779,11 @@ class FB03(DescargaConLista):
         if not re.fullmatch(r"[A-Z0-9]{1,4}", sociedad):
             raise ValueError("La sociedad debe ser un código de 1 a 4 letras o dígitos "
                              f"(se recibió {sociedad!r}).")
-        anio_desde = datetime.strptime(self.desde, "%d.%m.%Y").year
-        anio_hasta = datetime.strptime(self.hasta, "%d.%m.%Y").year
-        if anio_hasta < anio_desde:
+        fecha_desde = datetime.strptime(self.desde, "%d.%m.%Y")
+        fecha_hasta = datetime.strptime(self.hasta, "%d.%m.%Y")
+        if fecha_hasta < fecha_desde:
             raise ValueError(f"El periodo es inválido: {self.desde} — {self.hasta}.")
+        anio_desde, anio_hasta = fecha_desde.year, fecha_hasta.year
         os.makedirs(self.carpeta, exist_ok=True)
         self.borrar_restos()
 
@@ -1705,6 +1837,507 @@ class FB03(DescargaConLista):
 
 
 # ======================================================================
+# 2nd run (after the consolidation): VBRP, VBRK, VBRL 2nd run, KNVP, BKPF (ZSE16) and FBL5N.
+# Each pasos() follows its recording in Scripts (raw)/; the lists come from the #N/A rows of
+# 'TD.Diferencias_Referencias' (Consolidacion.EtapaListasSegundaCorrida) or, for FBL5N and KNVP,
+# from the 'Solic.' column of this run's VBRK.
+# ======================================================================
+class TablaZSE16(DescargaConLista):
+    """
+    A ZSE16 table queried with a list pasted through the clipboard, saved as .csv (the checks and
+    the *_REVISAR.csv of DescargaConLista). `info` (a dict, optional) receives what the run chose
+    and the user must be able to confirm without a console: 'layout' (its name) and 'campos' (the
+    texts of the selection fields ticked by position).
+    """
+    TABLA = ""
+    ARCHIVO = ""
+    LAYOUT = None                  # layout NAME (preferred); None = the recorded row below
+    FILA_LAYOUT = None             # recorded row of the layouts grid; None and no LAYOUT = no layout step
+    MENU_EXPORTAR = VBRL.MENU_EXPORTAR_GRID
+    MENSAJES_SIN_DATOS = VBRL.MENSAJES_SIN_DATOS
+
+    def __init__(self, documentos, carpeta, archivo, session, info=None):
+        super().__init__(documentos, carpeta, archivo or self.ARCHIVO, session)
+        self.info = info if info is not None else {}
+
+    def abrir_tabla(self):
+        """/nZSE16 → table name → Enter; its selection screen (MAX_SEL) must show up."""
+        s = self.conectar()
+        SAP.cerrar_popups(s)                     # a popup left by an earlier run blocks the command field
+        s.findById("wnd[0]").maximize()
+        s.findById("wnd[0]/tbar[0]/okcd").text = "/nZSE16"
+        s.findById("wnd[0]").sendVKey(0)
+        s.findById("wnd[0]/usr/ctxtGV_TABNAME").text = self.TABLA
+        s.findById("wnd[0]/usr/ctxtGV_TABNAME").caretPosition = len(self.TABLA)
+        s.findById("wnd[0]").sendVKey(0)
+        if not SAP.esperar(s, "wnd[0]/usr/txtMAX_SEL", 10):
+            raise RuntimeError(f"ZSE16 no abrió la tabla {self.TABLA}. SAP dice: "
+                               f"'{SAP.aviso(s) or '(sin mensaje)'}'.")
+        return s
+
+    def quitar_limite(self):
+        """MAX_SEL empty = no limit; anything else would cut the result silently."""
+        s = self.session
+        s.findById("wnd[0]/usr/txtMAX_SEL").text = ""
+        s.findById("wnd[0]/usr/txtMAX_SEL").setFocus()
+        valor_max = str(s.findById("wnd[0]/usr/txtMAX_SEL").text).strip()
+        if valor_max.strip("0"):
+            raise RuntimeError(f"No pude quitar el límite de resultados de ZSE16 (MAX_SEL = '{valor_max}'): "
+                               f"SAP devolvería sólo una parte de {self.TABLA}.")
+
+    def consultar_y_exportar(self, revisar=None):
+        """Execute → (no entries: placeholder, False) → layout → export → 3 × Back → guardar."""
+        self.quitar_limite()
+        self.consultar()
+        if self.sin_resultados("wnd[0]/usr/txtMAX_SEL", "la lista de resultados"):
+            return False
+        menu = self.elegir_layout()
+        self.exportar(menu)
+        self.volver_al_menu()
+        return self.guardar(revisar)
+
+    def elegir_layout(self):
+        """The layout BY NAME when LAYOUT is known, else the recorded row (its name goes to `info`, so
+        it can be fixed by name); no layout step when neither is set. Returns the export menu.
+        """
+        if self.LAYOUT is None and self.FILA_LAYOUT is None:
+            return self.MENU_EXPORTAR
+        s = self.session
+        s.findById("wnd[0]/tbar[1]/btn[33]").press()
+        modo, limite = None, time.time() + 10
+        while modo is None and time.time() < limite:
+            if SAP.existe(s, VBRL.GRID_LAYOUTS):
+                modo = "grid"
+            elif SAP.existe(s, ZSE16.BTN_BUSCAR):
+                modo = "lista"
+            else:
+                time.sleep(0.25)
+        if modo is None:
+            raise RuntimeError(f"SAP no abrió la lista de layouts de {self.TABLA}.")
+        if modo == "lista":
+            if self.LAYOUT is None:
+                SAP.cerrar_popups(s)
+                raise RuntimeError(f"La lista de layouts de {self.TABLA} salió como lista clásica: ahí sólo "
+                                   f"se puede elegir por NOMBRE y {type(self).__name__}.LAYOUT no lo tiene.")
+            nombre = ZSE16.elegir_layout_en_lista(s, self.LAYOUT)
+            menu = VBRL.MENU_EXPORTAR_LISTA
+        elif self.LAYOUT is not None:
+            nombre = ZSE16.elegir_layout_en_grid(s, VBRL.GRID_LAYOUTS, self.LAYOUT)
+            menu = self.MENU_EXPORTAR
+        else:
+            nombre = ZSE16.elegir_layout_por_renglon(s, VBRL.GRID_LAYOUTS, self.FILA_LAYOUT)
+            print(f"[{self.ETIQUETA}] Layout del renglón {self.FILA_LAYOUT} (como en la grabación): {nombre!r}")
+            menu = self.MENU_EXPORTAR
+        self.info["layout"] = nombre
+        return menu
+
+
+class VBRP(TablaZSE16):
+    """ZSE16 on table VBRP for the 'Referencia de pago' of the #N/A rows, as VBRP.vbs does."""
+    NOMBRE = "VBRP_ZSE16"
+    MARCA = "ZSE16/VBRP"
+    ETIQUETA = "VBRP"
+    TABLA = "VBRP"
+    ARCHIVO = "VBRP.csv"
+    UNIDAD = ("referencia(s)", "pedida(s)")
+    CAMPO = "VBELN"
+    FILA_LAYOUT = 1                # VBRP.vbs: currentCellRow = 1 (the layout's NAME is still unknown)
+
+    def pasos(self):
+        self.preparar()
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+        s = self.abrir_tabla()
+        ZSE16.dejar_solo_campo(s, self.CAMPO)
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar.")
+        self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
+        return self.consultar_y_exportar()
+
+
+class VBRK(TablaZSE16):
+    """
+    ZSE16 on table VBRK for the same references, as VBRK.vbs does. Its 'Solic.' column is the list
+    of FBL5N and KNVP, so the file is only accepted with that column.
+    """
+    NOMBRE = "VBRK_ZSE16"
+    MARCA = "ZSE16/VBRK"
+    ETIQUETA = "VBRK"
+    TABLA = "VBRK"
+    ARCHIVO = "VBRK.csv"
+    UNIDAD = ("referencia(s)", "pedida(s)")
+    CAMPO = "VBELN"
+    FILA_LAYOUT = 4                # VBRK.vbs: currentCellRow = 4 (the layout's NAME is still unknown)
+    COL_SOLICITANTE_CANDIDATAS = ("Solic.", "Solicitante")      # = Consolidacion.EtapaListasSegundaCorrida
+
+    def pasos(self):
+        self.preparar()
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+        s = self.abrir_tabla()
+        ZSE16.dejar_solo_campo(s, self.CAMPO)
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar.")
+        self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
+        return self.consultar_y_exportar(self.revisar_columnas)
+
+    @classmethod
+    def revisar_columnas(cls, df):
+        """FBL5N and KNVP need the 'Solic.' column: a layout without it is not this run's VBRK."""
+        buscadas = {Archivos.normalizar_encabezado(c) for c in cls.COL_SOLICITANTE_CANDIDATAS}
+        if not any(Archivos.normalizar_encabezado(c) in buscadas for c in df.columns):
+            columnas = ", ".join(f"{chr(65 + i)}='{c}'" for i, c in enumerate(df.columns[:12]))
+            raise RuntimeError(f"el archivo de VBRK no trae la columna 'Solic.' (la lista de FBL5N y KNVP); "
+                               f"¿el layout es el de la grabación? Columnas: {columnas}")
+
+
+class VBRL2(TablaZSE16):
+    """
+    ZSE16 on table VBRL (2nd run) for the same references, as VBRL_2do_run.vbs does: lines 5 and 7
+    of 'Fields for selection' (their texts go to `info`) and the list pasted into the SECOND field,
+    I2; no layout step.
+    """
+    NOMBRE = "VBRL2_ZSE16"
+    MARCA = "ZSE16/VBRL_2"
+    ETIQUETA = "VBRL_2"
+    TABLA = "VBRL"
+    ARCHIVO = "VBRL_2.csv"
+    UNIDAD = ("referencia(s)", "pedida(s)")
+    FILAS_CAMPOS = (5, 7)          # VBRL_2do_run.vbs: chk[2,5] and chk[2,7]
+
+    def pasos(self):
+        self.preparar()
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+        s = self.abrir_tabla()
+        textos = ZSE16.marcar_renglones(s, self.FILAS_CAMPOS)
+        self.info["campos"] = textos
+        print(f"[{self.ETIQUETA}] Campos de selección (renglones {self.FILAS_CAMPOS}): {textos}")
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar.")
+        self.pegar_lista("wnd[0]/usr/btn%_I2_%_APP_%-VALU_PUSH")
+        return self.consultar_y_exportar()
+
+
+class KNVP(TablaZSE16):
+    """
+    ZSE16 on table KNVP for the 'Solic.' customers of this run's VBRK, as KNVP.vbs does: the eight
+    first fields of the table as selection fields (I1..I8), the customers pasted into I1 (KUNNR)
+    and the fixed values of the recording in I2..I5; no layout step.
+    """
+    NOMBRE = "KNVP_ZSE16"
+    MARCA = "ZSE16/KNVP"
+    ETIQUETA = "KNVP"
+    TABLA = "KNVP"
+    ARCHIVO = "KNVP.csv"
+    UNIDAD = ("cliente(s)", "pedido(s)")
+    # KNVP.vbs ticks lines 5..12: the table's first eight fields, in table order (they become I1..I8).
+    CAMPOS = ("KUNNR", "VKORG", "VTWEG", "SPART", "PARVW", "PARZA", "KUNN2", "LIFNR")
+    VALORES_FIJOS = (
+        ("wnd[0]/usr/ctxtI2-LOW", "MX21"),     # VKORG  sales organization
+        ("wnd[0]/usr/ctxtI3-LOW", "01"),       # VTWEG  distribution channel
+        ("wnd[0]/usr/ctxtI4-LOW", "01"),       # SPART  division
+        ("wnd[0]/usr/ctxtI5-LOW", "re"),       # PARVW  partner function, typed as recorded
+    )
+
+    def pasos(self):
+        self.preparar()
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+        s = self.abrir_tabla()
+        ZSE16.marcar_campos(s, self.CAMPOS)
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} cliente(s) único(s) a consultar.")
+        self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
+        for campo, valor in self.VALORES_FIJOS:
+            s.findById(campo).text = valor
+        return self.consultar_y_exportar()
+
+
+class BKPF(TablaZSE16):
+    """
+    ZSE16 on table BKPF for the 'Nº documento' of the #N/A rows, as BKPF.vbs does: eight selection
+    fields (I1..I8), company code in I1, the documents pasted into I2 (BELNR) and the fiscal year in
+    I3 — from the year of DateFrom to the year of DateTo, like FB03.
+    """
+    NOMBRE = "BKPF_ZSE16"
+    MARCA = "ZSE16/BKPF"
+    ETIQUETA = "BKPF"
+    TABLA = "BKPF"
+    ARCHIVO = "BKPF.csv"
+    # BKPF.vbs ticks lines 5..10, 18 and 20: these fields of the table, in table order (I1..I8).
+    CAMPOS = ("BUKRS", "BELNR", "GJAHR", "BLART", "BLDAT", "BUDAT", "TCODE", "XBLNR")
+    FILA_LAYOUT = 1                # BKPF.vbs: currentCellRow = 1 (the layout's NAME is still unknown)
+
+    def __init__(self, documentos, desde, hasta, carpeta, archivo, sociedad, session, info=None):
+        super().__init__(documentos, carpeta, archivo, session, info)
+        self.desde, self.hasta, self.sociedad = desde, hasta, sociedad
+
+    def pasos(self):
+        self.preparar()
+        sociedad = "" if self.sociedad is None else str(self.sociedad).strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{1,4}", sociedad):
+            raise ValueError("La sociedad debe ser un código de 1 a 4 letras o dígitos "
+                             f"(se recibió {sociedad!r}).")
+        fecha_desde = datetime.strptime(self.desde, "%d.%m.%Y")
+        fecha_hasta = datetime.strptime(self.hasta, "%d.%m.%Y")
+        if fecha_hasta < fecha_desde:
+            raise ValueError(f"El periodo es inválido: {self.desde} — {self.hasta}.")
+        anio_desde, anio_hasta = fecha_desde.year, fecha_hasta.year
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+
+        s = self.abrir_tabla()
+        ZSE16.marcar_campos(s, self.CAMPOS)
+        s.findById("wnd[0]/usr/ctxtI1-LOW").text = sociedad
+        s.findById("wnd[0]/usr/txtI3-LOW").text = str(anio_desde)
+        if anio_hasta != anio_desde:
+            if not SAP.existe(s, "wnd[0]/usr/txtI3-HIGH"):
+                raise RuntimeError("El periodo abarca dos ejercicios y BKPF no muestra el campo "
+                                   "'hasta' del ejercicio (I3-HIGH).")
+            s.findById("wnd[0]/usr/txtI3-HIGH").text = str(anio_hasta)
+        s.findById("wnd[0]/usr/txtI3-LOW").setFocus()
+        s.findById("wnd[0]/usr/txtI3-LOW").caretPosition = 4
+        anios = str(anio_desde) if anio_hasta == anio_desde else f"{anio_desde}-{anio_hasta}"
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} documento(s) únicos a consultar (ejercicio {anios}).")
+        self.pegar_lista("wnd[0]/usr/btn%_I2_%_APP_%-VALU_PUSH")
+        return self.consultar_y_exportar()
+
+
+class FBL5N(DescargaConLista):
+    """
+    FBL5N.vbs: the report is NOT executed. F4 on the customer field opens its search help; the
+    'Solic.' customers of this run's VBRK are pasted into the multiple selection of line 5 of its
+    first tab, the hit list is saved with 'Save list in file' (first format option, as recorded)
+    and the popups are closed. SAP writes that file itself (a TEXT list, not a workbook): it is kept
+    as SAP writes it, under the date name with the recorded extension. It is saved first under a
+    temporary name and only replaces the final file once checked (*_REVISAR otherwise).
+    """
+    NOMBRE = "FBL5N_Deudores"
+    MARCA = "FBL5N"
+    ETIQUETA = "FBL5N"
+    ARCHIVO = "FBL5N.XLS"
+    UNIDAD = ("cliente(s)", "pedido(s)")
+    EXTENSIONES = (".xls", ".txt")
+    CAMPO_DEUDOR = "wnd[0]/usr/ctxtDD_KUNNR-LOW"          # where F4 is pressed (the default cursor)
+    TABS = "wnd[1]/usr/tabsG_SELONETABSTRIP"
+    PESTANA = TABS + "/tabpTAB001"
+    SUBPANTALLA = PESTANA + "/ssubSUBSCR_PRESEL:SAPLSDH4:0220/sub:SAPLSDH4:0220"
+    BTN_MULTIPLE = SUBPANTALLA + "/btnG_SELFLD_TAB-MORE[5,56]"            # as recorded
+    MAX_ACIERTOS = (SUBPANTALLA + "/txtDDSHF4CTRL-MAXRECORDS", "wnd[1]/usr/txtDDSHF4CTRL-MAXRECORDS")
+    CELDA_LISTA = "wnd[1]/usr/lbl[53,8]"
+    RADIO_FORMATO = ("wnd[2]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/"
+                     "radSPOPLI-SELFLAG[1,0]")
+    MENSAJES_SIN_DATOS = (
+        "no values", "no existen valores", "no hay valores", "ningún valor", "ningun valor",
+        "no se encontraron valores", "no se han encontrado valores",
+    )
+
+    def __init__(self, documentos, carpeta, archivo, session, info=None):
+        super().__init__(documentos, carpeta, archivo or self.ARCHIVO, session)
+        self.info = info if info is not None else {}
+        # SAP writes a temporary name; the final file is only replaced once the new one is checked.
+        # (self.ext is lower-cased for the checks; the names keep the extension as given.)
+        extension = os.path.splitext(self.archivo)[1]
+        self.nombre_xlsx = f"{self.base}_descarga{extension}"
+        self.ruta_xlsx = os.path.join(self.carpeta, self.nombre_xlsx)
+        self.ruta_parcial = self.ruta_xlsx
+        self.ruta_revisar = os.path.join(self.carpeta, f"{self.base}_REVISAR{extension}")
+
+    def preparar(self):
+        if os.path.basename(self.archivo) != self.archivo:
+            raise ValueError(f"El nombre del archivo no debe incluir carpetas: {self.archivo!r}")
+        if self.ext not in self.EXTENSIONES:
+            raise ValueError(f"FBL5N guarda la lista de SAP tal cual ({' o '.join(self.EXTENSIONES)}); "
+                             f"se recibió '{self.archivo}'.")
+        self.lista = Archivos.normalizar_documentos(self.documentos, self.ETIQUETA)
+
+    def pasos(self):
+        self.preparar()
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+        s = self.conectar()
+        SAP.cerrar_popups(s)
+        s.findById("wnd[0]").maximize()
+        s.findById("wnd[0]/tbar[0]/okcd").text = "/nFBL5N"
+        s.findById("wnd[0]").sendVKey(0)
+        if not SAP.esperar(s, self.CAMPO_DEUDOR, 10):
+            raise RuntimeError(f"FBL5N no mostró el campo de cuenta de deudor. SAP dice: "
+                               f"'{SAP.aviso(s) or '(sin mensaje)'}'.")
+        s.findById(self.CAMPO_DEUDOR).setFocus()                      # the recording relies on the default cursor
+        s.findById("wnd[0]").sendVKey(4)                              # F4: search help
+        if not SAP.esperar(s, self.TABS, 10):
+            raise RuntimeError("SAP no abrió la ayuda de búsqueda de deudores (F4) de FBL5N.")
+        if SAP.existe(s, self.PESTANA):
+            s.findById(self.PESTANA).select()                         # SAP remembers the last tab used
+        self.ampliar_aciertos()
+        if not SAP.existe(s, self.BTN_MULTIPLE):
+            raise RuntimeError("La ayuda de búsqueda de FBL5N no tiene el botón de selección múltiple "
+                               "del renglón 5 de su primera pestaña (grabación FBL5N.vbs).")
+
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} cliente(s) único(s) a consultar.")
+        s.findById(self.BTN_MULTIPLE).press()
+        if not SAP.esperar(s, "wnd[2]/tbar[0]/btn[24]", 10):
+            raise RuntimeError("SAP no abrió la selección múltiple de la ayuda de búsqueda de FBL5N.")
+        with Portapapeles.exclusivo():
+            Portapapeles.copiar_y_verificar("\r\n".join(self.lista))
+            s.findById("wnd[2]/tbar[0]/btn[24]").press()             # import from clipboard
+            time.sleep(1 + len(self.lista) / 5000)
+        s.findById("wnd[2]/tbar[0]/btn[8]").press()                  # copy and close
+        SAP.esperar_libre(s)
+        if not SAP.esperar_cierre(s, "wnd[2]"):
+            raise RuntimeError("La selección múltiple de FBL5N sigue abierta después de copiar.")
+
+        Paralelo.marca(f"{self.MARCA}: búsqueda enviada a SAP")
+        s.findById("wnd[1]/tbar[0]/btn[0]").press()                  # start the search
+        SAP.esperar_libre(s, timeout=_ESPERA_CONSULTA)
+        Paralelo.marca(f"{self.MARCA}: SAP respondió la búsqueda")
+        if self.sin_aciertos():
+            return False
+
+        if SAP.existe(s, self.CELDA_LISTA):
+            s.findById(self.CELDA_LISTA).setFocus()
+            s.findById(self.CELDA_LISTA).caretPosition = 0
+        s.findById("wnd[1]").sendVKey(14)                            # save list in file
+        if not SAP.esperar(s, self.RADIO_FORMATO, 10):
+            raise RuntimeError("SAP no mostró las opciones de formato para guardar la lista de FBL5N.")
+        s.findById(self.RADIO_FORMATO).select()
+        s.findById(self.RADIO_FORMATO).setFocus()
+        s.findById("wnd[2]/tbar[0]/btn[0]").press()
+        if not SAP.esperar(s, "wnd[2]/usr/ctxtDY_FILENAME", 10):
+            raise RuntimeError("SAP no abrió el diálogo para guardar la lista de FBL5N.")
+        desde, self.con_carpeta = self.dialogo_guardar("wnd[2]/tbar[0]/btn[0]", ventana="wnd[2]")
+        self.exportado = Archivos.esperar_nuevo(self.ruta_xlsx, desde)
+        if self.exportado:
+            Paralelo.marca(f"{self.MARCA}: archivo exportado")
+        self.cerrar_ayuda()
+        return self.guardar()
+
+    def ampliar_aciertos(self):
+        """Raise the search help's 'maximum number of hits' (usually 500) to its widest value, so the
+        hit list is not cut; without that field, SAP's own limit applies (reported)."""
+        s = self.session
+        for campo in self.MAX_ACIERTOS:
+            if SAP.existe(s, campo):
+                componente = s.findById(campo)
+                try:
+                    largo = int(componente.MaxLength)
+                except Exception:
+                    largo = 5
+                componente.text = "9" * max(1, min(largo, 9))
+                return
+        print(f"[{self.ETIQUETA}] ⚠️ No encontré el campo 'Número máximo de aciertos' de la ayuda de "
+              "búsqueda: aplica el límite que tenga SAP.")
+        self.info["aviso"] = "no se pudo ampliar el número máximo de aciertos de la ayuda de búsqueda"
+
+    def sin_aciertos(self):
+        """Still on the search-help tabs after starting the search: SAP found no customer
+        (placeholder written, True) or said something else (RuntimeError with its text)."""
+        s = self.session
+        if not SAP.existe(s, self.TABS):
+            if not SAP.existe(s, "wnd[1]"):
+                # Standard F4: with exactly ONE hit SAP copies it into the field and skips the list.
+                try:
+                    copiado = str(s.findById(self.CAMPO_DEUDOR).text).strip()
+                except Exception:
+                    copiado = ""
+                if copiado:
+                    raise DescargaPorRevisarError(
+                        f"SAP encontró un solo cliente ({copiado}) y lo pasó directo al campo, sin "
+                        "mostrar la lista (así funciona el F4 con un único resultado): no hay lista "
+                        "que guardar. Consúltalo a mano en FBL5N.")
+                raise RuntimeError("La ayuda de búsqueda de FBL5N se cerró sin mostrar la lista de clientes.")
+            return False
+        textos = [SAP.aviso(s)]
+        for barra in ("wnd[1]/sbar", "wnd[2]/usr/txtMESSTXT1"):
+            try:
+                textos.append(str(s.findById(barra).Text).strip())
+            except Exception:
+                pass
+        mensaje = next((t for t in textos if t), "")
+        if any(m in mensaje.lower() for m in self.MENSAJES_SIN_DATOS):
+            print(f"[SIN DATOS] {self.ETIQUETA}: {mensaje}. Creando archivo vacío: {self.ruta}")
+            SAP.cerrar_popups(s)
+            Archivos.crear_sin_datos(self.ruta)
+            return True
+        raise RuntimeError(f"La ayuda de búsqueda de FBL5N no mostró la lista de clientes. SAP dice: "
+                           f"'{mensaje or '(sin mensaje)'}'. Si significa que no hay datos, agrega ese "
+                           f"texto a FBL5N.MENSAJES_SIN_DATOS.")
+
+    def cerrar_ayuda(self):
+        """Close the hit list, then Back, as recorded. The file is already written: only reported."""
+        s = self.session
+        try:
+            if SAP.existe(s, "wnd[2]"):
+                raise RuntimeError("quedó abierto otro popup sobre la lista de clientes")
+            s.findById("wnd[1]").close()
+            if not SAP.esperar_cierre(s):
+                raise RuntimeError("la lista de clientes sigue abierta")
+            s.findById("wnd[0]/tbar[0]/btn[3]").press()
+            self.en_menu = True
+        except Exception as e:
+            print(f"[{self.ETIQUETA}] ⚠️ No pude regresar al menú principal de SAP "
+                  f"(el archivo ya se guardó): {e}")
+
+    @staticmethod
+    def leer_texto(ruta):
+        """The text of SAP's file whatever its encoding (UTF-16 / UTF-8 with or without BOM, ANSI)."""
+        with open(ruta, "rb") as f:
+            datos = f.read()
+        if datos.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return datos.decode("utf-16")
+        if datos.startswith(b"\xef\xbb\xbf"):
+            return datos[3:].decode("utf-8", errors="replace")
+        if datos[:2000].count(b"\x00") > 0:
+            return datos.decode("utf-16-le", errors="replace")
+        try:
+            return datos.decode("utf-8")
+        except UnicodeDecodeError:
+            return datos.decode("cp1252", errors="replace")
+
+    @staticmethod
+    def contar_presentes(texto, valores):
+        """How many of `valores` appear in `texto` as whole tokens (numbers compared without leading
+        zeros: SAP lists customers without them)."""
+        tokens = set(re.findall(r"[0-9A-Za-z]+", texto.upper()))
+        sin_ceros = {t.lstrip("0") or "0" for t in tokens if t.isdigit()}
+        presentes = 0
+        for valor in valores:
+            v = str(valor).strip().upper()
+            if v in tokens or (v.isdigit() and (v.lstrip("0") or "0") in sin_ceros):
+                presentes += 1
+        return presentes
+
+    def guardar(self, revisar=None):
+        """The file must exist, be complete and contain at least one of the customers asked for;
+        only then does it replace the final file (else it is kept as *_REVISAR)."""
+        if not os.path.exists(self.ruta_xlsx):
+            sin_carpeta = ("" if self.con_carpeta else " El diálogo de guardar no tenía el campo de carpeta: "
+                                                       "SAP lo guardó en su carpeta por defecto.")
+            raise DescargaPorRevisarError(f"SAP no dejó el archivo {self.nombre_xlsx} en {self.carpeta}.{sin_carpeta}")
+        try:
+            if not self.exportado:
+                raise RuntimeError("SAP no terminó de escribir el archivo a tiempo: puede estar incompleto.")
+            presentes = self.contar_presentes(self.leer_texto(self.ruta_xlsx), self.lista)
+            print(f"[{self.ETIQUETA}] {presentes:,} de {len(self.lista):,} cliente(s) pedidos aparecen en el archivo.")
+            if not presentes:
+                raise RuntimeError("ninguno de los clientes pedidos aparece en el archivo que guardó SAP.")
+            self.info["presentes"] = (presentes, len(self.lista))
+        except Exception as e:
+            guardado = self.ruta_revisar
+            try:
+                os.replace(self.ruta_xlsx, guardado)
+            except OSError as e2:
+                self.conservar_parcial, guardado = True, self.ruta_xlsx
+                print(f"[{self.ETIQUETA}] ⚠️ No pude renombrarlo a {os.path.basename(self.ruta_revisar)}: {e2}")
+            print(f"[{self.ETIQUETA}] ⚠️ Guardado para revisar: {guardado}")
+            raise DescargaPorRevisarError(f"guardé {os.path.basename(guardado)} para revisarlo: {e}") from e
+        try:
+            os.replace(self.ruta_xlsx, self.ruta)
+        except OSError as e:
+            raise RuntimeError(f"No pude guardar {self.ruta} (¿está abierto en Excel?). "
+                               "Ciérralo y vuelve a descargar.") from e
+        print(f"[{self.ETIQUETA}] Archivo descargado correctamente: {self.ruta}")
+        return True
+
+
+# ======================================================================
 # Entry points (controller.py). True = downloaded with data; False = no data or a
 # handled error (printed in the console). `session`: the SAP window of a parallel run.
 # ======================================================================
@@ -1754,6 +2387,39 @@ def FB03_Documentos(documentos, DateFrom, DateTo, FolderPath=None, FileName=None
                     sociedad=_SOCIEDAD, session=None):
     """FB03 document list for `documentos` (fiscal years of the period) → FileName (.csv)."""
     return FB03(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session).ejecutar()
+
+
+# 2nd run. `info` (optional dict) receives what the run chose by position ('layout', 'campos') and
+# the FBL5N checks ('presentes', 'aviso'), for the summary.
+def VBRP_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """Table VBRP (ZSE16) for the references in `documentos` → FileName (.csv, default 'VBRP.csv')."""
+    return VBRP(documentos, FolderPath, FileName, session, info).ejecutar()
+
+
+def VBRK_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """Table VBRK (ZSE16) for the references in `documentos` → FileName (.csv, with a 'Solic.' column)."""
+    return VBRK(documentos, FolderPath, FileName, session, info).ejecutar()
+
+
+def VBRL2_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """Table VBRL (ZSE16), 2nd run, for the references in `documentos` → FileName (.csv)."""
+    return VBRL2(documentos, FolderPath, FileName, session, info).ejecutar()
+
+
+def KNVP_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """Table KNVP (ZSE16) for the customers in `documentos` → FileName (.csv)."""
+    return KNVP(documentos, FolderPath, FileName, session, info).ejecutar()
+
+
+def BKPF_ZSE16(documentos, DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD,
+               session=None, info=None):
+    """Table BKPF (ZSE16) for the documents in `documentos` (fiscal years of the period) → FileName."""
+    return BKPF(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session, info).ejecutar()
+
+
+def FBL5N_Deudores(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """FBL5N customer search help for the customers in `documentos` → FileName (SAP's own text list)."""
+    return FBL5N(documentos, FolderPath, FileName, session, info).ejecutar()
 
 
 # ======================================================================

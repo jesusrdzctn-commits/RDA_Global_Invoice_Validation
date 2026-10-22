@@ -4,9 +4,13 @@ downloads (Descargas_SAP.py) and the consolidation (Consolidacion.py).
 The main download button runs Gallo, Monivoi, VBRL and FB03 one after another (default) or,
 with the GUI checkbox, IN PARALLEL by passes: Gallo ‖ Monivoi, then VBRL ‖ FB03 (VBRL needs
 the Monivoi file and FB03 the Gallo file of pass 1).
+After a consolidation, the 2nd run (VBRP, VBRK, VBRL 2nd run, BKPF, FBL5N, KNVP) pastes into SAP
+what the #N/A rows of 'TD.Diferencias_Referencias' carry: one after another, or, with the same
+checkbox, as TWO SEQUENCES at once, each in its own SAP window (SECUENCIAS_2DA).
 """
 
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 from tkinter import messagebox, filedialog
@@ -16,13 +20,17 @@ import pandas as pd
 from Descargas_SAP import (
     Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, CUENTAS_EIAP, CLASES_EIAP,
     VBRL_ZSE16, FB03_Documentos, DescargaPorRevisarError,
+    VBRP_ZSE16, VBRK_ZSE16, VBRL2_ZSE16, KNVP_ZSE16, BKPF_ZSE16, FBL5N_Deudores,
     Archivos, Excel, Paralelo, MAX_VENTANAS_SAP,
 )
 from Consolidacion import (
     consolidar_gallo_monivoi, consolidar_venta_eiap, leer_documentos_monivoi,
-    leer_documentos_gallo_fb03, EtapaDocumentosFB03,
+    leer_documentos_gallo_fb03, leer_solicitantes_vbrk, EtapaDocumentosFB03,
 )
-from utils import FORMATO_FECHA, parse_fecha, fecha_efectiva_eiap
+from utils import (
+    FORMATO_FECHA, parse_fecha, fecha_efectiva_eiap,
+    nombre_archivo_dia_2da, nombre_archivo_rango_2da,
+)
 
 
 def _fmt_duracion(segundos):
@@ -37,8 +45,89 @@ def _fmt_duracion(segundos):
     return f"{seg} s"
 
 
+class _EstadoSecuencias:
+    """What the windows of a 2nd run share, under ONE lock: results, lines, seconds, what is running,
+    and one Event per transaction, set as soon as it ENDS whatever its result (FBL5N / KNVP wait on
+    VBRK's). `abandonar` is the safety net: whatever a finished window did not register (it failed
+    before reaching it) counts as an error, so nobody waits for it forever.
+    """
+
+    def __init__(self, claves, espera_maxima):
+        """`espera_maxima` (s): ONE deadline, from now, for EVERY wait of the run (two transactions
+        waiting for the same stuck parent must not add up their waits).
+        """
+        self._lock = threading.Lock()
+        self._eventos = {clave: threading.Event() for clave in claves}
+        self._resultados, self._lineas, self._duraciones = {}, {}, {}
+        self._en_ejecucion = set()
+        self._segundos = {}
+        self._limite = time.monotonic() + float(espera_maxima)
+
+    def tiene(self, clave):
+        return clave in self._eventos
+
+    def termino(self, clave):
+        return self._eventos[clave].is_set()
+
+    def esperar(self, clave):
+        """True once `clave` ended; False if it had not when the run's deadline passed."""
+        return self._eventos[clave].wait(max(0.0, self._limite - time.monotonic()))
+
+    def iniciar(self, clave):
+        with self._lock:
+            self._en_ejecucion.add(clave)
+
+    def registrar(self, clave, estado, linea, segundos):
+        with self._lock:
+            self._en_ejecucion.discard(clave)
+            if clave not in self._resultados:
+                self._resultados[clave] = estado
+                self._lineas[clave] = linea
+                self._duraciones[clave] = segundos
+        self._eventos[clave].set()
+
+    def abandonar(self, claves):
+        claves = list(claves)
+        with self._lock:
+            for clave in claves:
+                self._en_ejecucion.discard(clave)
+                if clave not in self._resultados:
+                    self._resultados[clave] = "error"
+                    self._lineas[clave] = None          # filled in by the main thread
+                    self._duraciones[clave] = 0.0
+        for clave in claves:
+            self._eventos[clave].set()
+
+    def fin_de_ventana(self, indice, segundos):
+        with self._lock:
+            self._segundos[indice] = segundos
+
+    def foto(self):
+        """A copy of the results so far (what a transaction checks its parent in)."""
+        with self._lock:
+            return dict(self._resultados)
+
+    def foto_estado(self):
+        with self._lock:
+            return dict(self._resultados), set(self._en_ejecucion)
+
+    def copia(self):
+        with self._lock:
+            return (dict(self._lineas), dict(self._resultados), dict(self._duraciones),
+                    dict(self._segundos))
+
+
 class ValidacionFacturaController:
-    """Connects the GUI with the SAP downloads (Gallo, Monivoi, VBRL, FB03) and the consolidation."""
+    """Connects the GUI with the SAP downloads (Gallo, Monivoi, VBRL, FB03, and the 2nd run) and the
+    consolidation."""
+
+    # 2nd run: one sequence per SAP window, all at once; inside a window, one after another. VBRK goes
+    # FIRST in window 1 because FBL5N and KNVP (window 2) paste its 'Solic.' column; BKPF goes first
+    # in window 2 because it needs nothing, so that window works while VBRK runs.
+    SECUENCIAS_2DA = (("vbrk", "vbrp", "vbrl2"), ("bkpf", "fbl5n", "knvp"))
+    # Upper bound (s), counted from the start of the run, for the transactions waiting for one of
+    # ANOTHER window to end (FBL5N/KNVP ← VBRK): one shared deadline, not one per waiting transaction.
+    ESPERA_DEPENDENCIA = 2 * 60 * 60
 
     def __init__(self, gui):
         self.gui = gui
@@ -88,9 +177,43 @@ class ValidacionFacturaController:
             "sin_documentos_es_vacio": True,
             "filtro":   EtapaDocumentosFB03.DESCRIPCION_FILTRO,
         }
+        # 2nd run (after the consolidation). VBRP, VBRK, VBRL 2nd run and BKPF take their list from the
+        # consolidation ("lista_de": a key of resumen["listas_2da"], copied into the config as
+        # "documentos"); FBL5N and KNVP read 'Solic.' from THIS run's VBRK ("requiere").
+        self._TX_VBRP = {
+            "clave": "vbrp", "nombre": "VBRP (ZSE16)", "ejecutar": self._descargar_lista_2da,
+            "descarga": VBRP_ZSE16, "lista_de": "referencias", "unidad": "referencia(s)",
+        }
+        self._TX_VBRK = {
+            "clave": "vbrk", "nombre": "VBRK (ZSE16)", "ejecutar": self._descargar_lista_2da,
+            "descarga": VBRK_ZSE16, "lista_de": "referencias", "unidad": "referencia(s)",
+        }
+        self._TX_VBRL2 = {
+            "clave": "vbrl2", "nombre": "VBRL 2a corrida (ZSE16)", "ejecutar": self._descargar_lista_2da,
+            "descarga": VBRL2_ZSE16, "lista_de": "referencias", "unidad": "referencia(s)",
+        }
+        self._TX_BKPF = {
+            "clave": "bkpf", "nombre": "BKPF (ZSE16)", "ejecutar": self._descargar_lista_2da,
+            "descarga": BKPF_ZSE16, "lista_de": "documentos", "unidad": "documento(s)",
+            "con_periodo": True,
+        }
+        self._TX_FBL5N = {
+            "clave": "fbl5n", "nombre": "FBL5N (deudores)", "ejecutar": self._descargar_solicitantes,
+            "descarga": FBL5N_Deudores, "requiere": "vbrk", "leer_documentos": leer_solicitantes_vbrk,
+            "unidad": "cliente(s)",
+            "lista": "los solicitantes (columna 'Solic.') del VBRK de esta corrida",
+        }
+        self._TX_KNVP = {
+            "clave": "knvp", "nombre": "KNVP (ZSE16)", "ejecutar": self._descargar_solicitantes,
+            "descarga": KNVP_ZSE16, "requiere": "vbrk", "leer_documentos": leer_solicitantes_vbrk,
+            "unidad": "cliente(s)",
+            "lista": "los solicitantes (columna 'Solic.') del VBRK de esta corrida",
+        }
         self._TX_POR_CLAVE = {
             tx["clave"]: tx
-            for tx in (self._TX_GALLO, self._TX_MONIVOI, self._TX_EIAP, self._TX_VBRL, self._TX_FB03)
+            for tx in (self._TX_GALLO, self._TX_MONIVOI, self._TX_EIAP, self._TX_VBRL, self._TX_FB03,
+                       self._TX_VBRP, self._TX_VBRK, self._TX_VBRL2, self._TX_BKPF,
+                       self._TX_FBL5N, self._TX_KNVP)
         }
 
         # Re-entrancy guard: one run at a time.
@@ -285,8 +408,10 @@ class ValidacionFacturaController:
             return "error", f"❌ {tx['nombre']}: error — {e}"
 
     # --- Sequential engine (the default) ---
-    def _correr_secuencial(self, txs):
-        """Run `txs` one after another → three dicts by "clave": lines, estados, seconds."""
+    def _correr_secuencial(self, txs, configs=None):
+        """Run `txs` one after another → three dicts by "clave": lines, estados, seconds. `configs`
+        ({clave: config}, the 2nd run) replaces reading the GUI, also for the parent's file.
+        """
         lineas, resultados, duraciones = {}, {}, {}
         for i, tx in enumerate(txs, 1):
             clave = tx["clave"]
@@ -296,12 +421,14 @@ class ValidacionFacturaController:
             )
             inicio = time.time()
             try:
-                config = self.gui.get_config(clave)
+                config = configs[clave] if configs is not None else self.gui.get_config(clave)
             except Exception as e:
                 estado, linea = "error", f"❌ {tx['nombre']}: error — {e}"
             else:
+                requiere = tx.get("requiere")
+                cfg_padre = configs.get(requiere) if (configs is not None and requiere) else None
                 estado, linea = self._ejecutar_tx(
-                    tx, config, resultados, estado_cb=self.gui.set_status
+                    tx, config, resultados, cfg_padre=cfg_padre, estado_cb=self.gui.set_status
                 )
             resultados[clave] = estado
             lineas[clave] = linea
@@ -563,6 +690,7 @@ class ValidacionFacturaController:
             return
 
         self._ocupado = True
+        listas_2da = None
         try:
             self.gui.disable_buttons()
             resumen = consolidar_gallo_monivoi(
@@ -587,6 +715,7 @@ class ValidacionFacturaController:
                 + (resumen.get("vbrl_avisos") or [])
                 + (resumen.get("td_referencias_avisos") or [])
                 + (resumen.get("notas_pep_avisos") or [])
+                + ((resumen.get("listas_2da") or {}).get("avisos") or [])
             )
             nota_ventas = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
 
@@ -595,7 +724,7 @@ class ValidacionFacturaController:
                 lineas_vbrl = (
                     f"\n  • Filas VBRL               : {resumen['filas_vbrl']:,}"
                     f"\n  • Referencias (facturas)   : {resumen['filas_td_referencias']:,}"
-                    f"\n      …sin timbre            : {resumen['td_referencias_sin_timbre']:,}"
+                    f"\n      …en #N/A               : {resumen['td_referencias_na']:,}"
                 )
                 if resumen["vbrl_sin_datos"]:
                     lineas_vbrl += "\n⚠️ El archivo de VBRL venía sin datos; su pestaña quedó vacía."
@@ -608,6 +737,12 @@ class ValidacionFacturaController:
                         f"\n  • PEP Vouchers             : {resumen['filas_pep_ref']:,}"
                         f"  (Σ {resumen['total_pep_ref']:,.2f})"
                         f"\n      …en #N/A               : {resumen['pep_ref_na']:,}"
+                    )
+                listas = resumen.get("listas_2da")
+                if listas is not None:
+                    lineas_vbrl += (
+                        f"\n  • 2a corrida (renglones #N/A): {len(listas['referencias']):,} "
+                        f"referencia(s), {len(listas['documentos']):,} documento(s)"
                     )
 
             self.gui.set_status("✅ ¡Consolidación completada!")
@@ -622,6 +757,8 @@ class ValidacionFacturaController:
                 f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}"
                 f"{lineas_vbrl}{nota_monivoi}{nota_ventas}"
             )
+            # Only once the workbook exists and the summary was seen: the 2nd run comes next.
+            listas_2da = resumen.get("listas_2da")
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la consolidación")
             messagebox.showerror("Error en la consolidación", str(e))
@@ -633,6 +770,17 @@ class ValidacionFacturaController:
             self.gui.enable_buttons()
             if "completada" not in self.gui.status_var.get():
                 self.gui.set_status("✓ Listo para comenzar")
+        if listas_2da is not None:
+            # Same folder, company code and period the consolidation read (not the GUI as it is now).
+            # The workbook is already saved: a failure here must be shown, never lost in Tk's console.
+            try:
+                self._ofrecer_segunda_corrida(listas_2da, cfg_gallo)
+            except Exception as e:
+                self.gui.set_status("❌ Error al preparar la 2a corrida")
+                messagebox.showerror(
+                    "2a corrida de descargas",
+                    f"El Excel consolidado sí se generó, pero no pude preparar la 2a corrida:\n\n{e}",
+                )
 
     def _solo_eiap(self, cfg_eiap, cfg_gallo, cfg_monivoi):
         """True when the folder has the EIAP file of the GUI range and neither the Gallo nor the Monivoi
@@ -732,7 +880,7 @@ class ValidacionFacturaController:
             if not ruta:
                 return None, True
 
-        # A VBRL OLDER than its Monivoi may not cover its invoices (extra 'Sin timbre').
+        # A VBRL OLDER than its Monivoi may not cover its invoices (extra #N/A).
         try:
             vbrl_anterior = os.path.getmtime(ruta) < os.path.getmtime(ruta_monivoi) - 2
         except OSError:
@@ -742,7 +890,7 @@ class ValidacionFacturaController:
                 "VBRL anterior al archivo de Monivoi",
                 f"El archivo de VBRL:\n  {os.path.basename(ruta)}\n"
                 f"se descargó ANTES que el de Monivoi:\n  {os.path.basename(ruta_monivoi)}\n\n"
-                "Probablemente no cubre las facturas actuales y saldrían 'Sin timbre' de más.\n\n"
+                "Probablemente no cubre las facturas actuales y saldrían #N/A de más.\n\n"
                 "Sí = usarlo de todos modos\n"
                 "No = consolidar SIN VBRL\n"
                 "Cancelar = no consolidar",
@@ -829,6 +977,301 @@ class ValidacionFacturaController:
             filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
         )
         return ruta_manual or None
+
+    # --- 2nd run (after the consolidation): VBRP, VBRK, VBRL 2nd run, BKPF, FBL5N, KNVP ---
+    def _txs_segunda_corrida(self):
+        """SECUENCIAS_2DA as transaction profiles: one list per SAP window."""
+        return [[self._TX_POR_CLAVE[clave] for clave in secuencia] for secuencia in self.SECUENCIAS_2DA]
+
+    @staticmethod
+    def _configs_segunda_corrida(base, listas, txs):
+        """One config per transaction from `base`, the config the consolidation read (folder, company
+        code, period) — never the GUI again: it may have been edited while consolidating. The list
+        transactions get their list (a key of `listas`) as "documentos".
+        """
+        configs = {}
+        for tx in txs:
+            cfg = {campo: base[campo] for campo in
+                   ("mode", "sociedad", "input_path", "fecha", "date_from", "date_to") if campo in base}
+            if base["mode"] == "single":
+                cfg["filename"] = nombre_archivo_dia_2da(tx["clave"], base["fecha"])
+            else:
+                cfg["filename"] = nombre_archivo_rango_2da(tx["clave"], base["date_from"], base["date_to"])
+            if tx.get("lista_de"):
+                cfg["documentos"] = list(listas[tx["lista_de"]])
+            configs[tx["clave"]] = cfg
+        return configs
+
+    def _ofrecer_segunda_corrida(self, listas, base):
+        """After a consolidation: offer the 2nd run with its lists, or say there is nothing to ask."""
+        if not listas["referencias"] and not listas["documentos"]:
+            messagebox.showinfo(
+                "2a corrida de descargas",
+                "En 'TD.Diferencias_Referencias' ningún renglón quedó en #N/A (o sólo quedaron\n"
+                "referencias que empiezan con 'FP'): no hay nada que consultar en VBRP, VBRK,\n"
+                "VBRL, BKPF, FBL5N ni KNVP.",
+            )
+            return
+        self._execute_segunda_corrida(listas, base)
+
+    def _execute_segunda_corrida(self, listas, base):
+        """Confirm and run the 2nd run (two sequences at once with the GUI checkbox, else one after
+        another) and show ONE summary.
+        """
+        if self._ocupado:
+            return
+        secuencias = self._txs_segunda_corrida()
+        txs = [tx for secuencia in secuencias for tx in secuencia]
+        self._niveles(txs)                    # VBRK always before FBL5N / KNVP in the flat order
+        configs = self._configs_segunda_corrida(base, listas, txs)
+        problema = self._validar_paralelo(txs, configs)
+        if problema:
+            messagebox.showerror("2a corrida de descargas", problema)
+            return
+        usar_paralelo = getattr(self.gui, "usar_paralelo", None)
+        paralelo = bool(usar_paralelo()) if callable(usar_paralelo) else False
+
+        periodo = (
+            f"Fecha    : {base['fecha']}" if base["mode"] == "single"
+            else f"Periodo  : {base['date_from']} — {base['date_to']}"
+        )
+        excluidas = listas["excluidas_fp"]
+        nota_fp = ""
+        if excluidas["referencias"] or excluidas["documentos"]:
+            nota_fp = (f"(sin {excluidas['referencias']:,} referencia(s) y {excluidas['documentos']:,} "
+                       f"documento(s) que empiezan con 'FP')\n")
+        if paralelo:
+            orden = (
+                "Dos secuencias a la vez, cada una en su propia ventana de SAP:\n"
+                + "".join(
+                    f"  Ventana {i}: {' → '.join(self._nombre_corto(tx) for tx in secuencia)}\n"
+                    for i, secuencia in enumerate(secuencias, 1)
+                )
+                + "FBL5N y KNVP esperan a que termine VBRK (usan su columna 'Solic.').\n"
+                "Uso las ventanas 1 y 2 de SAP (abro las que falten). No trabajes en ellas.\n\n"
+            )
+        else:
+            orden = ("Se ejecutan una tras otra:\n"
+                     + "".join(f"  {i}) {tx['nombre']}\n" for i, tx in enumerate(txs, 1)) + "\n")
+        confirm = messagebox.askyesno(
+            "2a corrida de descargas",
+            "¿Descargar ahora las 6 transacciones de la 2a corrida?\n\n"
+            f"Sociedad : {base['sociedad']}\n{periodo}\n\n"
+            "Listas (renglones en #N/A de 'TD.Diferencias_Referencias'):\n"
+            f"  • {len(listas['referencias']):,} Referencia(s) de pago → VBRP, VBRK, VBRL\n"
+            f"  • {len(listas['documentos']):,} Nº documento(s) → BKPF\n"
+            f"{nota_fp}\n"
+            f"{orden}"
+            "Mientras corren NO copies nada: el portapapeles se usa para pasarle\n"
+            "las listas a SAP.\n\n"
+            f"Se guardará en:\n{base['input_path']}"
+        )
+        if not confirm:
+            return
+
+        self._ocupado = True
+        estado_final = None
+        try:
+            self.gui.disable_buttons()
+            os.makedirs(base["input_path"], exist_ok=True)
+            inicio_total = time.time()
+            if paralelo:
+                lineas, resultados, duraciones, notas = self._descargar_secuencias(secuencias, configs)
+            else:
+                lineas, resultados, duraciones = self._correr_secuencial(txs, configs)
+                notas = []
+            total = time.time() - inicio_total
+            todo_ok = all(resultados.get(tx["clave"]) == "datos" for tx in txs)
+            estado_final = ("✅ ¡2a corrida completada!" if todo_ok
+                            else "⚠️ 2a corrida terminada con avisos")
+            self.gui.set_status(estado_final)
+            mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
+            mostrar(
+                "Resumen de la 2a corrida",
+                "Proceso terminado:\n\n"
+                + "\n".join(f"{lineas[tx['clave']]} ({_fmt_duracion(duraciones[tx['clave']])})"
+                            for tx in txs)
+                + "\n\n" + "".join(f"{n}\n" for n in notas)
+                + f"⏱️ Tiempo total: {_fmt_duracion(total)}"
+                + f"\nRuta: {base['input_path']}"
+            )
+        except Exception as e:
+            estado_final = None
+            self.gui.set_status("❌ Error en la 2a corrida")
+            messagebox.showerror("Error", f"Ocurrió un error inesperado en la 2a corrida:\n\n{e}")
+        finally:
+            self._ocupado = False
+            self.gui.enable_buttons()
+            if estado_final is None:
+                self.gui.set_status("✓ Listo para comenzar")
+
+    def _descargar_secuencias(self, secuencias, configs):
+        """SAP windows 1..n (the open ones as they are, the missing ones opened and left open), then
+        one sequence per window. Without enough windows everything runs one after another.
+        """
+        self.gui.set_status("⏳ Preparando las ventanas de SAP... (no cierre SAP)")
+        disponibles, abiertas = Paralelo.asegurar_ventanas(len(secuencias))
+        if disponibles < len(secuencias):
+            txs = [tx for secuencia in secuencias for tx in secuencia]
+            lineas, resultados, duraciones = self._correr_secuencial(txs, configs)
+            return lineas, resultados, duraciones, [
+                f"ℹ️ Sólo hubo {disponibles} ventana(s) de SAP disponible(s): las transacciones "
+                "corrieron una tras otra."
+            ]
+        lineas, resultados, duraciones, segundos = self._correr_secuencias(secuencias, configs)
+        notas = [f"⚡ Modo paralelo: {len(secuencias)} secuencias a la vez, una por ventana de SAP."]
+        notas += [
+            f"⚡ Ventana {i} · {' → '.join(self._nombre_corto(tx) for tx in secuencia)}: "
+            f"{_fmt_duracion(segundos.get(i - 1, 0.0))}"
+            for i, secuencia in enumerate(secuencias, 1)
+        ]
+        if abiertas:
+            notas.append(f"🪟 Abrí {abiertas} ventana(s) de SAP y la(s) dejé abierta(s) para la próxima vez.")
+        return lineas, resultados, duraciones, notas
+
+    def _correr_secuencias(self, secuencias, configs):
+        """Every sequence in ITS window (1, 2, ...), all at once (Paralelo.correr, inside
+        Excel.modo_paralelo); inside a window, one transaction after another. A transaction that
+        needs one of ANOTHER window (FBL5N / KNVP ← VBRK) waits until that one ENDS, whatever its
+        result. Runs in the MAIN thread, the only one that touches Tk. Returns the three dicts of
+        _correr_secuencial plus {window index: seconds}.
+        """
+        todos = [tx for secuencia in secuencias for tx in secuencia]
+        compartido = _EstadoSecuencias((tx["clave"] for tx in todos), self.ESPERA_DEPENDENCIA)
+        inicio_global = time.time()
+        trabajos = [
+            (indice, self._secuencia_en_ventana, (secuencia, configs, compartido, indice))
+            for indice, secuencia in enumerate(secuencias)
+        ]
+
+        def estado(_vivos):
+            resultados, en_ejecucion = compartido.foto_estado()
+            self.gui.set_status(self._texto_estado_paralelo(
+                todos, resultados, en_ejecucion, time.time() - inicio_global))
+
+        def al_terminar(posicion):
+            # Its window is done (even if it could never be reached): release whoever waits for it.
+            compartido.abandonar(tx["clave"] for tx in secuencias[posicion])
+
+        with Excel.modo_paralelo():
+            salidas = Paralelo.correr(trabajos, al_esperar=estado, al_terminar=al_terminar)
+        lineas, resultados, duraciones, segundos = compartido.copia()
+        for secuencia, (ok, valor) in zip(secuencias, salidas):
+            for tx in secuencia:
+                if lineas.get(tx["clave"]) is None:
+                    # Its window failed before it could run (closed, SAP gone...).
+                    detalle = valor if not ok else "no llegó a ejecutarse"
+                    lineas[tx["clave"]] = f"❌ {tx['nombre']}: error — {detalle}"
+                    resultados[tx["clave"]] = "error"
+                    duraciones.setdefault(tx["clave"], 0.0)
+        return lineas, resultados, duraciones, segundos
+
+    def _secuencia_en_ventana(self, secuencia, configs, compartido, indice, *, session):
+        """Worker thread: the transactions of ONE sequence, one after another, on SAP window
+        `session`; each result is registered (and its waiters released) as soon as it ends. No Tk.
+        """
+        inicio = time.time()
+        try:
+            for tx in secuencia:
+                with Paralelo.etiqueta(self._etiqueta_ventana(indice, tx)):
+                    self._paso_de_secuencia(tx, configs, compartido, session)
+        finally:
+            compartido.fin_de_ventana(indice, time.time() - inicio)
+
+    def _paso_de_secuencia(self, tx, configs, compartido, session):
+        """ONE transaction of a sequence: wait for its parent (if it is in another window), run it,
+        register it — the registration happens even if something unexpected escapes.
+        """
+        clave = tx["clave"]
+        requiere = tx.get("requiere")
+        estado, linea = "error", f"❌ {tx['nombre']}: error — se interrumpió"
+        inicio = time.time()
+        try:
+            if requiere and compartido.tiene(requiere) and not compartido.termino(requiere):
+                nombre_padre = self._nombre_corto(self._TX_POR_CLAVE[requiere])
+                Paralelo.marca(f"esperando a que termine {nombre_padre}")
+                if not compartido.esperar(requiere):
+                    estado, linea = "error", (
+                        f"⚠️ {tx['nombre']}: omitido — {nombre_padre} no terminó en "
+                        f"{_fmt_duracion(self.ESPERA_DEPENDENCIA)} desde el inicio de la corrida"
+                    )
+                    return
+            inicio = time.time()               # the wait for the parent is not this transaction's time
+            compartido.iniciar(clave)
+            Paralelo.marca("inicio")
+            estado, linea = self._ejecutar_tx(
+                tx, configs[clave], compartido.foto(), session=session,
+                cfg_padre=configs.get(requiere) if requiere else None,
+            )
+        finally:
+            segundos = time.time() - inicio
+            compartido.registrar(clave, estado, linea, segundos)
+            Paralelo.marca(f"fin: {estado} ({_fmt_duracion(segundos)})")
+
+    @staticmethod
+    def _texto_info(info):
+        """What a 2nd-run download chose by POSITION, for the summary line: ' · layout 'X' · ...'."""
+        partes = []
+        if info.get("layout"):
+            partes.append(f"layout {info['layout']!r}")
+        if info.get("campos"):
+            partes.append("campos de selección: " + " | ".join(repr(t) for t in info["campos"]))
+        if info.get("presentes"):
+            encontrados, pedidos = info["presentes"]
+            partes.append(f"{encontrados:,} de {pedidos:,} cliente(s) aparecen en el archivo")
+        if info.get("aviso"):
+            partes.append(str(info["aviso"]))
+        return "".join(f" · {parte}" for parte in partes)
+
+    def _descargar_lista_2da(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
+        """VBRP / VBRK / VBRL 2nd run / BKPF: ONE query with the list the consolidation built
+        (config["documentos"]). An empty list is a normal empty result: 'Sin datos' placeholder.
+        """
+        documentos = config.get("documentos") or []
+        ruta_salida = os.path.join(config["input_path"], config["filename"])
+        if not documentos:
+            Archivos.crear_sin_datos(ruta_salida)
+            return "vacio", (f"⚠️ {tx['nombre']}: ningún renglón en #N/A trae {tx['unidad']} que consultar "
+                             f"→ {config['filename']} (vacío)")
+        if estado_cb is not None:
+            estado_cb(f"⏳ Descargando {tx['nombre']}: {len(documentos):,} {tx['unidad']}... (no cierre SAP)")
+        info = {}
+        extra = {} if session is None else {"session": session}
+        if tx.get("con_periodo"):
+            if config["mode"] == "single":
+                extra["DateFrom"] = extra["DateTo"] = config["fecha"]
+            else:
+                extra["DateFrom"], extra["DateTo"] = config["date_from"], config["date_to"]
+            extra["sociedad"] = config["sociedad"]
+        inicio = time.time()
+        try:
+            ok = tx["descarga"](documentos, FolderPath=config["input_path"], FileName=config["filename"],
+                                info=info, **extra)
+        except DescargaPorRevisarError as e:
+            raise DescargaPorRevisarError(f"{e}{self._texto_info(info)}") from e
+        detalle = self._texto_info(info)
+        if ok:
+            return "datos", f"✅ {tx['nombre']}: {len(documentos):,} {tx['unidad']} → {config['filename']}{detalle}"
+        if self._clasificar_sin_datos(ruta_salida, inicio) == "vacio":
+            return "vacio", (f"⚠️ {tx['nombre']}: SAP no devolvió entradas para la lista consultada "
+                             f"→ {config['filename']} (vacío){detalle}")
+        return "error", f"⚠️ {tx['nombre']}: error (ver consola){detalle}"
+
+    def _descargar_solicitantes(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
+        """FBL5N / KNVP: the 'Solic.' customers of THIS run's VBRK (see `_descargar_con_documentos`)."""
+        info = {}
+        extra = {} if session is None else {"session": session}
+
+        def descargar(documentos):
+            try:
+                return tx["descarga"](documentos, FolderPath=config["input_path"],
+                                      FileName=config["filename"], info=info, **extra)
+            except DescargaPorRevisarError as e:
+                raise DescargaPorRevisarError(f"{e}{self._texto_info(info)}") from e
+
+        estado, linea = self._descargar_con_documentos(
+            tx, config, resultados, descargar, cfg_padre=cfg_padre, estado_cb=estado_cb)
+        return estado, linea + self._texto_info(info)
 
     # --- Download cores ---
     def _descargar_vbrl(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):

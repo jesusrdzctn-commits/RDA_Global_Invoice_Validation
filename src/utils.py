@@ -107,6 +107,32 @@ def nombre_archivo_rango_fb03(desde, hasta):
     return f"FB03_{d}_a_{h}.csv"
 
 
+# 2nd run (after the consolidation): one file per transaction, named like VBRL / FB03 with the
+# dates of the period. FBL5N is SAP's own text list, kept with the extension of its recording.
+ARCHIVOS_SEGUNDA_CORRIDA = {
+    "vbrp":  ("VBRP",   ".csv"),
+    "vbrk":  ("VBRK",   ".csv"),
+    "vbrl2": ("VBRL_2", ".csv"),
+    "fbl5n": ("FBL5N",  ".XLS"),
+    "knvp":  ("KNVP",   ".csv"),
+    "bkpf":  ("BKPF",   ".csv"),
+}
+
+
+def nombre_archivo_dia_2da(clave, fecha_str):
+    """('vbrp', '18.08.2026') -> 'VBRP_18_ago_26.csv'; KeyError for an unknown key."""
+    prefijo, ext = ARCHIVOS_SEGUNDA_CORRIDA[clave]
+    return f"{prefijo}_{_sufijo_dia(parse_fecha(fecha_str))}{ext}"
+
+
+def nombre_archivo_rango_2da(clave, desde, hasta):
+    """('fbl5n', '18.08.2026', '20.08.2026') -> 'FBL5N_18_ago_26_a_20_ago_26.XLS'."""
+    prefijo, ext = ARCHIVOS_SEGUNDA_CORRIDA[clave]
+    d = _sufijo_dia(parse_fecha(desde))
+    h = _sufijo_dia(parse_fecha(hasta))
+    return f"{prefijo}_{d}_a_{h}{ext}"
+
+
 # Venta EIAP only works with a range ("Varios días"): no per-day name.
 def nombre_archivo_rango_eiap(desde, hasta):
     """('01.01.2026', '10.01.2026') -> 'Venta_EIAP_1_ene_26_a_10_ene_26.csv'."""
@@ -128,3 +154,5 @@ if __name__ == "__main__":
     print("FB03    rango :", nombre_archivo_rango_fb03("11.08.2026", "13.08.2026"))
     print("EIAP    rango :", nombre_archivo_rango_eiap("01.01.2026", "10.01.2026"))
     print("EIAP    a SAP :", fecha_efectiva_eiap_str("10.01.2026"))
+    for clave in ARCHIVOS_SEGUNDA_CORRIDA:
+        print(f"{clave:<7} día   :", nombre_archivo_dia_2da(clave, "11.08.2026"))

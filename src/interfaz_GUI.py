@@ -16,6 +16,8 @@ from utils import (
     nombre_archivo_dia_vbrl,     nombre_archivo_rango_vbrl,
     nombre_archivo_dia_fb03,     nombre_archivo_rango_fb03,
     nombre_archivo_rango_eiap,
+    ARCHIVOS_SEGUNDA_CORRIDA,
+    nombre_archivo_dia_2da,      nombre_archivo_rango_2da,
 )
 
 
@@ -443,6 +445,19 @@ class ValidacionFacturaGUI:
         except ValueError:
             return "(fecha inválida)"
 
+    def _preview_nombre_2da(self, clave):
+        """File of a 2nd-run transaction ('vbrp', 'fbl5n'...), named with the GUI dates."""
+        try:
+            if self.mode_var.get() == "single":
+                return nombre_archivo_dia_2da(clave, self.date_single_var.get().strip())
+            return nombre_archivo_rango_2da(
+                clave,
+                self.date_from_var.get().strip(),
+                self.date_to_var.get().strip(),
+            )
+        except ValueError:
+            return "(fecha inválida)"
+
     def _preview_nombre_eiap(self):
         # 'Venta EIAP' only works with a range.
         if self.mode_var.get() == "single":
@@ -461,7 +476,8 @@ class ValidacionFacturaGUI:
             f"📄 Monivoi:  {self._preview_nombre_monivoi()}\n"
             f"📄 VBRL:       {self._preview_nombre_vbrl()}\n"
             f"📄 FB03:       {self._preview_nombre_fb03()}\n"
-            f"📄 Venta EIAP: {self._preview_nombre_eiap()}"
+            f"📄 Venta EIAP: {self._preview_nombre_eiap()}\n"
+            "📄 2a corrida (tras consolidar): VBRP, VBRK, VBRL_2, BKPF, KNVP y FBL5N"
         )
 
     def _on_mode_change(self):
@@ -475,11 +491,16 @@ class ValidacionFacturaGUI:
 
     def _ajustar_alto_ventana(self):
         """Grow the window ONLY when display scaling makes the content taller than the design size
-        (measured with the taller 'Varios días' frame).
+        (measured with the taller 'Varios días' frame AND its file names, the longest preview text:
+        measured with an empty preview, a wrapped name line was left out of view).
         """
+        modo = self.mode_var.get()
+        self.mode_var.set("range")
+        self._update_filename_preview()
         self.single_frame.pack_forget()
         self.range_frame.pack(fill="x")
         self.root.update_idletasks()
+        self.mode_var.set(modo)
         ancho = max(self.ANCHO_BASE, self.root.winfo_reqwidth())
         alto  = max(self.ALTO_BASE,  self.root.winfo_reqheight())
         self.root.geometry(f"{ancho}x{alto}")
@@ -523,7 +544,10 @@ class ValidacionFacturaGUI:
             "fb03":    self._preview_nombre_fb03,
             "eiap":    self._preview_nombre_eiap,
         }
-        filename = nombres.get(transaccion, self._preview_nombre)()
+        if transaccion in ARCHIVOS_SEGUNDA_CORRIDA:
+            filename = self._preview_nombre_2da(transaccion)
+        else:
+            filename = nombres.get(transaccion, self._preview_nombre)()
         input_path = self.path_var.get().strip()
         os.makedirs(input_path, exist_ok=True)
         self._guardar_config()
