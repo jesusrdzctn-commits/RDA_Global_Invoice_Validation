@@ -2,7 +2,7 @@
 Validación Factura Global — SAP downloads (SAP GUI scripting)
 
 Gallo (FAGLL03), Monivoi (ZLMXCOM_TRN_MONINVOI), VBRL (ZSE16), FB03 (document list) and
-Venta DSD + EIAP (FAGLL03 with the accounts and classes of both sales); after the consolidation, the 2nd run: VBRP, VBRK,
+Venta EIAP and Venta DSD (two FAGLL03 queries, each with the accounts and classes of ITS sale); after the consolidation, the 2nd run: VBRP, VBRK,
 VBRL (2nd run), KNVP, BKPF (ZSE16) and FBL5N (customer search help). Every download follows its
 VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
 
@@ -38,10 +38,13 @@ from utils import (
     nombre_archivo_dia,
     nombre_archivo_dia_monivoi,
     nombre_archivo_rango_eiap,
+    nombre_archivo_rango_dsd,
     fecha_efectiva_monivoi_str,
     fecha_efectiva_eiap,
     CUENTAS_EIAP,
     CLASES_EIAP,
+    CUENTAS_DSD,
+    CLASES_DSD,
 )
 
 MAX_VENTANAS_SAP = 4                                           # corporate limit of SAP windows per user
@@ -804,46 +807,26 @@ class Archivos:
 # ======================================================================
 class Paralelo:
     """
-    The P&L way: make sure the first connection has enough windows (the ones already open
-    are used as they are; the missing ones are opened with CreateSession and stay open),
-    then one thread per window: it initializes COM, takes its window BY INDEX
-    (connection.Children(i)) and runs its download. Each thread can label the console
-    lines it prints (etiqueta/marca) to show whether the windows really overlapped.
+    The P&L way: the SAP windows of the first connection are opened by the USER (three of them,
+    always, before running the program; this code never opens one), then one thread per window:
+    it initializes COM, takes its window BY INDEX (connection.Children(i)) and runs its download.
+    Each thread can label the console lines it prints (etiqueta/marca) to show whether the
+    windows really overlapped.
     """
-    ESPERA_NUEVA_VENTANA = 20      # s SAP may take to show a window opened with CreateSession
     DESFASE = 0                    # s between the starts of two windows of a pass (P&L used 30)
     _hilo = threading.local()
 
     @staticmethod
-    def asegurar_ventanas(deseadas):
+    def ventanas_disponibles(deseadas):
         """
-        Open windows until the first connection has `deseadas` (at most MAX_VENTANAS_SAP).
-        Returns (windows available, up to `deseadas`; windows opened now).
+        How many windows of the first connection can be used: the ones that are open, up to
+        `deseadas` (at most MAX_VENTANAS_SAP). It NEVER opens a window: with fewer than wanted, the
+        caller works with what there is. ConnectionError if SAP GUI is not running.
         """
         deseadas = min(int(deseadas), MAX_VENTANAS_SAP)
         if deseadas < 1:
             raise ValueError("Se necesita al menos una ventana de SAP.")
-        conexion = SAP.conexion()
-        abiertas = 0
-        while int(conexion.Children.Count) < deseadas:
-            antes = int(conexion.Children.Count)
-            primera = conexion.Children(0)
-            try:
-                primera.CreateSession()           # a GuiSession method (not of the connection)
-            except Exception as e:
-                print(f"[SAP] No pude abrir otra ventana: {e}")
-                break
-            limite = time.time() + Paralelo.ESPERA_NUEVA_VENTANA
-            while int(conexion.Children.Count) <= antes and time.time() < limite:
-                time.sleep(0.25)
-            if int(conexion.Children.Count) <= antes:
-                # At the limit SAP opens nothing and shows a popup in the calling window.
-                print("[SAP] SAP no abrió otra ventana (probablemente se alcanzó el límite de ventanas).")
-                SAP.cerrar_popups(primera)
-                break
-            abiertas += 1
-            time.sleep(0.8)                       # let the new window finish starting up
-        return min(int(conexion.Children.Count), deseadas), abiertas
+        return min(int(SAP.conexion().Children.Count), deseadas)
 
     @staticmethod
     def en_ventana(indice, funcion, *args, **kwargs):
@@ -1052,7 +1035,7 @@ class Gallo(Descarga):
     CUENTAS = ["4000005", "4150000", "4200000", "4200004", "4200015", "4260000", "7000005"]
     VARIANTE = "BASE/VALID"
 
-    # 'Dynamic selections' (Venta DSD + EIAP only). Tree node keys come from a recording: they are system-specific.
+    # 'Dynamic selections' (the sales buttons, Venta DSD and Venta EIAP, only). Tree node keys come from a recording: they are system-specific.
     ARBOL = "wnd[0]/shellcont/shellcont/shell/shellcont[0]/shell"
     NODO_PADRE, NODO_CLASE = " " * 9 + "23", " " * 9 + "30"
     BTN_CLASES = "wnd[0]/usr/btn%_%%DYN001_%_APP_%-VALU_PUSH"
@@ -2083,9 +2066,10 @@ class VBRK(TablaZSE16):
 class VBRL2(TablaZSE16):
     """
     ZSE16 on table VBRL (2nd run) for the same references. VBRL_2do_run.vbs ticks lines 5 and 7 of
-    'Fields for selection' and pastes into the second one; the user confirmed (22-oct-2026) that
-    the right field is line 5, 'VBELN  Lista de facturas'. So, like the 1st VBRL: VBELN as the ONLY
-    selection field (found by its name), the list pasted into I1; no layout step (as recorded).
+    'Fields for selection' and pastes into the second one (I2): line 7, 'VBELN_VF' (billing
+    document). The user corrected (25-oct-2026) the earlier VBELN (line 5): the references go in
+    VBELN_VF. It is the ONLY selection field (found by its name), so the list is pasted into I1,
+    which queries the same field as the recording's I2; no layout step (as recorded).
     """
     NOMBRE = "VBRL2_ZSE16"
     MARCA = "ZSE16/VBRL_2"
@@ -2093,10 +2077,10 @@ class VBRL2(TablaZSE16):
     TABLA = "VBRL"
     ARCHIVO = "VBRL_2.csv"
     UNIDAD = ("referencia(s)", "pedida(s)")
-    # The field the references are looked up in (line 5, confirmed on 22-oct-2026). The recording ticks
-    # lines 5 AND 7 and pastes into the second one (I2); in the table's order line 7 would be
-    # "VBELN_VF" (billing document) — the candidate to try if SAP finds none of the references here.
-    CAMPO = "VBELN"
+    # The field the references are looked up in: line 7, "VBELN_VF" (confirmed on 25-oct-2026; line 5,
+    # "VBELN", was wrong). The recording ticks lines 5 AND 7 and pastes into the second one (I2).
+    # ZSE16.patron matches the WHOLE name, so "VBELN_VF" never picks the "VBELN" line (nor the reverse).
+    CAMPO = "VBELN_VF"
 
     def pasos(self):
         self.preparar()
@@ -2113,7 +2097,8 @@ class VBRL2(TablaZSE16):
             return True
         print(f"[{self.ETIQUETA}] SAP no encontró ninguna de las referencias en el campo "
               f"'{self.info['campo']}'. Si esperabas datos, revisa que ese sea el campo correcto "
-              "(VBRL2.CAMPO; la grabación VBRL_2do_run.vbs marca los renglones 5 y 7 y pega en el segundo).")
+              "(VBRL2.CAMPO; la grabación VBRL_2do_run.vbs marca los renglones 5 y 7 y pega en el segundo: "
+              "VBELN_VF).")
         return False
 
 
@@ -2448,17 +2433,18 @@ def Gallo_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SO
     return Gallo(DateFrom, DateTo, FolderPath, FileName, sociedad, cuentas, variante, session, clases).ejecutar()
 
 
-def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD, session=None):
+def _Venta_FAGLL03(venta, cuentas, clases, nombre_archivo, DateFrom, DateTo, FolderPath, FileName,
+                   sociedad, session):
     """
-    Gallo with the accounts and document classes of Venta DSD AND Venta EIAP (utils.CUENTAS_EIAP /
-    CLASES_EIAP), in ONE query up to DateTo MINUS one day (utils.fecha_efectiva_eiap); the file name
-    keeps the typed dates. ValueError if that leaves an empty or backwards range.
+    Gallo with the accounts and document classes of ONE sale (`venta`: 'Venta DSD' / 'Venta EIAP', for
+    the messages), up to DateTo MINUS one day (utils.fecha_efectiva_eiap); the file name keeps the typed
+    dates. ValueError if that leaves an empty or backwards range.
     """
     desde = parse_fecha(DateFrom)
     hasta = fecha_efectiva_eiap(DateTo)
     if hasta < desde:
         raise ValueError(
-            f"Venta DSD + EIAP: con Fecha Hasta {DateTo} la consulta terminaría el "
+            f"{venta}: con Fecha Hasta {DateTo} la consulta terminaría el "
             f"{hasta.strftime(FORMATO_FECHA)}, antes de la Fecha Desde ({DateFrom}). "
             "El periodo debe abarcar al menos 2 días."
         )
@@ -2466,12 +2452,26 @@ def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad
         DateFrom=desde.strftime(FORMATO_FECHA),
         DateTo=hasta.strftime(FORMATO_FECHA),
         FolderPath=FolderPath,
-        FileName=FileName or nombre_archivo_rango_eiap(DateFrom, DateTo),
+        FileName=FileName or nombre_archivo(DateFrom, DateTo),
         sociedad=sociedad,
-        cuentas=list(CUENTAS_EIAP),
+        cuentas=list(cuentas),
         session=session,
-        clases=CLASES_EIAP,
+        clases=clases,
     )
+
+
+def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD, session=None):
+    """'Venta EIAP': Gallo with the accounts and classes of utils.CUENTAS_EIAP / CLASES_EIAP, up to
+    DateTo minus one day. ValueError if the range is empty or backwards."""
+    return _Venta_FAGLL03("Venta EIAP", CUENTAS_EIAP, CLASES_EIAP, nombre_archivo_rango_eiap,
+                          DateFrom, DateTo, FolderPath, FileName, sociedad, session)
+
+
+def VentaDSD_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD, session=None):
+    """'Venta DSD': Gallo with the accounts and classes of utils.CUENTAS_DSD / CLASES_DSD, up to
+    DateTo minus one day. ValueError if the range is empty or backwards."""
+    return _Venta_FAGLL03("Venta DSD", CUENTAS_DSD, CLASES_DSD, nombre_archivo_rango_dsd,
+                          DateFrom, DateTo, FolderPath, FileName, sociedad, session)
 
 
 def Monivoi_ZLMXCOM(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD,
@@ -2534,8 +2534,9 @@ if __name__ == "__main__":
     print("3) VBRL (ZSE16) — con las facturas (columna 'Factura') del archivo de Monivoi del mismo periodo")
     print("4) FB03 (lista de documentos) — con los documentos (columna 'Nº documento') del archivo de Gallo "
           "del mismo periodo, sólo Clase de documento C2/C6 y Referencia Global")
-    print("5) Venta DSD + EIAP (FAGLL03, cuentas y clases de ambas ventas) — la fecha hasta se consulta menos 1 día")
-    opcion = input("Elige transacción [1/2/3/4/5]: ").strip()
+    print("5) Venta EIAP (FAGLL03, cuentas y clases de EIAP) — la fecha hasta se consulta menos 1 día")
+    print("6) Venta DSD (FAGLL03, cuentas y clases de DSD) — la fecha hasta se consulta menos 1 día")
+    opcion = input("Elige transacción [1/2/3/4/5/6]: ").strip()
     date_from = input("Fecha desde (DD.MM.YYYY): ").strip()
     date_to = input("Fecha hasta (DD.MM.YYYY): ").strip()
     carpeta = Archivos.ruta_input_default()
@@ -2578,14 +2579,15 @@ if __name__ == "__main__":
         except DescargaPorRevisarError as e:
             print(f"⚠️ {e}")
             ok = False
-    elif opcion == "5":
+    elif opcion in ("5", "6"):
         try:
-            archivo = nombre_archivo_rango_eiap(date_from, date_to)
+            archivo = (nombre_archivo_rango_eiap if opcion == "5" else nombre_archivo_rango_dsd)(
+                date_from, date_to)
             print(f"\nEl archivo se nombrará : {archivo}")
             print(f"Se consultará en SAP   : {date_from} — "
                   f"{fecha_efectiva_eiap(date_to).strftime(FORMATO_FECHA)}")
             print(f"Se guardará en         : {carpeta}\n")
-            ok = VentaEIAP_FAGLL03(date_from, date_to)
+            ok = (VentaEIAP_FAGLL03 if opcion == "5" else VentaDSD_FAGLL03)(date_from, date_to)
         except ValueError as e:
             print(f"❌ {e}")
             ok = False

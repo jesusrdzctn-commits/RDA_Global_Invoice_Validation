@@ -16,6 +16,7 @@ from utils import (
     nombre_archivo_dia_vbrl,     nombre_archivo_rango_vbrl,
     nombre_archivo_dia_fb03,     nombre_archivo_rango_fb03,
     nombre_archivo_rango_eiap,
+    nombre_archivo_rango_dsd,
     ARCHIVOS_SEGUNDA_CORRIDA,    CORRIDAS_DESCARGA,
     nombre_archivo_dia_2da,      nombre_archivo_rango_2da,
 )
@@ -65,6 +66,7 @@ class ValidacionFacturaGUI:
         # Callbacks the controller wires up
         self.on_download_gallo   = None
         self.on_download_monivoi = None
+        self.on_download_dsd     = None
         self.on_download_eiap    = None
         self.on_download_todos   = None
         self.on_consolidar       = None
@@ -294,10 +296,9 @@ class ValidacionFacturaGUI:
         )
         fila_individual = tk.Frame(btn_frame, bg=self.bg_color)
         fila_individual.pack(fill="x", pady=(0, 8))
-        # uniform= gives the three columns the same width whatever their labels.
-        fila_individual.columnconfigure(0, weight=1, uniform="descargas")
-        fila_individual.columnconfigure(1, weight=1, uniform="descargas")
-        fila_individual.columnconfigure(2, weight=1, uniform="descargas")
+        # uniform= gives the four columns the same width whatever their labels.
+        for columna in range(4):
+            fila_individual.columnconfigure(columna, weight=1, uniform="descargas")
 
         self.download_gallo_btn = tk.Button(
             fila_individual, text="🐓 Gallo",
@@ -311,11 +312,18 @@ class ValidacionFacturaGUI:
         )
         self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=4)
 
+        # The two sales have their own button (a merged query was too big): same range-only rule.
+        self.download_dsd_btn = tk.Button(
+            fila_individual, text="🛒 Venta DSD",
+            command=self._handle_dsd, **_btn_individual_kwargs,
+        )
+        self.download_dsd_btn.grid(row=0, column=2, sticky="ew", padx=4)
+
         self.download_eiap_btn = tk.Button(
-            fila_individual, text="📈 Venta DSD + EIAP",
+            fila_individual, text="📈 Venta EIAP",
             command=self._handle_eiap, **_btn_individual_kwargs,
         )
-        self.download_eiap_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.download_eiap_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         # Its text follows the 'Descargas' radio button (_on_corrida_descarga_change).
         self.download_btn = tk.Button(
@@ -545,21 +553,27 @@ class ValidacionFacturaGUI:
         except ValueError:
             return "(fecha inválida)"
 
-    def _preview_nombre_eiap(self):
-        # 'Venta DSD + EIAP' only works with a range.
+    def _preview_nombre_venta(self, nombre_archivo):
+        # The sales buttons ('Venta DSD', 'Venta EIAP') only work with a range.
         if self.mode_var.get() == "single":
             return "(sólo con 'Varios días')"
         try:
-            return nombre_archivo_rango_eiap(
+            return nombre_archivo(
                 self.date_from_var.get().strip(),
                 self.date_to_var.get().strip(),
             )
         except ValueError:
             return "(fecha inválida)"
 
+    def _preview_nombre_dsd(self):
+        return self._preview_nombre_venta(nombre_archivo_rango_dsd)
+
+    def _preview_nombre_eiap(self):
+        return self._preview_nombre_venta(nombre_archivo_rango_eiap)
+
     def _update_filename_preview(self):
-        """The files of the selected download run (the 1st one also lists 'Venta DSD + EIAP', whose
-        button sits next to Gallo and Monivoi)."""
+        """The files of the selected download run (the 1st one also lists 'Venta DSD' and 'Venta EIAP',
+        whose buttons sit next to Gallo and Monivoi)."""
         if not hasattr(self, "corrida_descarga_var"):
             return                                # still building the window
         if self.corrida_descarga() == 2:
@@ -573,7 +587,8 @@ class ValidacionFacturaGUI:
             f"📄 Monivoi:  {self._preview_nombre_monivoi()}\n"
             f"📄 VBRL:       {self._preview_nombre_vbrl()}\n"
             f"📄 FB03:       {self._preview_nombre_fb03()}\n"
-            f"📄 Venta DSD + EIAP: {self._preview_nombre_eiap()}"
+            f"📄 Venta DSD: {self._preview_nombre_dsd()}\n"
+            f"📄 Venta EIAP: {self._preview_nombre_eiap()}"
         )
 
     def _on_mode_change(self):
@@ -644,6 +659,7 @@ class ValidacionFacturaGUI:
             "monivoi": self._preview_nombre_monivoi,
             "vbrl":    self._preview_nombre_vbrl,
             "fb03":    self._preview_nombre_fb03,
+            "dsd":     self._preview_nombre_dsd,
             "eiap":    self._preview_nombre_eiap,
         }
         if transaccion in ARCHIVOS_SEGUNDA_CORRIDA:
@@ -683,6 +699,7 @@ class ValidacionFacturaGUI:
         return (
             (self.download_gallo_btn,   self.primary_color),
             (self.download_monivoi_btn, self.primary_color),
+            (self.download_dsd_btn,     self.primary_color),
             (self.download_eiap_btn,    self.primary_color),
             (self.download_btn,         self.primary_color),
             (self.consolidar_btn,       self.success_color),
@@ -727,6 +744,9 @@ class ValidacionFacturaGUI:
 
     def _handle_monivoi(self):
         self._disparar(self.on_download_monivoi, "monivoi")
+
+    def _handle_dsd(self):
+        self._disparar(self.on_download_dsd, "dsd")
 
     def _handle_eiap(self):
         self._disparar(self.on_download_eiap, "eiap")

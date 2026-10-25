@@ -11,10 +11,10 @@ EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida
 downloads pastes into SAP, from the #N/A rows) → Consolidador (the orchestrator); a class only
 uses the ones above it.
 consolidar_gallo_monivoi() is what the controller calls; calcular_listas_segunda_corrida() gives
-the '2a corrida' download button the same lists without writing a workbook; consolidar_venta_eiap()
-runs when ONLY the 'Venta DSD + EIAP' file was downloaded (its own workbook with the tabs 'Venta
-DSD' and 'Venta EIAP', see EtapaVentas: they are NOT part of the full workbook). No SAP and no
-tkinter here.
+the '2a corrida' download button the same lists without writing a workbook; consolidar_venta_dsd() and
+consolidar_venta_eiap() run when ONLY the file of that sale was downloaded (each its own workbook
+with the single tab 'Venta DSD' / 'Venta EIAP', see EtapaVentas: they are NOT part of the full
+workbook). No SAP and no tkinter here.
 """
 
 import os
@@ -30,10 +30,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from utils import (
-    CUENTAS_VENTA_DSD, CLASES_VENTA_DSD,
-    CUENTAS_VENTA_EIAP, CLASES_VENTA_EIAP,
-)
+from utils import CUENTAS_DSD, CLASES_DSD, CUENTAS_EIAP, CLASES_EIAP
 
 
 # === Shared helpers ===
@@ -826,35 +823,25 @@ class EtapaDocumentosFB03:
 
 # === Stage: 'Venta DSD' and 'Venta EIAP' — amount by date ===
 class EtapaVentas:
-    """The two sales sheets of the 'Venta DSD + EIAP' button: each a date (A) × summed amount (B)
-    matrix over the SAME FAGLL03 file (its one query asks for the accounts and classes of both):
-        'Venta DSD'   Clase de documento C1/C2/C5/C6/X0 or blank ("" = Excel's "(blanks)") AND
-                      accounts 4000005/4000010
-        'Venta EIAP'  Clase de documento RV/DA AND accounts 4000010/4000020/4000802/4300013
-    (the lists live in utils.py, next to what SAP is asked for). A row that fits neither sheet is
-    reported in 'avisos', never summed. It also validates the dates picked in the GUI. These sheets
-    are NOT in the full workbook (Gallo + Monivoi...): `consolidar_venta_eiap` writes them alone.
+    """The sales sheet of a sales button: a date (A) × summed amount (B) matrix over that sale's
+    FAGLL03 file (each button has its own query and its own workbook). This is the shared logic; the
+    sale is a subclass with its tab, its filters and its texts:
+        EtapaVentaDSD   'Venta DSD'   Clase de documento C1/C2/C5/C6/X0 or blank ("" = Excel's
+                        "(blanks)") AND accounts 4000005/4000010
+        EtapaVentaEIAP  'Venta EIAP'  Clase de documento RV/DA AND accounts
+                        4000010/4000020/4000802/4300013
+    (the lists live in utils.py, next to what SAP is asked for). A row that fits the tab's filters
+    is never lost: one that does not is reported in 'avisos', never summed. It also validates the
+    dates picked in the GUI. These sheets are NOT in the full workbook (Gallo + Monivoi...):
+    `consolidar_venta_dsd` / `consolidar_venta_eiap` write them alone.
     """
 
-    HOJA_DSD  = "Venta DSD"
-    HOJA_EIAP = "Venta EIAP"
-    HOJAS = (("dsd", HOJA_DSD), ("eiap", HOJA_EIAP))
-
-    # The blank class counts for DSD, but SAP's class filter of the download cannot ask for it: it
-    # only matters for a file that already carries blank-class rows.
-    CLASES_DSD  = frozenset(CLASES_VENTA_DSD) | {""}
-    # Accounts compared NORMALIZED: '4000010', '0004000010' and '4000010.0' are the same.
-    CUENTAS_DSD  = frozenset(CUENTAS_VENTA_DSD)
-    CLASES_EIAP_HOJA  = frozenset(CLASES_VENTA_EIAP)
-    CUENTAS_EIAP_HOJA = frozenset(CUENTAS_VENTA_EIAP)
-    # The matrices `preparar` builds: (key, tab, classes, accounts).
-    BLOQUES = (
-        ("dsd",  HOJA_DSD,  CLASES_DSD,       CUENTAS_DSD),
-        ("eiap", HOJA_EIAP, CLASES_EIAP_HOJA, CUENTAS_EIAP_HOJA),
-    )
-    # Where the rows come from, for the warnings and the filter legend.
-    ORIGEN = "Venta DSD + EIAP"
-    LEYENDA_ORIGEN = "archivo de Venta DSD + EIAP"
+    # The matrices `preparar` builds: (key, tab, classes, accounts). Defined by each sale.
+    BLOQUES = ()
+    # Where the rows come from, for the warnings and the filter legend. Defined by each sale.
+    ORIGEN = ""
+    LEYENDA_ORIGEN = ""
+    # Accounts are compared NORMALIZED: '4000010', '0004000010' and '4000010.0' are the same.
 
     ENCABEZADO_FECHA   = "Fecha"
     ETIQUETA_SIN_FECHA = "Sin fecha"
@@ -1002,9 +989,12 @@ class EtapaVentas:
 
     @classmethod
     def desde_csv(cls, eiap, fechas_sel=()):
-        """The stage for the 'Venta DSD + EIAP' CSV (as text): resolves its columns by name and parses
-        the amounts. ValueError: a missing column or an unreadable amount.
+        """The stage for the sale's CSV (as text): resolves its columns by name and parses the amounts.
+        ValueError: a missing column or an unreadable amount. TypeError: called on the base class.
         """
+        if not cls.BLOQUES:
+            raise TypeError("EtapaVentas es la base: usa EtapaVentaDSD o EtapaVentaEIAP.")
+
         def col(candidatos, descripcion):
             return Comun.col_por_candidatos(eiap, candidatos, descripcion, cls.ORIGEN)
 
@@ -1114,8 +1104,8 @@ class EtapaVentas:
                 },
             }
 
-        # Rows that fit NO sheet: the file is one query for both sales, so a pair like class RV with
-        # account 4000005 can arrive and belongs to neither. Counted with their amount.
+        # Rows that fit NO sheet of this sale (e.g. a class SAP's filter should have kept out, or an
+        # account/class pair of the other sale): reported with their amount, never summed.
         cubiertas = pd.Series(False, index=gallo.index)
         for mascara in mascaras.values():
             cubiertas = cubiertas | mascara
@@ -1197,6 +1187,30 @@ class EtapaVentas:
 
         ws.column_dimensions["A"].width = 14
         ws.column_dimensions["B"].width = 24
+
+
+class EtapaVentaDSD(EtapaVentas):
+    """'Venta DSD': classes C1/C2/C5/C6/X0 (or blank) and accounts 4000005/4000010 of ITS download."""
+
+    HOJA_DSD = "Venta DSD"
+    # The blank class counts for DSD, but SAP's class filter of the download cannot ask for it: it
+    # only matters for a file that already carries blank-class rows.
+    CLASES_HOJA = frozenset(CLASES_DSD) | {""}
+    CUENTAS_HOJA = frozenset(CUENTAS_DSD)
+    BLOQUES = (("dsd", HOJA_DSD, CLASES_HOJA, CUENTAS_HOJA),)
+    ORIGEN = "Venta DSD"
+    LEYENDA_ORIGEN = "archivo de Venta DSD"
+
+
+class EtapaVentaEIAP(EtapaVentas):
+    """'Venta EIAP': classes RV/DA and the EIAP accounts of ITS download."""
+
+    HOJA_EIAP = "Venta EIAP"
+    CLASES_HOJA = frozenset(CLASES_EIAP)
+    CUENTAS_HOJA = frozenset(CUENTAS_EIAP)
+    BLOQUES = (("eiap", HOJA_EIAP, CLASES_HOJA, CUENTAS_HOJA),)
+    ORIGEN = "Venta EIAP"
+    LEYENDA_ORIGEN = "archivo de Venta EIAP"
 
 
 # === Stage: Monivoi (ZLMXCOM_TRN_MONINVOI) — 'MTD' (step 16) ===
@@ -3183,49 +3197,65 @@ def calcular_listas_segunda_corrida(ruta_gallo, ruta_vbrl, ruta_fb03=None, callb
     return listas
 
 
-def consolidar_venta_eiap(ruta_eiap, ruta_output, nombre_salida=None, callback_status=None,
-                          fechas_seleccionadas=None):
-    """The controller's entry point for the 'Venta DSD + EIAP' button: a workbook with the two tabs
-    'Venta DSD' and 'Venta EIAP' (EtapaVentas). `fechas_seleccionadas` ('DD.MM.YYYY'): every day of
-    the queried range, which show up even without amounts. FileNotFoundError / ValueError as in
-    Consolidador.ejecutar().
+def _consolidar_venta(etapa_cls, ruta_csv, ruta_output, nombre_salida, callback_status,
+                      fechas_seleccionadas):
+    """The workbook of ONE sale: its CSV → the single tab of `etapa_cls` (EtapaVentaDSD / EtapaVentaEIAP).
+    Returns the summary dict the GUI shows: ruta, filas_archivo, total_venta, venta_avisos.
     """
     status = callback_status or (lambda _mensaje: None)
     fechas_sel = EtapaVentas.parsear_fechas_seleccionadas(fechas_seleccionadas)
+    (clave, nombre_hoja, _, _), = etapa_cls.BLOQUES
 
-    status("📄 Leyendo archivo de Venta DSD + EIAP...")
-    eiap = Comun.leer_csv(ruta_eiap)
-    if Comun.es_sin_datos(eiap):
+    status(f"📄 Leyendo archivo de {etapa_cls.ORIGEN}...")
+    datos = Comun.leer_csv(ruta_csv)
+    if Comun.es_sin_datos(datos):
         raise ValueError(
-            "El archivo de Venta DSD + EIAP no tiene datos (descarga 'sin partidas'). "
+            f"El archivo de {etapa_cls.ORIGEN} no tiene datos (descarga 'sin partidas'). "
             "No hay nada que consolidar."
         )
 
-    status("📆 Construyendo 'Venta DSD' y 'Venta EIAP'...")
-    etapa = EtapaVentas.desde_csv(eiap, fechas_sel)
+    status(f"📆 Construyendo '{nombre_hoja}'...")
+    etapa = etapa_cls.desde_csv(datos, fechas_sel)
     ventas = etapa.preparar()
 
     status("💾 Guardando Excel consolidado...")
     os.makedirs(ruta_output, exist_ok=True)
     if not nombre_salida:
-        nombre_salida = f"Consolidado_{os.path.splitext(os.path.basename(ruta_eiap))[0]}.xlsx"
+        nombre_salida = f"Consolidado_{os.path.splitext(os.path.basename(ruta_csv))[0]}.xlsx"
     ruta_final = os.path.join(ruta_output, nombre_salida)
 
     libro = Workbook()
-    for posicion, (clave, nombre_hoja) in enumerate(EtapaVentas.HOJAS):
-        hoja = libro.active if posicion == 0 else libro.create_sheet()
-        hoja.title = nombre_hoja
-        etapa.escribir(hoja, clave)
+    hoja = libro.active
+    hoja.title = nombre_hoja
+    etapa.escribir(hoja, clave)
     libro.save(ruta_final)
 
     status("✅ Consolidación completada")
     return {
-        "ruta":             ruta_final,
-        "filas_archivo":    len(eiap),
-        "total_venta_dsd":  ventas["dsd"]["total"],
-        "total_venta_eiap": ventas["eiap"]["total"],
-        "venta_avisos":     ventas["avisos"],
+        "ruta":          ruta_final,
+        "filas_archivo": len(datos),
+        "total_venta":   ventas[clave]["total"],
+        "venta_avisos":  ventas["avisos"],
     }
+
+
+def consolidar_venta_dsd(ruta_dsd, ruta_output, nombre_salida=None, callback_status=None,
+                         fechas_seleccionadas=None):
+    """The controller's entry point for the 'Venta DSD' button: a workbook with the single tab 'Venta DSD'.
+    `fechas_seleccionadas` ('DD.MM.YYYY'): every day of the queried range, which show up even without
+    amounts. FileNotFoundError / ValueError as in Consolidador.ejecutar().
+    """
+    return _consolidar_venta(EtapaVentaDSD, ruta_dsd, ruta_output, nombre_salida, callback_status,
+                             fechas_seleccionadas)
+
+
+def consolidar_venta_eiap(ruta_eiap, ruta_output, nombre_salida=None, callback_status=None,
+                          fechas_seleccionadas=None):
+    """The controller's entry point for the 'Venta EIAP' button: a workbook with the single tab
+    'Venta EIAP'. Same arguments and errors as consolidar_venta_dsd().
+    """
+    return _consolidar_venta(EtapaVentaEIAP, ruta_eiap, ruta_output, nombre_salida, callback_status,
+                             fechas_seleccionadas)
 
 
 # Quick test without the GUI:  python Consolidacion.py

@@ -19,18 +19,19 @@ from tkinter import messagebox, filedialog
 import pandas as pd
 
 from Descargas_SAP import (
-    Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, CUENTAS_EIAP, CLASES_EIAP,
+    Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, VentaDSD_FAGLL03,
     VBRL_ZSE16, FB03_Documentos, DescargaPorRevisarError,
     VBRP_ZSE16, VBRK_ZSE16, VBRL2_ZSE16, KNVP_ZSE16, BKPF_ZSE16, FBL5N_Deudores,
     Archivos, Excel, Paralelo, MAX_VENTANAS_SAP,
 )
 from Consolidacion import (
-    consolidar_gallo_monivoi, consolidar_venta_eiap, leer_documentos_monivoi,
+    consolidar_gallo_monivoi, consolidar_venta_dsd, consolidar_venta_eiap, leer_documentos_monivoi,
     leer_documentos_gallo_fb03, leer_solicitantes_vbrk, calcular_listas_segunda_corrida,
     EtapaDocumentosFB03,
 )
 from utils import (
     FORMATO_FECHA, parse_fecha, fecha_efectiva_eiap,
+    CUENTAS_EIAP, CLASES_EIAP, CUENTAS_DSD, CLASES_DSD,
     nombre_archivo_dia_2da, nombre_archivo_rango_2da, CORRIDAS_DESCARGA,
 )
 
@@ -71,14 +72,22 @@ class ValidacionFacturaController:
             "nombre":   "Monivoi (ZLMXCOM_TRN_MONINVOI)",
             "descarga": Monivoi_ZLMXCOM,
         }
-        # ONE Gallo query with the accounts and classes of 'Venta DSD' AND 'Venta EIAP' (the unions in
-        # utils); only for a range, SAP queried up to the end date minus one day. Its own workbook.
+        # The two sales have their OWN Gallo query (the accounts and classes of each, in utils): a merged
+        # one was too big. Only for a range, SAP queried up to the end date minus one day. Each has its own
+        # file and its own workbook, and neither is part of the full process.
+        self._TX_DSD = {
+            "clave":    "dsd",
+            "nombre":   "Venta DSD (FAGLL03)",
+            "descarga": VentaDSD_FAGLL03,
+            "validar":  lambda config: self._validar_venta("Venta DSD", config),
+            "nota":     lambda config: self._nota_venta(config, CUENTAS_DSD, CLASES_DSD),
+        }
         self._TX_EIAP = {
             "clave":    "eiap",
-            "nombre":   "Venta DSD + EIAP (FAGLL03)",
+            "nombre":   "Venta EIAP (FAGLL03)",
             "descarga": VentaEIAP_FAGLL03,
-            "validar":  self._validar_eiap,
-            "nota":     self._nota_eiap,
+            "validar":  lambda config: self._validar_venta("Venta EIAP", config),
+            "nota":     lambda config: self._nota_venta(config, CUENTAS_EIAP, CLASES_EIAP),
         }
         # VBRL and FB03: ONE query for the period with a list read from the file another transaction
         # downloaded in THIS run: "requiere" (that one, which must run before), "leer_documentos"
@@ -138,7 +147,8 @@ class ValidacionFacturaController:
         }
         self._TX_POR_CLAVE = {
             tx["clave"]: tx
-            for tx in (self._TX_GALLO, self._TX_MONIVOI, self._TX_EIAP, self._TX_VBRL, self._TX_FB03,
+            for tx in (self._TX_GALLO, self._TX_MONIVOI, self._TX_DSD, self._TX_EIAP, self._TX_VBRL,
+                       self._TX_FB03,
                        self._TX_VBRP, self._TX_VBRK, self._TX_VBRL2, self._TX_BKPF,
                        self._TX_FBL5N, self._TX_KNVP)
         }
@@ -148,6 +158,7 @@ class ValidacionFacturaController:
 
         self.gui.on_download_gallo   = self.execute_download_gallo
         self.gui.on_download_monivoi = self.execute_download_monivoi
+        self.gui.on_download_dsd     = self.execute_download_dsd
         self.gui.on_download_eiap    = self.execute_download_eiap
         self.gui.on_download_todos   = self.execute_download_todos
         self.gui.on_consolidar = self.execute_consolidacion
@@ -159,8 +170,11 @@ class ValidacionFacturaController:
     def execute_download_monivoi(self):
         self._execute_download([self._TX_MONIVOI], "Monivoi")
 
+    def execute_download_dsd(self):
+        self._execute_download([self._TX_DSD], "Venta DSD")
+
     def execute_download_eiap(self):
-        self._execute_download([self._TX_EIAP], "Venta DSD + EIAP")
+        self._execute_download([self._TX_EIAP], "Venta EIAP")
 
     def execute_download_todos(self):
         """The main download button: the run its GUI radio button selects. 1a = Gallo, Monivoi, VBRL,
@@ -547,12 +561,12 @@ class ValidacionFacturaController:
         return min(max((len(pasada) for pasada in pasadas), default=1), MAX_VENTANAS_SAP)
 
     def _descargar_en_paralelo(self, txs, configs, n_ventanas, pasadas=None):
-        """The P&L way: SAP windows 1..n (the open ones as they are; the missing ones opened and
-        left open), then the passes (`pasadas`: fixed ones, else split by dependency). With a single
+        """The P&L way: SAP windows 1..n, the ones the USER already has open (this code never opens
+        one), then the passes (`pasadas`: fixed ones, else split by dependency). With a single
         window it falls back to the sequential engine.
         """
         self.gui.set_status("⏳ Preparando las ventanas de SAP... (no cierre SAP)")
-        disponibles, abiertas = Paralelo.asegurar_ventanas(n_ventanas)
+        disponibles = Paralelo.ventanas_disponibles(n_ventanas)
         if disponibles < 2:
             lineas, resultados, duraciones = self._correr_secuencial(txs, configs)
             return lineas, resultados, duraciones, [
@@ -567,10 +581,6 @@ class ValidacionFacturaController:
                 f"proceso: cada pasada se partió en grupos de {disponibles}."
             )
         notas += self._notas_de_pasadas(txs, info)
-        if abiertas:
-            notas.append(
-                f"🪟 Abrí {abiertas} ventana(s) de SAP y la(s) dejé abierta(s) para la próxima vez."
-            )
         return lineas, resultados, duraciones, notas
 
     def _notas_de_pasadas(self, txs, pasadas):
@@ -689,11 +699,11 @@ class ValidacionFacturaController:
         cfg_gallo   = self.gui.get_config("gallo")
         cfg_monivoi = self.gui.get_config("monivoi")
         cfg_vbrl    = self.gui.get_config("vbrl")
-        cfg_eiap    = self.gui.get_config("eiap")
         input_path  = cfg_gallo["input_path"]
 
-        if self._solo_eiap(cfg_eiap, cfg_gallo, cfg_monivoi):
-            self._consolidar_solo_eiap(cfg_eiap)
+        ventas = self._ventas_solas(cfg_gallo, cfg_monivoi)
+        if ventas:
+            self._consolidar_solo_ventas(ventas)
             return
 
         ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
@@ -832,27 +842,35 @@ class ValidacionFacturaController:
                     f"El Excel consolidado sí se generó, pero no pude preparar la 2a corrida:\n\n{e}",
                 )
 
-    def _solo_eiap(self, cfg_eiap, cfg_gallo, cfg_monivoi):
-        """True when the folder has the 'Venta DSD + EIAP' file of the GUI range and neither the Gallo
-        nor the Monivoi one: only that button was used. (With any of those two, the usual flow runs.)
+    # The sales buttons' files: (GUI key, name, consolidation function).
+    _VENTAS = (
+        ("dsd",  "Venta DSD",  consolidar_venta_dsd),
+        ("eiap", "Venta EIAP", consolidar_venta_eiap),
+    )
+
+    def _ventas_solas(self, cfg_gallo, cfg_monivoi):
+        """The sales downloaded for the GUI range — [(name, config, consolidation function)] — when the
+        folder has NEITHER the Gallo nor the Monivoi file: only the sales buttons were used. [] otherwise
+        (with a Gallo or a Monivoi file, or in "Un día", the usual flow runs).
         """
-        if cfg_eiap["mode"] != "range":
-            return False
         def existe(cfg):
             return os.path.exists(os.path.join(cfg["input_path"], cfg["filename"]))
-        return existe(cfg_eiap) and not existe(cfg_gallo) and not existe(cfg_monivoi)
+        if existe(cfg_gallo) or existe(cfg_monivoi):
+            return []
+        ventas = []
+        for clave, nombre, consolidar in self._VENTAS:
+            cfg = self.gui.get_config(clave)
+            if cfg["mode"] == "range" and existe(cfg):
+                ventas.append((nombre, cfg, consolidar))
+        return ventas
 
-    def _consolidar_solo_eiap(self, cfg):
-        """Consolidate ONLY the 'Venta DSD + EIAP' download: a workbook with its two tabs."""
-        error = self._validar_eiap(cfg)
-        if error:
-            messagebox.showerror("Venta DSD + EIAP", error)
-            return
-        ruta_eiap = os.path.join(cfg["input_path"], cfg["filename"])
-        hasta = fecha_efectiva_eiap(cfg["date_to"]).strftime(FORMATO_FECHA)
-        # Every day SAP was queried for (Hasta - 1), so they all show even without amounts.
-        fechas_seleccionadas = self._iterar_dias(cfg["date_from"], hasta)
-
+    def _consolidar_solo_ventas(self, ventas):
+        """Consolidate ONLY the sales downloads found: one workbook per sale, each with its single tab."""
+        for nombre, cfg, _ in ventas:
+            error = self._validar_venta(nombre, cfg)
+            if error:
+                messagebox.showerror(nombre, error)
+                return
         try:
             ruta_output = self.gui.get_consolidacion_path()
         except OSError as e:
@@ -860,15 +878,42 @@ class ValidacionFacturaController:
                 "Error", f"No se pudo usar la carpeta de consolidación:\n{e}"
             )
             return
-        nombre_salida = f"Consolidado_{os.path.splitext(cfg['filename'])[0]}.xlsx"
 
+        nombres = [nombre for nombre, _, _ in ventas]
+        trabajos = []         # (name, CSV path, workbook name, days SAP was queried for, function)
+        lineas = []           # (CSV file name, period, workbook name) to tell the user
+        for nombre, cfg, consolidar in ventas:
+            hasta = fecha_efectiva_eiap(cfg["date_to"]).strftime(FORMATO_FECHA)
+            # Every day SAP was queried for (Hasta - 1), so they all show even without amounts.
+            dias = self._iterar_dias(cfg["date_from"], hasta)
+            nombre_salida = f"Consolidado_{os.path.splitext(cfg['filename'])[0]}.xlsx"
+            trabajos.append((nombre, os.path.join(cfg["input_path"], cfg["filename"]),
+                             nombre_salida, dias, consolidar))
+            lineas.append((cfg["filename"], f"{cfg['date_from']} — {hasta}", nombre_salida))
+
+        if len(ventas) == 1:
+            archivo, periodo, nombre_salida = lineas[0]
+            detalle = (
+                f"Sólo se encontró la descarga de {nombres[0]} (no hay Gallo ni Monivoi).\n"
+                f"Se generará un Excel con la pestaña '{nombres[0]}' únicamente.\n\n"
+                f"  🛒 {nombres[0]}: {archivo}\n"
+                f"  Periodo       : {periodo}\n\n"
+                f"Se generará:\n  {nombre_salida}\n\n"
+            )
+        else:
+            detalle = (
+                f"Sólo se encontraron las descargas de {' y '.join(nombres)} (no hay Gallo ni Monivoi).\n"
+                "Se generará un Excel por cada una, con su pestaña únicamente.\n\n"
+                + "".join(
+                    f"  🛒 {nombre}: {archivo}\n"
+                    f"  Periodo       : {periodo}\n"
+                    f"  Se generará   : {nombre_salida}\n\n"
+                    for nombre, (archivo, periodo, nombre_salida) in zip(nombres, lineas)
+                )
+            )
         confirm = messagebox.askyesno(
             "Confirmar consolidación",
-            f"Sólo se encontró la descarga de Venta DSD + EIAP (no hay Gallo ni Monivoi).\n"
-            f"Se generará un Excel con las pestañas 'Venta DSD' y 'Venta EIAP' únicamente.\n\n"
-            f"  🛒 Venta DSD + EIAP: {cfg['filename']}\n"
-            f"  Periodo            : {cfg['date_from']} — {hasta}\n\n"
-            f"Se generará:\n  {nombre_salida}\n\n"
+            f"{detalle}"
             f"En la carpeta:\n  {ruta_output}"
         )
         if not confirm:
@@ -877,23 +922,26 @@ class ValidacionFacturaController:
         self._ocupado = True
         try:
             self.gui.disable_buttons()
-            resumen = consolidar_venta_eiap(
-                ruta_eiap, ruta_output,
-                nombre_salida=nombre_salida,
-                callback_status=self.gui.set_status,
-                fechas_seleccionadas=fechas_seleccionadas,
-            )
-            avisos = resumen.get("venta_avisos") or []
-            nota = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
+            resumenes = []
+            for nombre, ruta_csv, nombre_salida, dias, consolidar in trabajos:
+                resumenes.append((nombre, consolidar(
+                    ruta_csv, ruta_output,
+                    nombre_salida=nombre_salida,
+                    callback_status=self.gui.set_status,
+                    fechas_seleccionadas=dias,
+                )))
+            partes = []
+            for nombre, resumen in resumenes:
+                avisos = resumen.get("venta_avisos") or []
+                nota = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
+                partes.append(
+                    f"Archivo generado:\n{resumen['ruta']}\n\n"
+                    f"  • Filas del archivo        : {resumen['filas_archivo']:,}\n"
+                    f"  • Σ {nombre} (moneda local): {resumen['total_venta']:,.2f}"
+                    f"{nota}"
+                )
             self.gui.set_status("✅ ¡Consolidación completada!")
-            messagebox.showinfo(
-                "Consolidación completada",
-                f"Archivo generado:\n{resumen['ruta']}\n\n"
-                f"  • Filas del archivo        : {resumen['filas_archivo']:,}\n"
-                f"  • Σ Venta DSD (moneda local): {resumen['total_venta_dsd']:,.2f}\n"
-                f"  • Σ Venta EIAP (moneda local): {resumen['total_venta_eiap']:,.2f}"
-                f"{nota}"
-            )
+            messagebox.showinfo("Consolidación completada", "\n\n".join(partes))
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la consolidación")
             messagebox.showerror("Error en la consolidación", str(e))
@@ -1346,15 +1394,15 @@ class ValidacionFacturaController:
             d += timedelta(days=1)
         return dias
 
-    # --- 'Venta DSD + EIAP' ---
+    # --- 'Venta DSD' / 'Venta EIAP' ---
     @staticmethod
-    def _validar_eiap(config):
-        """'Venta DSD + EIAP' needs a range that still makes sense once SAP is queried up to the end
-        date minus one day (utils.fecha_efectiva_eiap). Error text, or None.
+    def _validar_venta(nombre, config):
+        """A sales button (`nombre`: 'Venta DSD' / 'Venta EIAP') needs a range that still makes sense once
+        SAP is queried up to the end date minus one day (utils.fecha_efectiva_eiap). Error text, or None.
         """
         if config["mode"] != "range":
             return (
-                "'Venta DSD + EIAP' trabaja con el intervalo \"Varios días\".\n\n"
+                f"'{nombre}' trabaja con el intervalo \"Varios días\".\n\n"
                 "Cambia el 'Tipo de intervalo' a \"Varios días\" y captura Fecha Desde y "
                 "Fecha Hasta (a la Fecha Hasta se le resta 1 día en la consulta)."
             )
@@ -1365,18 +1413,18 @@ class ValidacionFacturaController:
                 f"Con Fecha Hasta {config['date_to']} la consulta terminaría el "
                 f"{hasta.strftime(FORMATO_FECHA)}, ANTES de la Fecha Desde "
                 f"({config['date_from']}).\n\n"
-                "En 'Venta DSD + EIAP' la Fecha Hasta se resta 1 día, así que el periodo "
+                f"En '{nombre}' la Fecha Hasta se resta 1 día, así que el periodo "
                 "debe abarcar al menos 2 días (ej. 01.01.2026 a 02.01.2026 consulta sólo el 01.01.2026)."
             )
         return None
 
     @staticmethod
-    def _nota_eiap(config):
-        """Confirmation text: the period SAP will REALLY be queried with, and the accounts."""
+    def _nota_venta(config, cuentas, clases):
+        """Confirmation text: the period SAP will REALLY be queried with, and the accounts and classes."""
         hasta = fecha_efectiva_eiap(config["date_to"]).strftime(FORMATO_FECHA)
         return (
             f"Consulta en SAP : {config['date_from']} — {hasta}\n"
             "(a la Fecha Hasta se le resta 1 día)\n"
-            f"Cuentas         : {', '.join(CUENTAS_EIAP)}\n"
-            f"Clases de doc.  : {', '.join(CLASES_EIAP)}\n\n"
+            f"Cuentas         : {', '.join(cuentas)}\n"
+            f"Clases de doc.  : {', '.join(clases)}\n\n"
         )
