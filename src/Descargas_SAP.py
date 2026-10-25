@@ -2,7 +2,7 @@
 Validación Factura Global — SAP downloads (SAP GUI scripting)
 
 Gallo (FAGLL03), Monivoi (ZLMXCOM_TRN_MONINVOI), VBRL (ZSE16), FB03 (document list) and
-Venta EIAP (FAGLL03 with the EIAP accounts); after the consolidation, the 2nd run: VBRP, VBRK,
+Venta DSD + EIAP (FAGLL03 with the accounts and classes of both sales); after the consolidation, the 2nd run: VBRP, VBRK,
 VBRL (2nd run), KNVP, BKPF (ZSE16) and FBL5N (customer search help). Every download follows its
 VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
 
@@ -155,6 +155,38 @@ class SAP:
             return session.findById("wnd[0]/sbar").Text.strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def describir_ventana(session, ventana="wnd[1]", maximo=300):
+        """"'<title>': text | text ..." of a window (for error messages). Never raises."""
+        try:
+            titulo = str(session.findById(ventana).Text).strip()
+        except Exception:
+            titulo = ""
+        textos = []
+        try:
+            area = session.findById(f"{ventana}/usr")
+            for i in range(min(int(area.Children.Count), 60)):
+                try:
+                    texto = str(area.Children(i).Text).strip()
+                except Exception:
+                    continue
+                if texto:
+                    textos.append(texto)
+        except Exception:
+            pass
+        if not textos:                             # SAP's message popups: txtMESSTXT1..4
+            for n in range(1, 5):
+                try:
+                    texto = str(session.findById(f"{ventana}/usr/txtMESSTXT{n}").Text).strip()
+                except Exception:
+                    continue
+                if texto:
+                    textos.append(texto)
+        detalle = " | ".join(dict.fromkeys(textos))
+        if len(detalle) > maximo:
+            detalle = detalle[:maximo] + "..."
+        return f"'{titulo or ventana}'" + (f": {detalle}" if detalle else "")
 
     @staticmethod
     def sin_partidas(session, ruta_archivo, mensajes_extra=()):
@@ -1020,7 +1052,7 @@ class Gallo(Descarga):
     CUENTAS = ["4000005", "4150000", "4200000", "4200004", "4200015", "4260000", "7000005"]
     VARIANTE = "BASE/VALID"
 
-    # 'Dynamic selections' (EIAP only). Tree node keys come from a recording: they are system-specific.
+    # 'Dynamic selections' (Venta DSD + EIAP only). Tree node keys come from a recording: they are system-specific.
     ARBOL = "wnd[0]/shellcont/shellcont/shell/shellcont[0]/shell"
     NODO_PADRE, NODO_CLASE = " " * 9 + "23", " " * 9 + "30"
     BTN_CLASES = "wnd[0]/usr/btn%_%%DYN001_%_APP_%-VALU_PUSH"
@@ -1036,7 +1068,10 @@ class Gallo(Descarga):
         self.clases = tuple(clases or ())              # document classes to filter by (empty = all)
 
     def filtrar_clases(self, s):
-        """Dynamic selections > document class = self.clases (port of the EIAP recording)."""
+        """Dynamic selections > document class = self.clases (port of the EIAP recording). The classes
+        are pasted through the clipboard, like the accounts: the recording typed them row by row, and
+        the popup only shows a few rows, so seven classes would not fit without scrolling.
+        """
         s.findById("wnd[0]/tbar[1]/btn[25]").press()
         arbol = s.findById(self.ARBOL)
         arbol.expandNode(self.NODO_PADRE)
@@ -1044,15 +1079,35 @@ class Gallo(Descarga):
         arbol.topNode = self.NODO_PADRE
         arbol.doubleClickNode(self.NODO_CLASE)
         s.findById(self.BTN_CLASES).press()
-        for i, clase in enumerate(self.clases):
-            fila = s.findById(self.FILA_CLASE.format(i))
-            fila.text = clase
-            fila.setFocus()
-            fila.caretPosition = len(clase)
+        if not SAP.esperar(s, "wnd[1]/tbar[0]/btn[8]", 10):
+            raise RuntimeError("SAP no abrió el popup de selección múltiple de clases de documento.")
+        with Portapapeles.exclusivo():
+            Portapapeles.copiar_y_verificar("\r\n".join(str(c).strip() for c in self.clases))
+            Portapapeles.importar_en_popup(s)
+            time.sleep(1)
+        self.verificar_clases(s)
         s.findById("wnd[1]/tbar[0]/btn[8]").press()                   # copy
         if not SAP.esperar_cierre(s):
             raise RuntimeError("El popup de selección de clases de documento sigue abierto.")
         s.findById("wnd[0]/tbar[0]/btn[11]").press()
+
+    def verificar_clases(self, s):
+        """After the paste: the first rows of the popup (as many as it shows) must be the classes asked
+        for, in order. A paste that landed somewhere else would query the wrong documents.
+        """
+        for i, clase in enumerate(self.clases):
+            fila = self.FILA_CLASE.format(i)
+            if not SAP.existe(s, fila):
+                if i == 0:
+                    raise RuntimeError("El popup de clases de documento no muestra su primera fila.")
+                return                                    # the rest is below the rows the popup shows
+            leida = str(s.findById(fila).text).strip().upper()
+            esperada = str(clase).strip().upper()
+            if leida != esperada:
+                raise RuntimeError(
+                    f"El popup de clases de documento trae '{leida}' en la fila {i + 1} y se esperaba "
+                    f"'{esperada}': la lista no se pegó como se pidió."
+                )
 
     def pasos(self):
         for fecha in (self.desde, self.hasta):
@@ -1183,6 +1238,7 @@ class ZSE16:
     BTN_DESMARCAR = "wnd[1]/tbar[0]/btn[14]"           # Deselect all
     BTN_BUSCAR = "wnd[1]/tbar[0]/btn[71]"              # Find (of a list popup)
     COLUMNA_LAYOUT = "VARIANT"                         # technical name of the grid's 'Layout' column
+    COLUMNA_DESCRIPCION = "TEXT"                       # ... and of its 'Layout description' column
 
     @staticmethod
     def patron(campo):
@@ -1275,12 +1331,14 @@ class ZSE16:
         return textos
 
     @staticmethod
-    def dejar_solo_campo(session, campo):
+    def dejar_solo_campo(session, campo, ok_extra=False):
         """
         `campo` as the ONLY selection field, like VBRL.vbs: Fields for selection → Deselect all
         → tick its line → OK. The line is found by its text (the recording ticks a fixed
         chk[2,5]); the Find is only used when it is not on screen. Guards: no other visible
         field left ticked, the tick read back, and exactly ONE field (I1, no I2) at the end.
+        `ok_extra`: the recording presses OK a SECOND time (VBRP.vbs), see confirmar_campos.
+        Returns the text of the line it ticked ('VBELN  Lista de facturas'), to show which field is queried.
         """
         session.findById(ZSE16.MENU_CAMPOS).select()
         if not SAP.esperar(session, ZSE16.BTN_DESMARCAR, 10):
@@ -1306,7 +1364,7 @@ class ZSE16:
         casilla.setFocus()
         if not bool(casilla.selected):
             raise RuntimeError(f"No pude marcar el campo '{campo}' en 'Campos para selección'.")
-        ZSE16.confirmar_campos(session)
+        ZSE16.confirmar_campos(session, ok_extra=ok_extra)
         if not SAP.existe(session, "wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH"):
             raise RuntimeError(f"ZSE16 no mostró el campo de selección '{campo}' (I1).")
         if SAP.existe(session, "wnd[0]/usr/btn%_I2_%_APP_%-VALU_PUSH"):
@@ -1315,19 +1373,55 @@ class ZSE16:
                 f"ZSE16 quedó con más de un campo de selección ({campos}); "
                 f"esperaba sólo '{campo}'. Revisa 'Opciones > Campos para selección'."
             )
+        return renglones[fila]["texto"]
+
+    # Seconds a popup may take to close (or to show up, for VBRP's recorded 2nd OK) after an OK.
+    ESPERA_CIERRE = 10
+    ESPERA_SEGUNDO_POPUP = 2
+    # Informational windows SAP shows after that OK and to which OK is the recorded answer (VBRP.vbs
+    # presses OK twice). Upper-case fragments of their text, so they do not depend on SAP's language.
+    # Seen on 23-oct-2026: 'Información': "Tipo FLTP del Dictionary ABAP para el elemento de dynpro no
+    # permitido" (ZSE16 cannot put a floating-point field on its selection screen and says so).
+    AVISOS_CONOCIDOS = ("FLTP",)
 
     @staticmethod
-    def confirmar_campos(session):
-        """OK of 'Fields for selection'. If the SAME popup is still there, OK once more (VBRP.vbs
-        presses it twice); any other popup, or one that never closes, is an error.
+    def es_aviso_conocido(descripcion):
+        """True if `descripcion` (SAP.describir_ventana) is one of AVISOS_CONOCIDOS."""
+        texto = str(descripcion).upper()
+        return any(fragmento in texto for fragmento in ZSE16.AVISOS_CONOCIDOS)
+
+    @staticmethod
+    def confirmar_campos(session, ok_extra=False):
+        """OK of 'Fields for selection', then OK once more ONLY for what the recording answers with OK:
+        the SAME popup still open, or one of the known informational windows (AVISOS_CONOCIDOS), which
+        gets a calm one-line log. With `ok_extra` (VBRP.vbs: SAP shows its 2nd window a moment after the
+        1st OK) it also waits ESPERA_SEGUNDO_POPUP s for that window to appear. Any OTHER window is
+        never confirmed blindly: it is an error that names it (title and text). The callers then check
+        the selection screen (I1..In), so a second OK that did something else never goes unnoticed.
         """
         session.findById("wnd[1]/tbar[0]/btn[0]").press()                 # OK
         SAP.esperar_libre(session)
-        if not SAP.esperar_cierre(session) and SAP.existe(session, ZSE16.BTN_DESMARCAR):
-            session.findById("wnd[1]/tbar[0]/btn[0]").press()             # OK again, as recorded
-            SAP.esperar_libre(session)
-        if not SAP.esperar_cierre(session):
-            raise RuntimeError("La ventana 'Campos para selección' sigue abierta después de OK.")
+        cerrada = SAP.esperar_cierre(session, timeout=ZSE16.ESPERA_CIERRE)
+        if ok_extra and cerrada:
+            # The recorded second window may open a moment after the first one closed.
+            cerrada = not SAP.esperar(session, "wnd[1]", ZSE16.ESPERA_SEGUNDO_POPUP)
+        if not cerrada:
+            mismo_popup = SAP.existe(session, ZSE16.BTN_DESMARCAR)
+            ventana = SAP.describir_ventana(session)
+            if mismo_popup:
+                print(f"[ZSE16] Después del OK sigue abierta la ventana {ventana}: "
+                      "OK otra vez, como en la grabación.")
+            elif ZSE16.es_aviso_conocido(ventana):
+                print(f"[ZSE16] SAP mostró el aviso informativo {ventana}: le doy OK, como en la grabación.")
+            if mismo_popup or ZSE16.es_aviso_conocido(ventana):
+                session.findById("wnd[1]/tbar[0]/btn[0]").press()         # OK again, as recorded
+                SAP.esperar_libre(session)
+                cerrada = SAP.esperar_cierre(session, timeout=ZSE16.ESPERA_CIERRE)
+        if not cerrada:
+            raise RuntimeError(
+                "Después de OK en 'Campos para selección' sigue abierta la ventana "
+                f"{SAP.describir_ventana(session)}. Mándame este mensaje para ajustar el paso."
+            )
 
     @staticmethod
     def _abrir_campos_desmarcados(session):
@@ -1402,43 +1496,20 @@ class ZSE16:
         return filas
 
     @staticmethod
-    def marcar_renglones(session, filas):
-        """The lines `filas` of 'Fields for selection' (as recorded, when their field names are not
-        known) as the ONLY selection fields, I1..In. Returns their texts, so they can be reported.
-        """
-        renglones = ZSE16._abrir_campos_desmarcados(session)
-        return ZSE16._marcar_renglones(session, renglones, list(filas),
-                                       "renglones " + ", ".join(str(f) for f in filas))
-
-    @staticmethod
-    def elegir_layout_por_renglon(session, id_grid, fila):
-        """Row `fila` of the ALV grid of layouts, as recorded, when the layout's NAME is not known yet.
-        Returns the name it chose (to be reported, so it can be fixed BY NAME later); the popup must
-        close after the click.
-        """
-        grid = session.findById(id_grid)
-        filas = int(grid.RowCount)
-        if not 0 <= int(fila) < filas:
-            raise RuntimeError(f"La lista de layouts tiene {filas} renglón(es); la grabación elige "
-                               f"el renglón {fila}.")
-        try:
-            nombre = str(grid.GetCellValue(int(fila), ZSE16.COLUMNA_LAYOUT)).strip()
-        except Exception as e:
-            raise RuntimeError(f"No pude leer el nombre del layout del renglón {fila}: {e}") from e
-        grid.currentCellRow = int(fila)
-        grid.selectedRows = str(int(fila))
-        grid.clickCurrentCell()
-        SAP.esperar_libre(session)
-        if not SAP.esperar_cierre(session):
-            raise RuntimeError(f"El popup de layouts sigue abierto después de elegir '{nombre}'.")
-        return nombre
+    def sin_acentos(texto):
+        """'Validación ' → 'VALIDACION' (layout names compared without accents, case or edge spaces)."""
+        descompuesto = unicodedata.normalize("NFKD", str(texto))
+        return "".join(c for c in descompuesto if not unicodedata.combining(c)).strip().upper()
 
     @staticmethod
     def elegir_layout_en_grid(session, id_grid, nombre):
         """
-        The layout `nombre` in the ALV grid of layouts, BY NAME (the recording clicks row 0,
-        which is whatever layout sorts first): exactly one row must be called `nombre`, and the
-        popup must close after the click. Returns the name it saw.
+        The layout `nombre` in the ALV grid of layouts, BY NAME (the recording clicks a fixed row,
+        which is whatever layout sorts there). Tried in this order, each step must find EXACTLY one
+        row (two = ambiguous = error; none = next step): 1) the layout name ('VARIANT'), ignoring
+        case — so a name that matches exactly behaves as always; 2) the name without accents
+        ('VALIDACIÓN' == 'VALIDACION'); 3) the layout DESCRIPTION ('TEXT'), without accents. The
+        popup must close after the click. Returns the name it chose.
         """
         grid = session.findById(id_grid)
         try:
@@ -1451,12 +1522,34 @@ class ZSE16:
                 columnas = ["(no pude leerlas)"]
             raise RuntimeError(f"La lista de layouts no tiene la columna '{ZSE16.COLUMNA_LAYOUT}' "
                                f"(columnas: {', '.join(columnas)}): {e}") from e
-        elegidas = [i for i, n in enumerate(nombres) if n.upper() == nombre.strip().upper()]
-        if len(elegidas) != 1:
-            vistas = ", ".join(repr(n) for n in nombres[:15]) or "(ninguno)"
-            raise RuntimeError(f"Esperaba exactamente un layout '{nombre}' en la lista de layouts y hay "
-                               f"{len(elegidas)}. Layouts que vi: {vistas}")
-        fila = elegidas[0]
+        try:
+            textos = [str(grid.GetCellValue(i, ZSE16.COLUMNA_DESCRIPCION)).strip()
+                      for i in range(len(nombres))]
+        except Exception:
+            textos = [""] * len(nombres)          # no description column: steps 1 and 2 only
+        buscado = ZSE16.sin_acentos(nombre)
+        pasos = (
+            ("nombre", lambda i: nombres[i].upper() == nombre.strip().upper()),
+            ("nombre sin acentos", lambda i: ZSE16.sin_acentos(nombres[i]) == buscado),
+            ("descripción", lambda i: bool(textos[i]) and ZSE16.sin_acentos(textos[i]) == buscado),
+        )
+        fila = None
+        for que, coincide in pasos:
+            elegidas = [i for i in range(len(nombres)) if coincide(i)]
+            if len(elegidas) > 1:
+                raise RuntimeError(
+                    f"Hay {len(elegidas)} layouts que coinciden con '{nombre}' por {que} y no sé cuál "
+                    "elegir: " + "; ".join(f"{nombres[i]!r} ({textos[i]!r})" for i in elegidas))
+            if elegidas:
+                fila = elegidas[0]
+                if que != "nombre":
+                    print(f"[ZSE16] Layout '{nombre}' encontrado por {que}: {nombres[fila]!r} "
+                          f"({textos[fila]!r}).")
+                break
+        if fila is None:
+            vistas = "; ".join(f"{n!r} ({t!r})" for n, t in list(zip(nombres, textos))[:15]) or "(ninguno)"
+            raise RuntimeError(f"No encontré el layout '{nombre}' en la lista de layouts (ni por nombre "
+                               f"ni por descripción). Layouts que vi (nombre y descripción): {vistas}")
         grid.currentCellRow = fila
         grid.selectedRows = str(fila)
         grid.clickCurrentCell()
@@ -1675,6 +1768,9 @@ class VBRL(DescargaConLista):
         "no existen entradas de tabla",
         "no se encontraron entradas de tabla",
         "no se han encontrado entradas de tabla",
+        # What SAP really answered (23-oct-2026, VBRL_2): "No se han encontrado entradas en la tabla
+        # para la clave indicada." The other ZSE16 tables (TablaZSE16) share this list.
+        "no se han encontrado entradas en la tabla",
     )
 
     def __init__(self, documentos, carpeta, archivo, session):
@@ -1846,13 +1942,11 @@ class TablaZSE16(DescargaConLista):
     """
     A ZSE16 table queried with a list pasted through the clipboard, saved as .csv (the checks and
     the *_REVISAR.csv of DescargaConLista). `info` (a dict, optional) receives what the run chose
-    and the user must be able to confirm without a console: 'layout' (its name) and 'campos' (the
-    texts of the selection fields ticked by position).
+    and the user must be able to confirm without a console: 'layout' (the name it picked).
     """
     TABLA = ""
     ARCHIVO = ""
-    LAYOUT = None                  # layout NAME (preferred); None = the recorded row below
-    FILA_LAYOUT = None             # recorded row of the layouts grid; None and no LAYOUT = no layout step
+    LAYOUT = None                  # layout NAME (given by the user); None = no layout step (recording)
     MENU_EXPORTAR = VBRL.MENU_EXPORTAR_GRID
     MENSAJES_SIN_DATOS = VBRL.MENSAJES_SIN_DATOS
 
@@ -1897,10 +1991,10 @@ class TablaZSE16(DescargaConLista):
         return self.guardar(revisar)
 
     def elegir_layout(self):
-        """The layout BY NAME when LAYOUT is known, else the recorded row (its name goes to `info`, so
-        it can be fixed by name); no layout step when neither is set. Returns the export menu.
+        """The layout BY NAME (LAYOUT; the name it picked goes to `info`), or no layout step when the
+        recording has none (LAYOUT None). Returns the export menu of the popup SAP opened.
         """
-        if self.LAYOUT is None and self.FILA_LAYOUT is None:
+        if self.LAYOUT is None:
             return self.MENU_EXPORTAR
         s = self.session
         s.findById("wnd[0]/tbar[1]/btn[33]").press()
@@ -1915,25 +2009,22 @@ class TablaZSE16(DescargaConLista):
         if modo is None:
             raise RuntimeError(f"SAP no abrió la lista de layouts de {self.TABLA}.")
         if modo == "lista":
-            if self.LAYOUT is None:
-                SAP.cerrar_popups(s)
-                raise RuntimeError(f"La lista de layouts de {self.TABLA} salió como lista clásica: ahí sólo "
-                                   f"se puede elegir por NOMBRE y {type(self).__name__}.LAYOUT no lo tiene.")
             nombre = ZSE16.elegir_layout_en_lista(s, self.LAYOUT)
             menu = VBRL.MENU_EXPORTAR_LISTA
-        elif self.LAYOUT is not None:
+        else:
             nombre = ZSE16.elegir_layout_en_grid(s, VBRL.GRID_LAYOUTS, self.LAYOUT)
             menu = self.MENU_EXPORTAR
-        else:
-            nombre = ZSE16.elegir_layout_por_renglon(s, VBRL.GRID_LAYOUTS, self.FILA_LAYOUT)
-            print(f"[{self.ETIQUETA}] Layout del renglón {self.FILA_LAYOUT} (como en la grabación): {nombre!r}")
-            menu = self.MENU_EXPORTAR
+        print(f"[{self.ETIQUETA}] Layout elegido por nombre: {nombre!r}")
         self.info["layout"] = nombre
         return menu
 
 
 class VBRP(TablaZSE16):
-    """ZSE16 on table VBRP for the 'Referencia de pago' of the #N/A rows, as VBRP.vbs does."""
+    """
+    ZSE16 on table VBRP for the 'Referencia de pago' of the #N/A rows, as VBRP.vbs does. Its
+    recording presses OK in 'Fields for selection' TWICE (a second window shows up in wnd[1]):
+    ZSE16.confirmar_campos(ok_extra=True).
+    """
     NOMBRE = "VBRP_ZSE16"
     MARCA = "ZSE16/VBRP"
     ETIQUETA = "VBRP"
@@ -1941,14 +2032,14 @@ class VBRP(TablaZSE16):
     ARCHIVO = "VBRP.csv"
     UNIDAD = ("referencia(s)", "pedida(s)")
     CAMPO = "VBELN"
-    FILA_LAYOUT = 1                # VBRP.vbs: currentCellRow = 1 (the layout's NAME is still unknown)
+    LAYOUT = "VALIDACIÓN"          # given by the user (22-oct-2026); the recording clicks row 1
 
     def pasos(self):
         self.preparar()
         os.makedirs(self.carpeta, exist_ok=True)
         self.borrar_restos()
         s = self.abrir_tabla()
-        ZSE16.dejar_solo_campo(s, self.CAMPO)
+        ZSE16.dejar_solo_campo(s, self.CAMPO, ok_extra=True)
         print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar.")
         self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
         return self.consultar_y_exportar()
@@ -1966,7 +2057,7 @@ class VBRK(TablaZSE16):
     ARCHIVO = "VBRK.csv"
     UNIDAD = ("referencia(s)", "pedida(s)")
     CAMPO = "VBELN"
-    FILA_LAYOUT = 4                # VBRK.vbs: currentCellRow = 4 (the layout's NAME is still unknown)
+    LAYOUT = "VAL"                 # given by the user (22-oct-2026); the recording clicks row 4
     COL_SOLICITANTE_CANDIDATAS = ("Solic.", "Solicitante")      # = Consolidacion.EtapaListasSegundaCorrida
 
     def pasos(self):
@@ -1991,9 +2082,10 @@ class VBRK(TablaZSE16):
 
 class VBRL2(TablaZSE16):
     """
-    ZSE16 on table VBRL (2nd run) for the same references, as VBRL_2do_run.vbs does: lines 5 and 7
-    of 'Fields for selection' (their texts go to `info`) and the list pasted into the SECOND field,
-    I2; no layout step.
+    ZSE16 on table VBRL (2nd run) for the same references. VBRL_2do_run.vbs ticks lines 5 and 7 of
+    'Fields for selection' and pastes into the second one; the user confirmed (22-oct-2026) that
+    the right field is line 5, 'VBELN  Lista de facturas'. So, like the 1st VBRL: VBELN as the ONLY
+    selection field (found by its name), the list pasted into I1; no layout step (as recorded).
     """
     NOMBRE = "VBRL2_ZSE16"
     MARCA = "ZSE16/VBRL_2"
@@ -2001,19 +2093,28 @@ class VBRL2(TablaZSE16):
     TABLA = "VBRL"
     ARCHIVO = "VBRL_2.csv"
     UNIDAD = ("referencia(s)", "pedida(s)")
-    FILAS_CAMPOS = (5, 7)          # VBRL_2do_run.vbs: chk[2,5] and chk[2,7]
+    # The field the references are looked up in (line 5, confirmed on 22-oct-2026). The recording ticks
+    # lines 5 AND 7 and pastes into the second one (I2); in the table's order line 7 would be
+    # "VBELN_VF" (billing document) — the candidate to try if SAP finds none of the references here.
+    CAMPO = "VBELN"
 
     def pasos(self):
         self.preparar()
         os.makedirs(self.carpeta, exist_ok=True)
         self.borrar_restos()
         s = self.abrir_tabla()
-        textos = ZSE16.marcar_renglones(s, self.FILAS_CAMPOS)
-        self.info["campos"] = textos
-        print(f"[{self.ETIQUETA}] Campos de selección (renglones {self.FILAS_CAMPOS}): {textos}")
-        print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar.")
-        self.pegar_lista("wnd[0]/usr/btn%_I2_%_APP_%-VALU_PUSH")
-        return self.consultar_y_exportar()
+        linea = ZSE16.dejar_solo_campo(s, self.CAMPO)
+        self.info["campo"] = " ".join(linea.split())             # what the summary shows: which field was queried
+        muestra = ", ".join(self.lista[:3]) + (", ..." if len(self.lista) > 3 else "")
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} referencia(s) única(s) a consultar en el campo "
+              f"'{self.info['campo']}' (p. ej.: {muestra}).")
+        self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
+        if self.consultar_y_exportar():
+            return True
+        print(f"[{self.ETIQUETA}] SAP no encontró ninguna de las referencias en el campo "
+              f"'{self.info['campo']}'. Si esperabas datos, revisa que ese sea el campo correcto "
+              "(VBRL2.CAMPO; la grabación VBRL_2do_run.vbs marca los renglones 5 y 7 y pega en el segundo).")
+        return False
 
 
 class KNVP(TablaZSE16):
@@ -2063,7 +2164,7 @@ class BKPF(TablaZSE16):
     ARCHIVO = "BKPF.csv"
     # BKPF.vbs ticks lines 5..10, 18 and 20: these fields of the table, in table order (I1..I8).
     CAMPOS = ("BUKRS", "BELNR", "GJAHR", "BLART", "BLDAT", "BUDAT", "TCODE", "XBLNR")
-    FILA_LAYOUT = 1                # BKPF.vbs: currentCellRow = 1 (the layout's NAME is still unknown)
+    LAYOUT = "VAL"                 # given by the user (22-oct-2026); the recording clicks row 1
 
     def __init__(self, documentos, desde, hasta, carpeta, archivo, sociedad, session, info=None):
         super().__init__(documentos, carpeta, archivo, session, info)
@@ -2349,14 +2450,15 @@ def Gallo_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SO
 
 def VentaEIAP_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD, session=None):
     """
-    Gallo with the EIAP accounts, queried up to DateTo MINUS one day (utils.fecha_efectiva_eiap);
-    the file name keeps the typed dates. ValueError if that leaves an empty or backwards range.
+    Gallo with the accounts and document classes of Venta DSD AND Venta EIAP (utils.CUENTAS_EIAP /
+    CLASES_EIAP), in ONE query up to DateTo MINUS one day (utils.fecha_efectiva_eiap); the file name
+    keeps the typed dates. ValueError if that leaves an empty or backwards range.
     """
     desde = parse_fecha(DateFrom)
     hasta = fecha_efectiva_eiap(DateTo)
     if hasta < desde:
         raise ValueError(
-            f"Venta EIAP: con Fecha Hasta {DateTo} la consulta terminaría el "
+            f"Venta DSD + EIAP: con Fecha Hasta {DateTo} la consulta terminaría el "
             f"{hasta.strftime(FORMATO_FECHA)}, antes de la Fecha Desde ({DateFrom}). "
             "El periodo debe abarcar al menos 2 días."
         )
@@ -2389,7 +2491,7 @@ def FB03_Documentos(documentos, DateFrom, DateTo, FolderPath=None, FileName=None
     return FB03(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session).ejecutar()
 
 
-# 2nd run. `info` (optional dict) receives what the run chose by position ('layout', 'campos') and
+# 2nd run. `info` (optional dict) receives the layout the run picked by name ('layout') and
 # the FBL5N checks ('presentes', 'aviso'), for the summary.
 def VBRP_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
     """Table VBRP (ZSE16) for the references in `documentos` → FileName (.csv, default 'VBRP.csv')."""
@@ -2432,7 +2534,7 @@ if __name__ == "__main__":
     print("3) VBRL (ZSE16) — con las facturas (columna 'Factura') del archivo de Monivoi del mismo periodo")
     print("4) FB03 (lista de documentos) — con los documentos (columna 'Nº documento') del archivo de Gallo "
           "del mismo periodo, sólo Clase de documento C2/C6 y Referencia Global")
-    print("5) Venta EIAP (FAGLL03, cuentas EIAP) — la fecha hasta se consulta menos 1 día")
+    print("5) Venta DSD + EIAP (FAGLL03, cuentas y clases de ambas ventas) — la fecha hasta se consulta menos 1 día")
     opcion = input("Elige transacción [1/2/3/4/5]: ").strip()
     date_from = input("Fecha desde (DD.MM.YYYY): ").strip()
     date_to = input("Fecha hasta (DD.MM.YYYY): ").strip()

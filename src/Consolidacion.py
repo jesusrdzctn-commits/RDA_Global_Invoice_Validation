@@ -1,6 +1,6 @@
 """Validación Factura Global — consolidation: the CSVs downloaded from SAP (Gallo FAGLL03,
 Monivoi ZLMXCOM and, optionally, VBRL ZSE16) → ONE Excel workbook. Tabs, in order:
-    Gallo, Monivoi, VBRL*, FB**, Validación - Doc., TD, TD.Diferencias_Referencias*, MTD, Venta DSD
+    Gallo, Monivoi, VBRL*, FB**, Validación - Doc., TD, TD.Diferencias_Referencias*, MTD
     (* only with a VBRL file; ** only with a VBRL and an FB03 file, which also add the 'Notas de
     crédito' and 'PEP Vouchers' tables to 'TD.Diferencias_Referencias')
 
@@ -10,9 +10,11 @@ EtapaDocumentosFB03 → EtapaVentas → EtapaMonivoi → EtapaCruceTDMTD → Eta
 EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida (what the 2nd run of
 downloads pastes into SAP, from the #N/A rows) → Consolidador (the orchestrator); a class only
 uses the ones above it.
-consolidar_gallo_monivoi() is what the controller calls; consolidar_venta_eiap() when ONLY the
-'Solo Venta EIAP' file was downloaded (a workbook with the single tab 'Venta EIAP', see
-EtapaVentaEIAP). No SAP and no tkinter here.
+consolidar_gallo_monivoi() is what the controller calls; calcular_listas_segunda_corrida() gives
+the '2a corrida' download button the same lists without writing a workbook; consolidar_venta_eiap()
+runs when ONLY the 'Venta DSD + EIAP' file was downloaded (its own workbook with the tabs 'Venta
+DSD' and 'Venta EIAP', see EtapaVentas: they are NOT part of the full workbook). No SAP and no
+tkinter here.
 """
 
 import os
@@ -28,7 +30,10 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from utils import CUENTAS_EIAP, CLASES_EIAP
+from utils import (
+    CUENTAS_VENTA_DSD, CLASES_VENTA_DSD,
+    CUENTAS_VENTA_EIAP, CLASES_VENTA_EIAP,
+)
 
 
 # === Shared helpers ===
@@ -42,7 +47,7 @@ class Comun:
 
     FORMATO_NUMERO = "#,##0.00"
 
-    # Gallo's amount header (also column B of 'Venta DSD').
+    # Gallo's amount header (also column B of 'Venta DSD' and 'Venta EIAP').
     ENCABEZADO_IMPORTE = "Importe en moneda local"
 
     # Filter legends in italic gray, so they never read as data.
@@ -203,19 +208,18 @@ class Comun:
         return '"' + str(texto).replace('"', '""') + '"'
 
 
-# === Stage: Gallo (FAGLL03) — steps 2-9 + SG/RG override + 'Validación - Doc.' ===
+# === Stage: Gallo (FAGLL03) — steps 2-9 + 'MX Commercial' override + 'Validación - Doc.' ===
 class EtapaGallo:
-    """Everything computed FROM the Gallo: the helper columns K, L, M of 'Gallo' (steps 2-9 + SG/RG
-    override, `preparar`) and the 'Validación - Doc.' sheet. It resolves every Gallo column the
+    """Everything computed FROM the Gallo: the helper columns K, L, M of 'Gallo' (steps 2-9 + the
+    'MX Commercial' override, `preparar`) and the 'Validación - Doc.' sheet. It resolves every Gallo column the
     later stages need ONCE, so a missing one stops the run in the first second.
     """
 
     HOJA_GALLO      = "Gallo"
     HOJA_VALIDACION = "Validación - Doc."
 
-    VALOR_ASIGNACION       = "MX Commercial"             # filter of steps 5, 8.5 and 9
+    VALOR_ASIGNACION       = "MX Commercial"             # filter of steps 5, 8, 8.5 and 9
     PREFIJOS_LETRAS_GLOBAL = frozenset({"PP", "RG", "SG"})  # letter-only prefixes that are also 'Global'
-    PREFIJOS_RECLASIFICAR  = frozenset({"SG", "RG"})        # step 8.5: SG/RG 'MX Commercial' → Individual
 
     # Their position in the export is not fixed: resolved by NAME (several spellings accepted).
     COL_FECHA_CANDIDATAS = (
@@ -290,12 +294,14 @@ class EtapaGallo:
         return "Individual"
 
     def preparar(self):
-        """Steps 2-9 + the SG/RG override + ONE amount-parsing pass. MUTATES `self.gallo`: appends
-        'Referencia 2', 'Referencia 3' and 'Comercializadora' (K, L, M with the standard A-J layout).
-        The step order is business logic: step 9 snapshots the globals BEFORE the SG/RG override
-        ("step 8.5") reclassifies rows; do not reorder. Returns (also self.resultado) the real column
-        names, refs_unicas, tipos, catalogo_docs, globales, filas_reclasificadas and importe_num
-        (float, same index). ValueError: a missing column or an unreadable amount.
+        """Steps 2-9 + the 'MX Commercial' override + ONE amount-parsing pass. MUTATES `self.gallo`:
+        appends 'Referencia 2', 'Referencia 3' and 'Comercializadora' (K, L, M with the standard A-J
+        layout). The step order is business logic: step 9 snapshots the globals BEFORE the override
+        ("step 8.5") turns them into 'Individual'; do not reorder. Returns (also self.resultado) the
+        real column names, refs_unicas, tipos, catalogo_docs (every 'MX Commercial' row: the lookup
+        of step 8), globales (Centro / Asignación / Nº documento of the Global 'MX Commercial' rows:
+        blocks D-E and G-H), filas_reclasificadas and importe_num (float, same index). ValueError: a
+        missing column or an unreadable amount.
         """
         gallo = self.gallo
         update_status = self._update_status
@@ -341,41 +347,43 @@ class EtapaGallo:
             gallo["Referencia 2"].map(mapa_tipo).fillna("")
         )
 
-        # Step 8: 'Comercializadora' (Nº documento → Asignación), first match like XLOOKUP.
+        # Step 8: 'Comercializadora' (Nº documento → Asignación), first match like XLOOKUP: the WHOLE
+        # document is 'MX Commercial' as soon as one of its lines says so. A blank Nº documento is never
+        # looked up (it would paint every blank-document row), and a row whose OWN Asignación is
+        # 'MX Commercial' always gets it, whatever its document says (rule of 24-oct-2026: wherever
+        # Asignación has it, Comercializadora has it too).
         mapa_comercializadora = {}
         for doc, asig in zip(
             catalogo_docs[col_doc].astype(str).str.strip(),
             catalogo_docs[col_asig].astype(str).str.strip(),
         ):
-            mapa_comercializadora.setdefault(doc, asig)
+            if doc:
+                mapa_comercializadora.setdefault(doc, asig)
 
         gallo["Comercializadora"] = (
             gallo[col_doc].astype(str).str.strip().map(mapa_comercializadora).fillna("")
         )
+        gallo.loc[mascara_mx, "Comercializadora"] = self.VALOR_ASIGNACION
 
-        # Step 9: final filter → global Centro / Nº documento (G-H of 'Validación - Doc.'), frozen
-        # BEFORE the SG/RG override on purpose (stakeholder request): it keeps those rows as Global.
+        # Step 9: final filter (Comercializadora == 'MX Commercial' AND Referencia 3 == 'Global') →
+        # their Asignación / Nº documento (D-E of 'Validación - Doc.') and Centro / Nº documento
+        # (G-H), frozen BEFORE the override below on purpose: they keep the rows it turns Individual.
         update_status("🧮 Aplicando filtro final (Global + MX Commercial)...")
         mascara_final = (
             (gallo["Comercializadora"] == self.VALOR_ASIGNACION)
             & (gallo["Referencia 3"] == "Global")
         )
-        globales = gallo.loc[mascara_final, [col_centro, col_doc]].copy()
+        globales = gallo.loc[mascara_final, [col_centro, col_asig, col_doc]].copy()
 
-        # SG/RG override ("step 8.5", AFTER step 9): MX Commercial rows with Referencia 2 SG/RG are
-        # settled individually → 'Individual' in 'Referencia 3' (and so in 'TD'), not in block G-H.
-        update_status("🏷️ Reclasificando SG/RG de 'MX Commercial' a 'Individual'...")
-        ref2_norm = gallo["Referencia 2"].astype(str).str.strip().str.upper()
-        mascara_reclasificar = (
-            (gallo["Comercializadora"] == self.VALOR_ASIGNACION)
-            & (ref2_norm.isin(self.PREFIJOS_RECLASIFICAR))
-            & (gallo["Referencia 3"] == "Global")
-        )
-        filas_reclasificadas = int(mascara_reclasificar.sum())
-        gallo.loc[mascara_reclasificar, "Referencia 3"] = "Individual"
+        # 'MX Commercial' override ("step 8.5", AFTER step 9, rule of 24-oct-2026): EVERY row copied
+        # above is settled individually → 'Individual' in 'Referencia 3' (and so out of 'TD'), whatever
+        # its Referencia 2 (SG, RG, PP, a digit...). The SAME mask: what is copied is what changes.
+        update_status("🏷️ Reclasificando 'MX Commercial' de 'Global' a 'Individual'...")
+        filas_reclasificadas = int(mascara_final.sum())
+        gallo.loc[mascara_final, "Referencia 3"] = "Individual"
 
-        # ONE amount-parsing pass for every matrix: faster (~1.15M rows for 3 days), and 'TD',
-        # 'TD.Diferencias_Referencias' and 'Venta DSD' see exactly the same numbers.
+        # ONE amount-parsing pass for every matrix: faster (~1.15M rows for 3 days), and 'TD' and
+        # 'TD.Diferencias_Referencias' see exactly the same numbers.
         update_status("🔢 Convirtiendo 'Importe en moneda local' a número...")
         importe_num = gallo[col_importe].map(
             partial(Comun.parse_importe_us, columna=col_importe))
@@ -399,12 +407,12 @@ class EtapaGallo:
 
     def escribir_validacion(self, ws):
         """'Validación - Doc.': three blocks side by side — A-B references and their type (steps 3-4),
-        D-E 'MX Commercial' documents (step 6), G-H Centro and Nº documento of the globals (step 9).
+        D-E Asignación and Nº documento of the Global 'MX Commercial' rows (the ones the override
+        turns Individual), G-H Centro and Nº documento of those same rows (step 9).
         """
         pasos         = self.resultado
         refs_unicas   = pasos["refs_unicas"]
         tipos         = pasos["tipos"]
-        catalogo_docs = pasos["catalogo_docs"]
         globales      = pasos["globales"]
         col_asig      = pasos["col_asig"]
         col_doc       = pasos["col_doc"]
@@ -424,7 +432,7 @@ class EtapaGallo:
             ws.cell(row=fila, column=2, value=tipo)
 
         for fila, (asig, doc) in enumerate(
-            zip(catalogo_docs[col_asig], catalogo_docs[col_doc]), start=2
+            zip(globales[col_asig], globales[col_doc]), start=2
         ):
             ws.cell(row=fila, column=4, value=asig)
             ws.cell(row=fila, column=5, value=doc)
@@ -473,7 +481,8 @@ class EtapaTD:
     LABELS_ANALISIS = [(1, "Monitor"), (2, "Contabilidad"), (3, "Diferencias")]
 
     # PEP vouchers: Referencia 3 == 'Global', Referencia 2 == 'PP', Clase de documento == 'C2'
-    # (plus a non-blank Centro). It does NOT exclude 'MX Commercial'.
+    # (plus a non-blank Centro). No 'MX Commercial' test of its own: those rows are already
+    # 'Individual' (EtapaGallo override), so they cannot be Global here.
     PEP = {
         "titulo": "PEP VOUCHERS",
         "col_cedis": 23,           # W
@@ -499,7 +508,8 @@ class EtapaTD:
         the blocks may list different centros (no range clipping):
             Facturas  Referencia 3 == 'Global', Asignación != 'MX Commercial', Clase in {C1, C5}
             Notas     the same base, Clase in {C2, C6}
-            PEP       Referencia 3 == 'Global', Referencia 2 == 'PP', Clase == 'C2' (MX Commercial too)
+            PEP       Referencia 3 == 'Global', Referencia 2 == 'PP', Clase == 'C2' ('MX Commercial' rows
+                      are already 'Individual' by then)
         All three need a non-blank Centro: rows without one are counted and reported in 'avisos'
         (never dropped silently), so a short Grand Total can always be explained. The amount comes
         already parsed (`pasos_gallo["importe_num"]`). Returns per block 'cedis' and 'suma', plus
@@ -612,7 +622,7 @@ class EtapaTD:
 
     def mascara_pep(self):
         """Mask of the Gallo rows of the PEP block — the SAME rows `preparar` summed (Global, Referencia
-        2 == 'PP', Clase == 'C2', non-blank Centro; 'MX Commercial' included). Call it after `preparar`.
+        2 == 'PP', Clase == 'C2', non-blank Centro). Call it after `preparar`.
         """
         if self._pep is None:
             raise RuntimeError("EtapaTD.mascara_pep requiere llamar antes a preparar().")
@@ -641,7 +651,7 @@ class EtapaTD:
             f"Referencia 3 = 'Global'; {columnas['centro']} no vacío",
             f"Referencia 2 = '{EtapaTD.PEP_REFERENCIA2}'; "
             f"{columnas['clase']} = '{EtapaTD.PEP_CLASE}' "
-            f"(sí incluye '{EtapaGallo.VALOR_ASIGNACION}')",
+            f"('{EtapaGallo.VALOR_ASIGNACION}' ya pasó a 'Individual')",
         ]
 
     def escribir(self, ws_td):
@@ -748,7 +758,7 @@ class EtapaDocumentosFB03:
     Global 'Referencia' (step 4: it starts with a digit, or with PP / RG / SG). It reuses
     EtapaGallo's pieces and EtapaTD.NOTAS, so it cannot drift from the consolidation.
     Deliberately NOT applied (only those two filters were asked for): the 'MX Commercial'
-    exclusion, the non-blank Centro and the SG/RG override — an extra document in FB03 does no
+    exclusion, the non-blank Centro and the 'MX Commercial' override — an extra document in FB03 does no
     harm, a missing one would.
     """
 
@@ -757,9 +767,7 @@ class EtapaDocumentosFB03:
     # How the filter is described to the user, built from the same constants it uses.
     _PREFIJOS = tuple(sorted(EtapaGallo.PREFIJOS_LETRAS_GLOBAL))            # ('PP', 'RG', 'SG')
     DESCRIPCION_FILTRO = (
-        f"Clase de documento {'/'.join(sorted(CLASES))} y Referencia Global "
-        f"(empieza con {', '.join(_PREFIJOS[:-1])} o {_PREFIJOS[-1]}, "
-        "o empieza con un dígito)"
+        f"Clase de documento {'/'.join(sorted(CLASES))} y Referencia Global"
     )
 
     @staticmethod
@@ -816,25 +824,37 @@ class EtapaDocumentosFB03:
         return EtapaDocumentosFB03.documentos(gallo, columnas)
 
 
-# === Stage: 'Venta DSD' — amount by date ===
+# === Stage: 'Venta DSD' and 'Venta EIAP' — amount by date ===
 class EtapaVentas:
-    """The 'Venta DSD' sheet: date (A) × summed amount (B) for Clase de documento C1/C2/C5/C6/X0 or
-    blank ("" = Excel's "(blanks)") AND accounts 4000010/4000005. It also validates the dates picked
-    in the GUI (only this sheet uses them). 'Venta EIAP' left the consolidation: it is downloaded on
-    its own with the 'Solo Venta EIAP' button (see EtapaVentaEIAP).
+    """The two sales sheets of the 'Venta DSD + EIAP' button: each a date (A) × summed amount (B)
+    matrix over the SAME FAGLL03 file (its one query asks for the accounts and classes of both):
+        'Venta DSD'   Clase de documento C1/C2/C5/C6/X0 or blank ("" = Excel's "(blanks)") AND
+                      accounts 4000005/4000010
+        'Venta EIAP'  Clase de documento RV/DA AND accounts 4000010/4000020/4000802/4300013
+    (the lists live in utils.py, next to what SAP is asked for). A row that fits neither sheet is
+    reported in 'avisos', never summed. It also validates the dates picked in the GUI. These sheets
+    are NOT in the full workbook (Gallo + Monivoi...): `consolidar_venta_eiap` writes them alone.
     """
 
     HOJA_DSD  = "Venta DSD"
-    HOJAS = (("dsd", HOJA_DSD),)
+    HOJA_EIAP = "Venta EIAP"
+    HOJAS = (("dsd", HOJA_DSD), ("eiap", HOJA_EIAP))
 
-    CLASES_DSD  = frozenset({"C1", "C2", "C5", "C6", "X0", ""})
+    # The blank class counts for DSD, but SAP's class filter of the download cannot ask for it: it
+    # only matters for a file that already carries blank-class rows.
+    CLASES_DSD  = frozenset(CLASES_VENTA_DSD) | {""}
     # Accounts compared NORMALIZED: '4000010', '0004000010' and '4000010.0' are the same.
-    CUENTAS_DSD  = frozenset({"4000010", "4000005"})
+    CUENTAS_DSD  = frozenset(CUENTAS_VENTA_DSD)
+    CLASES_EIAP_HOJA  = frozenset(CLASES_VENTA_EIAP)
+    CUENTAS_EIAP_HOJA = frozenset(CUENTAS_VENTA_EIAP)
     # The matrices `preparar` builds: (key, tab, classes, accounts).
-    BLOQUES = (("dsd", HOJA_DSD, CLASES_DSD, CUENTAS_DSD),)
+    BLOQUES = (
+        ("dsd",  HOJA_DSD,  CLASES_DSD,       CUENTAS_DSD),
+        ("eiap", HOJA_EIAP, CLASES_EIAP_HOJA, CUENTAS_EIAP_HOJA),
+    )
     # Where the rows come from, for the warnings and the filter legend.
-    ORIGEN = "Gallo"
-    LEYENDA_ORIGEN = "hoja 'Gallo'"
+    ORIGEN = "Venta DSD + EIAP"
+    LEYENDA_ORIGEN = "archivo de Venta DSD + EIAP"
 
     ENCABEZADO_FECHA   = "Fecha"
     ETIQUETA_SIN_FECHA = "Sin fecha"
@@ -980,8 +1000,28 @@ class EtapaVentas:
             f"{', '.join(EtapaVentas.FORMATOS_FECHA_4D + EtapaVentas.FORMATOS_FECHA_2D)}."
         )
 
+    @classmethod
+    def desde_csv(cls, eiap, fechas_sel=()):
+        """The stage for the 'Venta DSD + EIAP' CSV (as text): resolves its columns by name and parses
+        the amounts. ValueError: a missing column or an unreadable amount.
+        """
+        def col(candidatos, descripcion):
+            return Comun.col_por_candidatos(eiap, candidatos, descripcion, cls.ORIGEN)
+
+        col_importe = col((Comun.ENCABEZADO_IMPORTE,), "importe en moneda local")
+        pasos = {
+            "col_clase":   col(("Clase de documento",), "clase de documento"),
+            "col_cuenta":  col(EtapaGallo.COL_CUENTA_CANDIDATAS, "cuenta"),
+            "col_fecha":   col(EtapaGallo.COL_FECHA_CANDIDATAS, "fecha de contabilización"),
+            "importe_num": eiap[col_importe].map(partial(Comun.parse_importe_us, columna=col_importe)),
+        }
+        return cls(eiap, pasos, fechas_sel)
+
     def preparar(self):
-        """'Venta DSD' → {'dsd': {filas, sin_fecha_n, sin_fecha_importe, total, fuera_rango}, 'avisos'}."""
+        """Both sheets → {'dsd': {filas, sin_fecha_n, sin_fecha_importe, total, fuera_rango, ...},
+        'eiap': {...}, 'avisos'}. Rows that no sheet sums (a class / account pair outside both, or a
+        class SAP's filter should have kept out) are reported, never added to a sheet.
+        """
         gallo = self.gallo
         pasos = self.pasos
         col_clase   = pasos["col_clase"]
@@ -1008,10 +1048,12 @@ class EtapaVentas:
         seleccionadas = set(fechas_sel)
         avisos = []
         bloques = {}
+        mascaras = {}
 
         for clave, etiqueta, clases, cuentas in self.BLOQUES:
             cuentas_buscadas = {self.normalizar_cuenta(c) for c in cuentas}
             mascara = clase_norm.isin(clases) & cuenta_norm.isin(cuentas_buscadas)
+            mascaras[clave] = mascara
 
             # A requested account missing from the file: no postings that day... or a layout change → warn.
             faltantes = sorted(c for c in cuentas_buscadas if c not in cuentas_presentes)
@@ -1072,6 +1114,30 @@ class EtapaVentas:
                 },
             }
 
+        # Rows that fit NO sheet: the file is one query for both sales, so a pair like class RV with
+        # account 4000005 can arrive and belongs to neither. Counted with their amount.
+        cubiertas = pd.Series(False, index=gallo.index)
+        for mascara in mascaras.values():
+            cubiertas = cubiertas | mascara
+        ajenas = ~cubiertas
+        n_ajenas = int(ajenas.sum())
+        if n_ajenas:
+            importe_ajeno = round(float(importe_num[ajenas].sum()), 2)
+            pares = (
+                pd.DataFrame({"_clase": clase_norm[ajenas], "_cuenta": cuenta_norm[ajenas]})
+                .drop_duplicates().head(3)
+            )
+            ejemplos = ", ".join(
+                f"{clase or self.ETIQUETA_EN_BLANCO}/{cuenta}"
+                for clase, cuenta in zip(pares["_clase"], pares["_cuenta"])
+            )
+            hojas = " ni ".join(f"'{etiqueta}'" for _, etiqueta, _, _ in self.BLOQUES)
+            avisos.append(
+                f"{self.ORIGEN}: {n_ajenas:,} fila(s) (importe {importe_ajeno:,.2f}) con una "
+                f"combinación de clase de documento y cuenta que no es de {hojas} "
+                f"(clase/cuenta, ej.: {ejemplos}); no se sumaron."
+            )
+
         bloques["avisos"] = avisos
         self.resultado = bloques
         return bloques
@@ -1131,50 +1197,6 @@ class EtapaVentas:
 
         ws.column_dimensions["A"].width = 14
         ws.column_dimensions["B"].width = 24
-
-
-class EtapaVentaEIAP(EtapaVentas):
-    """'Venta EIAP' of the EIAP-only consolidation: the matrix of 'Venta DSD' (date × amount, Grand
-    Total) over the EIAP download, with ITS filters (classes RV/DA, the EIAP accounts). The sheet is
-    the whole workbook: no Gallo / Monivoi involved.
-    """
-
-    HOJA_EIAP = "Venta EIAP"
-    BLOQUES = (("eiap", HOJA_EIAP, frozenset(CLASES_EIAP), frozenset(CUENTAS_EIAP)),)
-    ORIGEN = "Venta EIAP"
-    LEYENDA_ORIGEN = "archivo de Venta EIAP"
-
-    @classmethod
-    def desde_csv(cls, eiap, fechas_sel=()):
-        """The stage for the EIAP CSV (as text): resolves its columns by name and parses the amounts.
-        ValueError: a missing column or an unreadable amount.
-        """
-        def col(candidatos, descripcion):
-            return Comun.col_por_candidatos(eiap, candidatos, descripcion, cls.ORIGEN)
-
-        col_importe = col((Comun.ENCABEZADO_IMPORTE,), "importe en moneda local")
-        pasos = {
-            "col_clase":   col(("Clase de documento",), "clase de documento"),
-            "col_cuenta":  col(EtapaGallo.COL_CUENTA_CANDIDATAS, "cuenta"),
-            "col_fecha":   col(EtapaGallo.COL_FECHA_CANDIDATAS, "fecha de contabilización"),
-            "importe_num": eiap[col_importe].map(partial(Comun.parse_importe_us, columna=col_importe)),
-        }
-        return cls(eiap, pasos, fechas_sel)
-
-    def preparar(self):
-        """Like 'Venta DSD', plus a warning for the rows of other classes (SAP's class filter failed or
-        was changed): they are left out of the sum, never added to it.
-        """
-        bloques = super().preparar()
-        clases = self.BLOQUES[0][2]
-        clase_norm = self.gallo[self.pasos["col_clase"]].astype(str).str.strip().str.upper()
-        ajenas = int((~clase_norm.isin(clases)).sum())
-        if ajenas:
-            bloques["avisos"].append(
-                f"{self.HOJA_EIAP}: {ajenas:,} fila(s) con clase de documento distinta de "
-                f"{' / '.join(sorted(clases))}; no se sumaron."
-            )
-        return bloques
 
 
 # === Stage: Monivoi (ZLMXCOM_TRN_MONINVOI) — 'MTD' (step 16) ===
@@ -2741,9 +2763,11 @@ class EtapaListasSegundaCorrida:
                      Notas de crédito / PEP Vouchers: what their 'Referencia de pago' formula SHOWS,
                      i.e. the FB reference that is not in VBRL (a row whose reference is itself #N/A,
                      or shows 0 because FB has it empty, has nothing to copy)
-        documentos   'Nº documento' → BKPF, of EVERY #N/A row of the three tables
-    Values that start with 'FP' are left out of each list (case-insensitive, like Excel's "does not
-    begin with" filter), and so are '(blank)', empty cells and repeats (first appearance wins:
+        documentos   'Nº documento' → BKPF, of the same #N/A rows
+    The 'FP' rule looks at the row's 'Referencia de pago' ONLY (user, 22-oct-2026): a row whose
+    reference starts with 'FP' (case-insensitive, like Excel's "does not begin with" filter) leaves
+    BOTH lists — its reference and its document. The document number itself is never tested. Also
+    left out: '(blank)' / empty references, empty cells and repeats (first appearance wins:
     Facturas, then Notas de crédito, then PEP Vouchers). A #VALUE! row is not #N/A: left out.
     """
 
@@ -2761,7 +2785,7 @@ class EtapaListasSegundaCorrida:
 
     @classmethod
     def excluida(cls, valor):
-        """True for a value the lists leave out because it starts with 'FP'."""
+        """True for a 'Referencia de pago' that takes its whole row out of both lists ('FP...')."""
         return str(valor).strip().upper().startswith(cls.PREFIJO_EXCLUIDO)
 
     def _filas_na(self):
@@ -2789,23 +2813,37 @@ class EtapaListasSegundaCorrida:
                 yield clave, referencia, documento
 
     def preparar(self):
-        """Build both lists → {referencias, documentos, renglones_na (per table), excluidas_fp (per
-        list), con_notas_pep, avisos}.
+        """Build both lists → {referencias, documentos, renglones_na (per table), excluidas_fp
+        ({renglones, referencias, documentos}: #N/A rows left out by the 'FP' rule, and the distinct
+        references / documents that left with them), con_notas_pep, avisos}.
         """
         renglones_na = {clave: 0 for clave, _ in self.ORIGENES}
         referencias, documentos = [], []
+        referencias_fp, documentos_todos = [], []
+        renglones_fp = 0
         for origen, referencia, documento in self._filas_na():
             renglones_na[origen] += 1
+            documentos_todos.append(documento)
+            if referencia is not None and self.excluida(referencia):
+                # The WHOLE row goes: neither its reference nor its document is asked for.
+                renglones_fp += 1
+                referencias_fp.append(referencia)
+                continue
             if referencia is not None:
                 referencias.append(referencia)
             documentos.append(documento)
 
-        excluidas = {}
-        listas = {}
-        for nombre, valores in (("referencias", referencias), ("documentos", documentos)):
-            distintos = Comun.documentos_distintos(valores)
-            listas[nombre] = [v for v in distintos if not self.excluida(v)]
-            excluidas[nombre] = len(distintos) - len(listas[nombre])
+        listas = {
+            "referencias": Comun.documentos_distintos(referencias),
+            "documentos":  Comun.documentos_distintos(documentos),
+        }
+        # A document stays if ANY of its #N/A rows survives; only the ones left with no row count.
+        sin_renglon = set(Comun.documentos_distintos(documentos_todos)) - set(listas["documentos"])
+        excluidas = {
+            "renglones":   renglones_fp,
+            "referencias": len(Comun.documentos_distintos(referencias_fp)),
+            "documentos":  len(sin_renglon),
+        }
 
         avisos = []
         if self.etapa_notas_pep is None:
@@ -2869,19 +2907,39 @@ def leer_solicitantes_vbrk(ruta_vbrk):
     return EtapaListasSegundaCorrida.leer_solicitantes(ruta_vbrk)
 
 
+def preparar_tablas_diferencias(gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb=None,
+                                update_status=None):
+    """The three tables of 'TD.Diferencias_Referencias' and the 2nd-run lists taken from their #N/A
+    rows → (etapa_td_ref, etapa_notas_pep or None, listas). `etapa_td` and `etapa_vbrl` (and
+    `etapa_fb`, which adds Notas de crédito / PEP Vouchers) must already be prepared; `pasos_gallo`
+    must come from EtapaGallo(con_ref_pago=True). ONE code path for the consolidation and for
+    calcular_listas_segunda_corrida, so the lists can never differ from what the workbook shows.
+    """
+    status = update_status or (lambda _mensaje: None)
+    status("🔬 Construyendo 'TD.Diferencias_Referencias'...")
+    etapa_td_ref = EtapaTDReferencias(gallo, pasos_gallo, etapa_td, etapa_vbrl)
+    etapa_td_ref.preparar()
+    etapa_notas_pep = None
+    if etapa_fb is not None:
+        status("🔬 Construyendo 'Notas de crédito' y 'PEP Vouchers'...")
+        etapa_notas_pep = EtapaTDNotasPEP(gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb)
+        etapa_notas_pep.preparar()
+    listas = EtapaListasSegundaCorrida(etapa_td_ref, etapa_notas_pep).preparar()
+    return etapa_td_ref, etapa_notas_pep, listas
+
+
 # === Orchestrator ===
 class Consolidador:
     """Runs the consolidation: reads the CSVs, runs the stages in order and writes the workbook (the
     stages hold the logic): EtapaGallo → EtapaTD → EtapaMonivoi → EtapaCruceTDMTD → [EtapaVBRL →
-    EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida] → EtapaVentas. The VBRL and the FB03 are
+    EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida]. The VBRL and the FB03 are
     OPTIONAL on purpose: an old date from before those downloads must still consolidate (just
     without their sheets; the Notas de crédito / PEP Vouchers tables need BOTH).
     """
 
     def __init__(self, ruta_gallo, ruta_monivoi, ruta_output, nombre_salida=None,
-                 callback_status=None, fechas_seleccionadas=None, ruta_vbrl=None, ruta_fb03=None):
-        """`fechas_seleccionadas` ('DD.MM.YYYY' from the GUI) make those days show in 'Venta DSD' even
-        without amounts and break ties in the date format; `ruta_vbrl` adds the 'VBRL' and
+                 callback_status=None, ruta_vbrl=None, ruta_fb03=None):
+        """`ruta_vbrl` adds the 'VBRL' and
         'TD.Diferencias_Referencias' sheets; `ruta_fb03` (together with `ruta_vbrl`) adds the 'FB' sheet
         and the 'Notas de crédito' / 'PEP Vouchers' tables; `nombre_salida` defaults to
         'Consolidado_<Gallo CSV>.xlsx'.
@@ -2891,7 +2949,6 @@ class Consolidador:
         self.ruta_output = ruta_output
         self.nombre_salida = nombre_salida
         self.callback_status = callback_status
-        self.fechas_seleccionadas = fechas_seleccionadas
         self.ruta_vbrl = ruta_vbrl or None
         self.ruta_fb03 = ruta_fb03 or None
 
@@ -2911,9 +2968,6 @@ class Consolidador:
         con_fb = self.ruta_fb03 is not None
         # The tables read FB AND VBRL: with only one of them there is nothing to look up.
         con_notas_pep = con_vbrl and con_fb
-
-        # Validated BEFORE reading anything: better in the first second than after 1M rows.
-        fechas_sel = EtapaVentas.parsear_fechas_seleccionadas(self.fechas_seleccionadas)
 
         # Step 1: read the files.
         update_status("📄 Leyendo archivo de Gallo...")
@@ -2944,7 +2998,7 @@ class Consolidador:
             etapa_fb = EtapaFB(fb, Comun.es_sin_datos(fb))
             etapa_fb.preparar()
 
-        # Gallo: steps 2-9 + SG/RG override + amounts (adds K, L, M).
+        # Gallo: steps 2-9 + 'MX Commercial' override + amounts (adds K, L, M).
         etapa_gallo = EtapaGallo(gallo, update_status, con_ref_pago=con_vbrl)
         pasos_gallo = etapa_gallo.preparar()
 
@@ -2966,28 +3020,12 @@ class Consolidador:
         cruce_avisos = cruce.avisos()
 
         # 'TD.Diferencias_Referencias' (only with VBRL).
-        etapa_td_ref = None
+        # 'Notas de crédito' / 'PEP Vouchers' (only with VBRL and FB03) and the lists of the 2nd run
+        # of downloads: the SAME helper the 2nd run uses on its own (calcular_listas_segunda_corrida).
+        etapa_td_ref = etapa_notas_pep = listas_2da = None
         if con_vbrl:
-            update_status("🔬 Construyendo 'TD.Diferencias_Referencias'...")
-            etapa_td_ref = EtapaTDReferencias(gallo, pasos_gallo, etapa_td, etapa_vbrl)
-            etapa_td_ref.preparar()
-
-        # 'Notas de crédito' and 'PEP Vouchers' (only with VBRL and FB03).
-        etapa_notas_pep = None
-        if con_notas_pep:
-            update_status("🔬 Construyendo 'Notas de crédito' y 'PEP Vouchers'...")
-            etapa_notas_pep = EtapaTDNotasPEP(gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb)
-            etapa_notas_pep.preparar()
-
-        # The lists of the 2nd run of downloads (only with VBRL: they come from its #N/A rows).
-        listas_2da = None
-        if etapa_td_ref is not None:
-            listas_2da = EtapaListasSegundaCorrida(etapa_td_ref, etapa_notas_pep).preparar()
-
-        # 'Venta DSD'.
-        update_status("📆 Construyendo 'Venta DSD'...")
-        etapa_ventas = EtapaVentas(gallo, pasos_gallo, fechas_sel)
-        ventas = etapa_ventas.preparar()
+            etapa_td_ref, etapa_notas_pep, listas_2da = preparar_tablas_diferencias(
+                gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb, update_status)
 
         # Export the workbook.
         update_status("💾 Guardando Excel consolidado...")
@@ -3027,9 +3065,6 @@ class Consolidador:
 
             etapa_monivoi.escribir_mtd(writer.book.create_sheet(EtapaMonivoi.HOJA_MTD))
 
-            for clave, nombre_hoja in EtapaVentas.HOJAS:
-                etapa_ventas.escribir(writer.book.create_sheet(nombre_hoja), clave)
-
         update_status("✅ Consolidación completada")
 
         resumen_vbrl = etapa_vbrl.resultado if etapa_vbrl is not None else None
@@ -3065,8 +3100,6 @@ class Consolidador:
             "total_pep":            td_resumen["total_pep"],
             "total_importe_gallo":  total_importe_gallo,
             "td_avisos":            td_resumen["avisos"],
-            "total_venta_dsd":      ventas["dsd"]["total"],
-            "venta_avisos":         ventas["avisos"],
             "centros_mtd_todos":    len(mtd["bloques"]["todos"]["filas"]),
             "mtd_filas_sin_uuid":   mtd["filas_sin_uuid"],
             "mtd_avisos":           mtd["avisos"],
@@ -3099,7 +3132,6 @@ def consolidar_gallo_monivoi(
     ruta_output,
     nombre_salida=None,
     callback_status=None,
-    fechas_seleccionadas=None,
     ruta_vbrl=None,
     ruta_fb03=None,
 ):
@@ -3108,31 +3140,69 @@ def consolidar_gallo_monivoi(
         ruta_gallo, ruta_monivoi, ruta_output,
         nombre_salida=nombre_salida,
         callback_status=callback_status,
-        fechas_seleccionadas=fechas_seleccionadas,
         ruta_vbrl=ruta_vbrl,
         ruta_fb03=ruta_fb03,
     ).ejecutar()
 
 
+def calcular_listas_segunda_corrida(ruta_gallo, ruta_vbrl, ruta_fb03=None, callback_status=None):
+    """The 2nd-run lists WITHOUT writing a workbook (the '2a corrida' download button): the files of
+    the 1st run go through the same stages as in the consolidation — Gallo (steps 2-9, amounts) →
+    'TD' → preparar_tablas_diferencias — so the lists are exactly the #N/A rows the consolidated
+    'TD.Diferencias_Referencias' shows for those files. `ruta_fb03` is optional (without it, only
+    the Facturas table: a warning in 'avisos'). Returns EtapaListasSegundaCorrida.resultado.
+    FileNotFoundError: a file is missing. ValueError: Gallo without data, a missing column, an
+    unreadable amount, or a VBRL / FB03 without the columns the lookups need.
+    """
+    status = callback_status or (lambda _mensaje: None)
+    # Read AND check VBRL / FB03 first: a wrong layout stops the run before the big Gallo.
+    status("📄 Leyendo archivo de VBRL...")
+    vbrl = Comun.leer_csv(ruta_vbrl)
+    etapa_vbrl = EtapaVBRL(vbrl, Comun.es_sin_datos(vbrl))
+    etapa_vbrl.preparar()
+    etapa_fb = None
+    if ruta_fb03:
+        status("📄 Leyendo archivo de FB03...")
+        fb = Comun.leer_csv(ruta_fb03)
+        etapa_fb = EtapaFB(fb, Comun.es_sin_datos(fb))
+        etapa_fb.preparar()
+
+    status("📄 Leyendo archivo de Gallo...")
+    gallo = Comun.leer_csv(ruta_gallo)
+    if Comun.es_sin_datos(gallo):
+        raise ValueError(
+            "El archivo de Gallo no tiene datos (descarga 'sin partidas'): no hay renglones "
+            "de los que salgan las listas de la 2a corrida."
+        )
+    pasos_gallo = EtapaGallo(gallo, status, con_ref_pago=True).preparar()
+    status("📊 Construyendo matriz 'TD'...")
+    etapa_td = EtapaTD(gallo, pasos_gallo)
+    etapa_td.preparar()
+    _, _, listas = preparar_tablas_diferencias(
+        gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb, status)
+    return listas
+
+
 def consolidar_venta_eiap(ruta_eiap, ruta_output, nombre_salida=None, callback_status=None,
                           fechas_seleccionadas=None):
-    """The controller's entry point when ONLY 'Venta EIAP' was downloaded: a workbook with the single
-    'Venta EIAP' tab. `fechas_seleccionadas` ('DD.MM.YYYY'): every day of the queried range, which
-    show up even without amounts. FileNotFoundError / ValueError as in Consolidador.ejecutar().
+    """The controller's entry point for the 'Venta DSD + EIAP' button: a workbook with the two tabs
+    'Venta DSD' and 'Venta EIAP' (EtapaVentas). `fechas_seleccionadas` ('DD.MM.YYYY'): every day of
+    the queried range, which show up even without amounts. FileNotFoundError / ValueError as in
+    Consolidador.ejecutar().
     """
     status = callback_status or (lambda _mensaje: None)
     fechas_sel = EtapaVentas.parsear_fechas_seleccionadas(fechas_seleccionadas)
 
-    status("📄 Leyendo archivo de Venta EIAP...")
+    status("📄 Leyendo archivo de Venta DSD + EIAP...")
     eiap = Comun.leer_csv(ruta_eiap)
     if Comun.es_sin_datos(eiap):
         raise ValueError(
-            "El archivo de Venta EIAP no tiene datos (descarga 'sin partidas'). "
+            "El archivo de Venta DSD + EIAP no tiene datos (descarga 'sin partidas'). "
             "No hay nada que consolidar."
         )
 
-    status("📆 Construyendo 'Venta EIAP'...")
-    etapa = EtapaVentaEIAP.desde_csv(eiap, fechas_sel)
+    status("📆 Construyendo 'Venta DSD' y 'Venta EIAP'...")
+    etapa = EtapaVentas.desde_csv(eiap, fechas_sel)
     ventas = etapa.preparar()
 
     status("💾 Guardando Excel consolidado...")
@@ -3142,15 +3212,17 @@ def consolidar_venta_eiap(ruta_eiap, ruta_output, nombre_salida=None, callback_s
     ruta_final = os.path.join(ruta_output, nombre_salida)
 
     libro = Workbook()
-    hoja = libro.active
-    hoja.title = EtapaVentaEIAP.HOJA_EIAP
-    etapa.escribir(hoja, "eiap")
+    for posicion, (clave, nombre_hoja) in enumerate(EtapaVentas.HOJAS):
+        hoja = libro.active if posicion == 0 else libro.create_sheet()
+        hoja.title = nombre_hoja
+        etapa.escribir(hoja, clave)
     libro.save(ruta_final)
 
     status("✅ Consolidación completada")
     return {
         "ruta":             ruta_final,
-        "filas_eiap":       len(eiap),
+        "filas_archivo":    len(eiap),
+        "total_venta_dsd":  ventas["dsd"]["total"],
         "total_venta_eiap": ventas["eiap"]["total"],
         "venta_avisos":     ventas["avisos"],
     }
@@ -3163,10 +3235,6 @@ if __name__ == "__main__":
     ruta_monivoi = input("Ruta del CSV de Monivoi : ").strip().strip('"')
     ruta_vbrl    = input("Ruta del CSV de VBRL (Enter = sin VBRL): ").strip().strip('"') or None
     ruta_fb03    = input("Ruta del CSV de FB03 (Enter = sin FB03): ").strip().strip('"') or None
-    fechas_txt   = input(
-        "Fechas seleccionadas 'DD.MM.YYYY' separadas por coma (Enter = ninguna): "
-    ).strip()
-    fechas = [f.strip() for f in fechas_txt.split(",") if f.strip()] or None
 
     salida = carpeta_output_desde_input(os.path.dirname(ruta_gallo))
 
@@ -3174,7 +3242,6 @@ if __name__ == "__main__":
         resumen = consolidar_gallo_monivoi(
             ruta_gallo, ruta_monivoi, salida,
             callback_status=print,
-            fechas_seleccionadas=fechas,
             ruta_vbrl=ruta_vbrl,
             ruta_fb03=ruta_fb03,
         )

@@ -16,7 +16,7 @@ from utils import (
     nombre_archivo_dia_vbrl,     nombre_archivo_rango_vbrl,
     nombre_archivo_dia_fb03,     nombre_archivo_rango_fb03,
     nombre_archivo_rango_eiap,
-    ARCHIVOS_SEGUNDA_CORRIDA,
+    ARCHIVOS_SEGUNDA_CORRIDA,    CORRIDAS_DESCARGA,
     nombre_archivo_dia_2da,      nombre_archivo_rango_2da,
 )
 
@@ -35,9 +35,21 @@ class ValidacionFacturaGUI:
     ANCHO_BASE = 580
     ALTO_BASE  = 690
 
+    # The two runs: radio buttons for the downloads and for the consolidations, each with a legend.
+    LEYENDAS_DESCARGA = {
+        1: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[1]),
+        2: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[2]),
+    }
+    LEYENDAS_CONSOLIDACION = {
+        1: "Gallo + Monivoi + VBRL + FB03 → Excel consolidado",
+        2: "Por definir",
+    }
+    # The 2nd consolidation is not defined yet: its radio button stays disabled until it is.
+    CONSOLIDACION_2_DISPONIBLE = False
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Validación Factura Global")
+        self.root.title("VALIDACIÓN FACTURA GLOBAL")
         self.root.geometry(f"{self.ANCHO_BASE}x{self.ALTO_BASE}")
         self.root.resizable(False, False)
 
@@ -61,6 +73,10 @@ class ValidacionFacturaGUI:
 
         # Parallel run by passes (opt-in): it always starts unchecked (sequential is the safe default).
         self.paralelo_var = tk.BooleanVar(value=False)
+
+        # Which run the main buttons execute (1a / 2a); always the 1st when the window opens.
+        self.corrida_descarga_var = tk.IntVar(value=1)
+        self.corrida_consolidacion_var = tk.IntVar(value=1)
 
         # Download folder: the user's Documents path by default; it can be changed (e.g. a synced SharePoint
         # folder) and is remembered in config.json, like the consolidation folder.
@@ -116,7 +132,7 @@ class ValidacionFacturaGUI:
 
         # --- Header (fixed) ---
         tk.Label(
-            main, text="Validación Factura Global",
+            main, text="VALIDACIÓN FACTURA GLOBAL",
             font=("Segoe UI", 16, "bold"),
             bg=self.bg_color, fg=self.primary_color,
         ).pack(pady=(0, 4))
@@ -162,9 +178,9 @@ class ValidacionFacturaGUI:
             cont, text="  Tipo de intervalo  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
-            bd=1, relief=tk.SOLID, padx=15, pady=10,
+            bd=1, relief=tk.SOLID, padx=15, pady=6,
         )
-        mode_frame.pack(fill="x", pady=(0, 12))
+        mode_frame.pack(fill="x", pady=(0, 10))
 
         for text, value in [("Un solo día", "single"), ("Varios días", "range")]:
             tk.Radiobutton(
@@ -176,7 +192,7 @@ class ValidacionFacturaGUI:
 
         # --- Date container (switches between single/range) ---
         self.date_container = tk.Frame(cont, bg=self.bg_color)
-        self.date_container.pack(fill="x", pady=(0, 12))
+        self.date_container.pack(fill="x", pady=(0, 10))
 
         hoy = datetime.now().strftime("%d.%m.%Y")
 
@@ -185,7 +201,7 @@ class ValidacionFacturaGUI:
             self.date_container, text="  Fecha  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
-            bd=1, relief=tk.SOLID, padx=15, pady=15,
+            bd=1, relief=tk.SOLID, padx=15, pady=6,
         )
         tk.Label(
             self.single_frame, text="Fecha:", font=("Segoe UI", 9),
@@ -208,43 +224,58 @@ class ValidacionFacturaGUI:
             self.date_container, text="  Intervalo de Tiempo  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
-            bd=1, relief=tk.SOLID, padx=15, pady=15,
+            bd=1, relief=tk.SOLID, padx=15, pady=6,
         )
-        for row, (label, attr) in enumerate([
-            ("Fecha Desde:", "date_from_var"),
-            ("Fecha Hasta:", "date_to_var"),
+        # Both dates on ONE row (Desde ... Hasta ...): the window stays short enough for a laptop.
+        for col, (label, attr) in enumerate([
+            ("Desde:", "date_from_var"),
+            ("Hasta:", "date_to_var"),
         ]):
             tk.Label(
                 self.range_frame, text=label, font=("Segoe UI", 9),
                 bg=self.bg_color, fg=self.secondary_color,
-            ).grid(row=row, column=0, sticky="w", pady=8)
+            ).grid(row=0, column=2 * col, sticky="w", pady=8)
             var = tk.StringVar(value=hoy)
             setattr(self, attr, var)
             tk.Entry(
-                self.range_frame, textvariable=var, width=15,
+                self.range_frame, textvariable=var, width=12,
                 font=("Segoe UI", 10), bg=self.light_gray, fg=self.primary_color,
                 relief=tk.FLAT, bd=1, highlightthickness=1,
                 highlightbackground=self.border_color, highlightcolor=self.primary_color,
-            ).grid(row=row, column=1, padx=10, pady=8, sticky="w")
-            tk.Label(
-                self.range_frame, text="(DD.MM.YYYY)", font=("Segoe UI", 8),
-                bg=self.bg_color, fg="#999999",
-            ).grid(row=row, column=2, sticky="w")
+            ).grid(row=0, column=2 * col + 1, padx=(8, 16), pady=8, sticky="w")
+        tk.Label(
+            self.range_frame, text="(DD.MM.YYYY)", font=("Segoe UI", 8),
+            bg=self.bg_color, fg="#999999",
+        ).grid(row=0, column=4, sticky="w")
 
         for var in (self.date_single_var, self.date_from_var, self.date_to_var):
             var.trace_add("write", lambda *_: self._update_filename_preview())
 
+        # --- Runs: downloads (left) and consolidations (right), each with its legend ---
+        corridas = tk.Frame(cont, bg=self.bg_color)
+        corridas.pack(fill="x", pady=(0, 10))
+        corridas.columnconfigure(0, weight=1, uniform="corridas")
+        corridas.columnconfigure(1, weight=1, uniform="corridas")
+        self.radios_descarga, self.leyenda_descarga = self._grupo_corridas(
+            corridas, 0, "  ⬇️ Descargas  ", self.corrida_descarga_var,
+            self._on_corrida_descarga_change, (0, 6),
+        )
+        self.radios_consolidacion, self.leyenda_consolidacion = self._grupo_corridas(
+            corridas, 1, "  🧩 Consolidación  ", self.corrida_consolidacion_var,
+            self._on_corrida_consolidacion_change, (6, 0),
+        )
+
         # --- Output file names (the folder is in the Configuración tab) ---
         info_frame = tk.Frame(cont, bg=self.light_gray, bd=1, relief=tk.SOLID)
-        info_frame.pack(fill="x", pady=(0, 14))
+        info_frame.pack(fill="x", pady=(0, 10))
 
         self.filename_var = tk.StringVar()
         tk.Label(
             info_frame, textvariable=self.filename_var,
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 8, "bold"),
             bg=self.light_gray, fg=self.primary_color, anchor="w", justify="left",
             wraplength=500,
-        ).pack(fill="x", padx=12, pady=10)
+        ).pack(fill="x", padx=12, pady=6)
 
         # --- Action buttons ---
         btn_frame = tk.Frame(cont, bg=self.bg_color)
@@ -281,19 +312,19 @@ class ValidacionFacturaGUI:
         self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=4)
 
         self.download_eiap_btn = tk.Button(
-            fila_individual, text="📈 Venta EIAP",
+            fila_individual, text="📈 Venta DSD + EIAP",
             command=self._handle_eiap, **_btn_individual_kwargs,
         )
         self.download_eiap_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
+        # Its text follows the 'Descargas' radio button (_on_corrida_descarga_change).
         self.download_btn = tk.Button(
-            btn_frame, text="🐓📊🧾📑 Descargar Gallo + Monivoi + VBRL + FB03",
-            command=self._handle_todos, **_btn_kwargs,
+            btn_frame, text="", command=self._handle_todos, **_btn_kwargs,
         )
         self.download_btn.pack(fill="x")
 
         self.paralelo_chk = tk.Checkbutton(
-            btn_frame, text="⚡ En paralelo (prueba): por pasadas, en varias ventanas de SAP",
+            btn_frame, text="⚡ En paralelo, por pasadas",
             variable=self.paralelo_var,
             font=("Segoe UI", 9), bg=self.bg_color, fg=self.primary_color,
             activebackground=self.bg_color, selectcolor=self.light_gray,
@@ -304,10 +335,66 @@ class ValidacionFacturaGUI:
         # Green 'process data', as opposed to the blue 'bring data' buttons.
         _btn_consolidar_kwargs = dict(_btn_kwargs, bg=self.success_color)
         self.consolidar_btn = tk.Button(
-            btn_frame, text="🧩 Consolidar...!",
-            command=self._handle_consolidar, **_btn_consolidar_kwargs,
+            btn_frame, text="", command=self._handle_consolidar, **_btn_consolidar_kwargs,
         )
         self.consolidar_btn.pack(fill="x", pady=(10, 0))
+
+        self._on_corrida_descarga_change()
+        self._on_corrida_consolidacion_change()
+
+    def _grupo_corridas(self, parent, columna, titulo, variable, al_cambiar, padx):
+        """One LabelFrame with the '1a corrida' / '2a corrida' radio buttons and a legend below them
+        (italic, gray) → ({1: radio, 2: radio}, legend label)."""
+        marco = tk.LabelFrame(
+            parent, text=titulo, font=("Segoe UI", 10, "bold"),
+            bg=self.bg_color, fg=self.primary_color,
+            bd=1, relief=tk.SOLID, padx=10, pady=6,
+        )
+        marco.grid(row=0, column=columna, sticky="nsew", padx=padx)
+        fila = tk.Frame(marco, bg=self.bg_color)
+        fila.pack(fill="x")
+        radios = {}
+        for valor, texto in ((1, "1a corrida"), (2, "2a corrida")):
+            radios[valor] = tk.Radiobutton(
+                fila, text=texto, variable=variable, value=valor,
+                font=("Segoe UI", 9), bg=self.bg_color, fg=self.primary_color,
+                activebackground=self.bg_color, selectcolor=self.light_gray,
+                cursor="hand2", command=al_cambiar,
+            )
+            radios[valor].pack(side=tk.LEFT, padx=(0, 10))
+        leyenda = tk.Label(
+            marco, text="", font=("Segoe UI", 8, "italic"), bg=self.bg_color, fg="#666666",
+            anchor="w", justify="left", wraplength=225,
+        )
+        leyenda.pack(fill="x", pady=(2, 0))
+        return radios, leyenda
+
+    def _on_corrida_descarga_change(self):
+        """Legend, main button text and file names follow the selected download run."""
+        corrida = self.corrida_descarga()
+        self.leyenda_descarga.config(text=self.LEYENDAS_DESCARGA[corrida])
+        n = len(CORRIDAS_DESCARGA[corrida])
+        self.download_btn.config(text=f"⬇️ Descargar {corrida}a corrida ({n} transacciones)")
+        self._update_filename_preview()
+
+    def _on_corrida_consolidacion_change(self):
+        corrida = self.corrida_consolidacion()
+        self.leyenda_consolidacion.config(text=self.LEYENDAS_CONSOLIDACION[corrida])
+        self.consolidar_btn.config(text=f"🧩 Consolidar {corrida}a corrida...!")
+        self._estado_radio_consolidacion_2()
+
+    def _estado_radio_consolidacion_2(self):
+        """The 2nd consolidation radio is only usable once that consolidation exists."""
+        if not self.CONSOLIDACION_2_DISPONIBLE:
+            self.radios_consolidacion[2].config(state="disabled")
+
+    def corrida_descarga(self):
+        """1 or 2: the run the main download button executes (read by the controller)."""
+        return 2 if self.corrida_descarga_var.get() == 2 else 1
+
+    def corrida_consolidacion(self):
+        """1 or 2: the consolidation the green button executes (read by the controller)."""
+        return 2 if self.corrida_consolidacion_var.get() == 2 else 1
 
     # --- Tab 2: Configuración (company code and folders) ---
     def _build_tab_config(self, parent):
@@ -459,7 +546,7 @@ class ValidacionFacturaGUI:
             return "(fecha inválida)"
 
     def _preview_nombre_eiap(self):
-        # 'Venta EIAP' only works with a range.
+        # 'Venta DSD + EIAP' only works with a range.
         if self.mode_var.get() == "single":
             return "(sólo con 'Varios días')"
         try:
@@ -471,13 +558,22 @@ class ValidacionFacturaGUI:
             return "(fecha inválida)"
 
     def _update_filename_preview(self):
+        """The files of the selected download run (the 1st one also lists 'Venta DSD + EIAP', whose
+        button sits next to Gallo and Monivoi)."""
+        if not hasattr(self, "corrida_descarga_var"):
+            return                                # still building the window
+        if self.corrida_descarga() == 2:
+            self.filename_var.set("\n".join(
+                f"📄 {nombre}: {self._preview_nombre_2da(clave)}"
+                for clave, nombre in CORRIDAS_DESCARGA[2]
+            ))
+            return
         self.filename_var.set(
             f"📄 Gallo:      {self._preview_nombre()}\n"
             f"📄 Monivoi:  {self._preview_nombre_monivoi()}\n"
             f"📄 VBRL:       {self._preview_nombre_vbrl()}\n"
             f"📄 FB03:       {self._preview_nombre_fb03()}\n"
-            f"📄 Venta EIAP: {self._preview_nombre_eiap()}\n"
-            "📄 2a corrida (tras consolidar): VBRP, VBRK, VBRL_2, BKPF, KNVP y FBL5N"
+            f"📄 Venta DSD + EIAP: {self._preview_nombre_eiap()}"
         )
 
     def _on_mode_change(self):
@@ -495,14 +591,20 @@ class ValidacionFacturaGUI:
         measured with an empty preview, a wrapped name line was left out of view).
         """
         modo = self.mode_var.get()
+        corrida = self.corrida_descarga_var.get()
         self.mode_var.set("range")
-        self._update_filename_preview()
         self.single_frame.pack_forget()
         self.range_frame.pack(fill="x")
-        self.root.update_idletasks()
+        ancho, alto = self.ANCHO_BASE, self.ALTO_BASE
+        for opcion in CORRIDAS_DESCARGA:               # every run's legend and file names
+            self.corrida_descarga_var.set(opcion)
+            self._on_corrida_descarga_change()
+            self.root.update_idletasks()
+            ancho = max(ancho, self.root.winfo_reqwidth())
+            alto = max(alto, self.root.winfo_reqheight())
         self.mode_var.set(modo)
-        ancho = max(self.ANCHO_BASE, self.root.winfo_reqwidth())
-        alto  = max(self.ALTO_BASE,  self.root.winfo_reqheight())
+        self.corrida_descarga_var.set(corrida)
+        self._on_corrida_descarga_change()
         self.root.geometry(f"{ancho}x{alto}")
         self.range_frame.pack_forget()
 
@@ -586,15 +688,23 @@ class ValidacionFacturaGUI:
             (self.consolidar_btn,       self.success_color),
         )
 
+    def _radios_corrida(self):
+        return tuple(self.radios_descarga.values()) + tuple(self.radios_consolidacion.values())
+
     def disable_buttons(self):
         for btn, _ in self._botones_accion():
             btn.config(state="disabled", bg="#666666")
         self.paralelo_chk.config(state="disabled")
+        for radio in self._radios_corrida():           # the run cannot change while one is running
+            radio.config(state="disabled")
 
     def enable_buttons(self):
         for btn, color in self._botones_accion():
             btn.config(state="normal", bg=color)
         self.paralelo_chk.config(state="normal")
+        for radio in self._radios_corrida():
+            radio.config(state="normal")
+        self._estado_radio_consolidacion_2()
 
     def usar_paralelo(self):
         """True if the 'en paralelo' checkbox is ticked (read by the controller)."""

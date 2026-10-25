@@ -1,8 +1,8 @@
 """Validación Factura Global — helpers without SAP or tkinter (the GUI opens and tests on its own).
 
 The ONLY place for the Spanish months, the file-name formats and the two date offsets of the
-SAP queries: Monivoi +1 day and 'Solo Venta EIAP' −1 day on the end date, plus the accounts and
-document classes of 'Solo Venta EIAP' (asked to SAP AND summed by its tab). File NAMES always
+SAP queries: Monivoi +1 day and 'Venta DSD + EIAP' −1 day on the end date, plus the accounts and
+document classes of the two sales (asked to SAP AND summed by their tabs). File NAMES always
 keep the dates the user typed.
 """
 
@@ -11,9 +11,18 @@ from datetime import datetime, timedelta
 # Date format the user types everywhere in the app.
 FORMATO_FECHA = "%d.%m.%Y"
 
-# 'Solo Venta EIAP': what SAP is asked for AND what its consolidated tab sums (one source for both).
-CUENTAS_EIAP = ("4000010", "4000020", "4000802", "4300013")
-CLASES_EIAP = ("RV", "DA")
+# 'Venta DSD + EIAP' button: what SAP is asked for AND what its two consolidated tabs sum (one
+# source for both). Each tab sums ITS OWN accounts AND classes...
+CUENTAS_VENTA_EIAP = ("4000010", "4000020", "4000802", "4300013")
+CLASES_VENTA_EIAP = ("RV", "DA")
+CUENTAS_VENTA_DSD = ("4000005", "4000010")
+CLASES_VENTA_DSD = ("C1", "C2", "C5", "C6", "X0")
+
+# ...while the ONE FAGLL03 query of the button asks for ALL the accounts and ALL the classes of both
+# sales (4000010 is in both lists; the classes do not overlap). To add an account or a class to a
+# sale, add it to ITS list above: the query follows.
+CUENTAS_EIAP = tuple(dict.fromkeys(CUENTAS_VENTA_EIAP + CUENTAS_VENTA_DSD))
+CLASES_EIAP = tuple(dict.fromkeys(CLASES_VENTA_EIAP + CLASES_VENTA_DSD))
 
 MESES_ES = {
     1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
@@ -40,8 +49,8 @@ def fecha_efectiva_monivoi_str(fecha_str):
 
 
 def fecha_efectiva_eiap(fecha_str):
-    """'Solo Venta EIAP' queries SAP up to the day BEFORE the typed end date (only that button's
-    query): '10.01.2026' -> datetime(2026, 1, 9); '01.03.2026' -> datetime(2026, 2, 28).
+    """The 'Venta DSD + EIAP' button queries SAP up to the day BEFORE the typed end date (only that
+    button's query): '10.01.2026' -> datetime(2026, 1, 9); '01.03.2026' -> datetime(2026, 2, 28).
     """
     return parse_fecha(fecha_str) - timedelta(days=1)
 
@@ -133,12 +142,22 @@ def nombre_archivo_rango_2da(clave, desde, hasta):
     return f"{prefijo}_{d}_a_{h}{ext}"
 
 
-# Venta EIAP only works with a range ("Varios días"): no per-day name.
+# The two runs of the main download button (GUI radio buttons): (controller key, name in the legend).
+# ONE definition for the GUI legends and for what the controller runs (a test ties them together).
+CORRIDAS_DESCARGA = {
+    1: (("gallo", "Gallo"), ("monivoi", "Monivoi"), ("vbrl", "VBRL"), ("fb03", "FB03")),
+    2: (("vbrp", "VBRP"), ("vbrk", "VBRK"), ("vbrl2", "VBRL_2"),
+        ("fbl5n", "FBL5N"), ("knvp", "KNVP"), ("bkpf", "BKPF")),
+}
+
+
+# Venta DSD + EIAP only works with a range ("Varios días"): no per-day name. (The functions keep
+# their 'eiap' name: that was the button before DSD joined it.)
 def nombre_archivo_rango_eiap(desde, hasta):
-    """('01.01.2026', '10.01.2026') -> 'Venta_EIAP_1_ene_26_a_10_ene_26.csv'."""
+    """('01.01.2026', '10.01.2026') -> 'Venta_DSD_EIAP_1_ene_26_a_10_ene_26.csv'."""
     d = _sufijo_dia(parse_fecha(desde))
     h = _sufijo_dia(parse_fecha(hasta))
-    return f"Venta_EIAP_{d}_a_{h}.csv"
+    return f"Venta_DSD_EIAP_{d}_a_{h}.csv"
 
 
 # Quick test:  python utils.py
