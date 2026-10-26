@@ -895,7 +895,7 @@ class ValidacionFacturaController:
             archivo, periodo, nombre_salida = lineas[0]
             detalle = (
                 f"Sólo se encontró la descarga de {nombres[0]} (no hay Gallo ni Monivoi).\n"
-                f"Se generará un Excel con la pestaña '{nombres[0]}' únicamente.\n\n"
+                f"Se generará un Excel con las pestañas 'Gallo' (la base descargada) y '{nombres[0]}'.\n\n"
                 f"  🛒 {nombres[0]}: {archivo}\n"
                 f"  Periodo       : {periodo}\n\n"
                 f"Se generará:\n  {nombre_salida}\n\n"
@@ -903,7 +903,7 @@ class ValidacionFacturaController:
         else:
             detalle = (
                 f"Sólo se encontraron las descargas de {' y '.join(nombres)} (no hay Gallo ni Monivoi).\n"
-                "Se generará un Excel por cada una, con su pestaña únicamente.\n\n"
+                "Se generará un Excel por cada una, con las pestañas 'Gallo' (la base descargada) y la de su venta.\n\n"
                 + "".join(
                     f"  🛒 {nombre}: {archivo}\n"
                     f"  Periodo       : {periodo}\n"

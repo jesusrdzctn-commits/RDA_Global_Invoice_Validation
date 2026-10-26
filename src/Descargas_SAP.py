@@ -1097,7 +1097,7 @@ class Gallo(Descarga):
             datetime.strptime(fecha, "%d.%m.%Y")          # ValueError if malformed
         os.makedirs(self.carpeta, exist_ok=True)
         s = self.conectar()
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFAGLL03"
         s.findById("wnd[0]").sendVKey(0)
         if self.clases:
@@ -1158,7 +1158,7 @@ class Monivoi(Descarga):
             datetime.strptime(fecha, "%d.%m.%Y")
         os.makedirs(self.carpeta, exist_ok=True)
         s = self.conectar()
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/n" + self.TX
         s.findById("wnd[0]").sendVKey(0)
 
@@ -1765,7 +1765,7 @@ class VBRL(DescargaConLista):
         self.borrar_restos()
         s = self.conectar()
         SAP.cerrar_popups(s)                     # a popup left by an earlier run blocks the command field
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nZSE16"
         s.findById("wnd[0]").sendVKey(0)
         s.findById("wnd[0]/usr/ctxtGV_TABNAME").text = "VBRL"
@@ -1868,7 +1868,7 @@ class FB03(DescargaConLista):
 
         s = self.conectar()
         SAP.cerrar_popups(s)
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFB03"
         s.findById("wnd[0]").sendVKey(0)
         s.findById("wnd[0]/tbar[1]/btn[20]").press()                     # document list
@@ -1941,7 +1941,7 @@ class TablaZSE16(DescargaConLista):
         """/nZSE16 → table name → Enter; its selection screen (MAX_SEL) must show up."""
         s = self.conectar()
         SAP.cerrar_popups(s)                     # a popup left by an earlier run blocks the command field
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nZSE16"
         s.findById("wnd[0]").sendVKey(0)
         s.findById("wnd[0]/usr/ctxtGV_TABNAME").text = self.TABLA
@@ -2240,7 +2240,7 @@ class FBL5N(DescargaConLista):
         self.borrar_restos()
         s = self.conectar()
         SAP.cerrar_popups(s)
-        s.findById("wnd[0]").maximize()
+        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFBL5N"
         s.findById("wnd[0]").sendVKey(0)
         if not SAP.esperar(s, self.CAMPO_DEUDOR, 10):

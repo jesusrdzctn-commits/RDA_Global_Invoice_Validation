@@ -1,19 +1,20 @@
 """Validación Factura Global — consolidation: the CSVs downloaded from SAP (Gallo FAGLL03,
 Monivoi ZLMXCOM and, optionally, VBRL ZSE16) → ONE Excel workbook. Tabs, in order:
-    Gallo, Monivoi, VBRL*, FB**, Validación - Doc., TD, TD.Diferencias_Referencias*, MTD
+    Gallo, Monivoi, VBRL*, FB**, Validación - Doc., TD, TD.Diferencias_Referencias*, MTD,
+    Validación_doc*
     (* only with a VBRL file; ** only with a VBRL and an FB03 file, which also add the 'Notas de
-    crédito' and 'PEP Vouchers' tables to 'TD.Diferencias_Referencias')
+    crédito' and 'PEP Vouchers' tables to 'TD.Diferencias_Referencias' and to 'Validación_doc')
 
 One class per stage, each with its constants, its computation (preparar → result dict) and
 the sheet it writes (escribir): Comun (shared helpers) → EtapaGallo → EtapaTD →
 EtapaDocumentosFB03 → EtapaVentas → EtapaMonivoi → EtapaCruceTDMTD → EtapaVBRL →
-EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida (what the 2nd run of
-downloads pastes into SAP, from the #N/A rows) → Consolidador (the orchestrator); a class only
-uses the ones above it.
+EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaValidacionDoc (the #N/A rows of those tables,
+side by side) → EtapaListasSegundaCorrida (what the 2nd run of downloads pastes into SAP, from the
+same #N/A rows) → Consolidador (the orchestrator); a class only uses the ones above it.
 consolidar_gallo_monivoi() is what the controller calls; calcular_listas_segunda_corrida() gives
 the '2a corrida' download button the same lists without writing a workbook; consolidar_venta_dsd() and
 consolidar_venta_eiap() run when ONLY the file of that sale was downloaded (each its own workbook
-with the single tab 'Venta DSD' / 'Venta EIAP', see EtapaVentas: they are NOT part of the full
+with the tabs 'Gallo' + 'Venta DSD' / 'Venta EIAP', see EtapaVentas: they are NOT part of the full
 workbook). No SAP and no tkinter here.
 """
 
@@ -24,7 +25,6 @@ from datetime import datetime
 from functools import partial
 
 import pandas as pd
-from openpyxl import Workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
@@ -191,6 +191,17 @@ class Comun:
             celda = ws.cell(row=fila_inicial + i, column=columna, value=texto)
             celda.font = Font(italic=True, color=Comun.FILTROS_COLOR)
 
+    # Author of every header note the workbook carries.
+    AUTOR_COMENTARIOS = "Validación Factura Global"
+
+    @staticmethod
+    def comentar(celda, texto, ancho=420, alto=150):
+        """Attach a note to `celda`, sized so the whole text is visible."""
+        comentario = Comment(texto, Comun.AUTOR_COMENTARIOS)
+        comentario.width = ancho
+        comentario.height = alto
+        celda.comment = comentario
+
     @staticmethod
     def ref_hoja(nombre):
         """Sheet name as a formula reference: bare when allowed, quoted otherwise."""
@@ -205,18 +216,48 @@ class Comun:
         return '"' + str(texto).replace('"', '""') + '"'
 
 
-# === Stage: Gallo (FAGLL03) — steps 2-9 + 'MX Commercial' override + 'Validación - Doc.' ===
+# === Stage: Gallo (FAGLL03) — 'Referencia 2/3' + 'MX Commercial' copy + 'Validación - Doc.' ===
 class EtapaGallo:
-    """Everything computed FROM the Gallo: the helper columns K, L, M of 'Gallo' (steps 2-9 + the
-    'MX Commercial' override, `preparar`) and the 'Validación - Doc.' sheet. It resolves every Gallo column the
+    """Everything computed FROM the Gallo: the helper columns K and L of 'Gallo' ('Referencia 2' and
+    'Referencia 3', `preparar`) and the 'Validación - Doc.' sheet. It resolves every Gallo column the
     later stages need ONCE, so a missing one stops the run in the first second.
+
+    The order of the steps is business logic (rule of 25-oct-2026, it replaces the 'Comercializadora'
+    column of the 24-oct-2026 rule):
+        1. 'Referencia 2' / 'Referencia 3' first (they rank above everything about 'MX Commercial').
+        2. Filter Asignación = 'MX Commercial' → ALL its rows go to 'Validación - Doc.' D:E (audit
+           control: the sheet keeps what the filter showed).
+        3. ONLY THEN: the rows of that filter whose 'Referencia 3' is 'Global' go to G:H (Centro,
+           Nº documento).
+        4. Once copied, those same rows change 'Global' → 'Individual' in 'Gallo' (so they leave 'TD').
+           With `MX_POR_DOCUMENTO` (the default) "those rows" are ALL the Global lines of a document
+           that has an 'MX Commercial' line, as the 'Comercializadora' column used to do (see below).
     """
 
     HOJA_GALLO      = "Gallo"
     HOJA_VALIDACION = "Validación - Doc."
 
-    VALOR_ASIGNACION       = "MX Commercial"             # filter of steps 5, 8, 8.5 and 9
+    VALOR_ASIGNACION       = "MX Commercial"             # filter of steps 2-4 (class docstring)
     PREFIJOS_LETRAS_GLOBAL = frozenset({"PP", "RG", "SG"})  # letter-only prefixes that are also 'Global'
+
+    # Written into 'Gallo' as LIVE formulas (the stakeholder's template) instead of values: K =LEFT(C,2),
+    # L =XLOOKUP(K, 'Validación - Doc.'!A:A, B:B). The values are ALWAYS computed in Python too (TD and
+    # the other matrices read them); this only decides what the CELLS hold. False → values (smaller file,
+    # faster to write and to open on ~1M rows).
+    REF_COMO_FORMULAS = True
+
+    # 26-oct-2026. The 'Comercializadora' column made a WHOLE document 'MX Commercial' as soon as one of
+    # its lines said so, and the override then turned every Global line of it 'Individual'. 'TD' already
+    # leaves out the lines whose own Asignación is 'MX Commercial', so a row-level override changes
+    # nothing there: the OTHER lines of an MX document (same Nº documento, another Asignación) would
+    # stay in 'TD' and in the 'Notas de crédito' table, where their invoices are not in VBRL (the
+    # 'Factura Monitor' #N/A flood of the 1st run). True → the override is by document (as before);
+    # False → by line only (the literal reading of the 25-oct-2026 request).
+    MX_POR_DOCUMENTO = True
+
+    # 'Validación - Doc.' columns the 'Referencia 3' formula looks at (A: Referencia 2, B: Tipo).
+    VAL_COL_REFERENCIA = "A"
+    VAL_COL_TIPO       = "B"
 
     # Their position in the export is not fixed: resolved by NAME (several spellings accepted).
     COL_FECHA_CANDIDATAS = (
@@ -249,6 +290,7 @@ class EtapaGallo:
         self._update_status = update_status or (lambda _mensaje: None)
         self.con_ref_pago = con_ref_pago
         self.resultado = None
+        self._mascara_reclasificadas = None   # rows step 4 turned 'Individual' (set by `preparar`)
 
     @staticmethod
     def _col(df, nombre, indice, letra):
@@ -290,15 +332,37 @@ class EtapaGallo:
             return "Global"
         return "Individual"
 
+    @staticmethod
+    def referencia2(referencias):
+        """'Referencia 2' of a Series of 'Referencia' values: the first two characters AS THEY ARE, what
+        the template's =LEFT(C2,2) gives in Excel (no trimming). ONE definition for 'Gallo' and for the
+        document list of the FB03 download, so the two can never classify a reference differently.
+        """
+        return referencias.astype(str).str[:2]
+
+    @staticmethod
+    def _letra_columna(df, nombre):
+        """Excel letter of column `nombre` as `to_excel(index=False)` will write it. ValueError if the
+        name is not there exactly once: a formula could not tell which column it means.
+        """
+        posiciones = [i for i, columna in enumerate(df.columns) if columna == nombre]
+        if len(posiciones) != 1:
+            raise ValueError(
+                f"La columna '{nombre}' del Gallo aparece {len(posiciones)} veces; las fórmulas de "
+                f"'Referencia 2' / 'Referencia 3' necesitan que esté exactamente una vez. "
+                f"Columnas: {list(df.columns)}"
+            )
+        return get_column_letter(posiciones[0] + 1)
+
     def preparar(self):
-        """Steps 2-9 + the 'MX Commercial' override + ONE amount-parsing pass. MUTATES `self.gallo`:
-        appends 'Referencia 2', 'Referencia 3' and 'Comercializadora' (K, L, M with the standard A-J
-        layout). The step order is business logic: step 9 snapshots the globals BEFORE the override
-        ("step 8.5") turns them into 'Individual'; do not reorder. Returns (also self.resultado) the
-        real column names, refs_unicas, tipos, catalogo_docs (every 'MX Commercial' row: the lookup
-        of step 8), globales (Centro / Asignación / Nº documento of the Global 'MX Commercial' rows:
-        blocks D-E and G-H), filas_reclasificadas and importe_num (float, same index). ValueError: a
-        missing column or an unreadable amount.
+        """Steps 1-4 of the class docstring + ONE amount-parsing pass. MUTATES `self.gallo`: appends
+        'Referencia 2' and 'Referencia 3' (K, L with the standard A-J layout). Their VALUES are computed
+        here exactly as the template formulas will compute them in Excel (LEFT keeps the characters as
+        they are: no trimming). Returns (also self.resultado) the real column names, their Excel
+        letters, refs_unicas, tipos, catalogo_docs (every 'MX Commercial' row: block D-E of
+        'Validación - Doc.'), globales (Centro / Asignación / Nº documento of the Global 'MX Commercial'
+        rows: block G-H), filas_reclasificadas, importe_num (float, same index) and avisos.
+        ValueError: a missing column or an unreadable amount.
         """
         gallo = self.gallo
         update_status = self._update_status
@@ -320,64 +384,65 @@ class EtapaGallo:
             if self.con_ref_pago else None
         )
 
-        # Step 2: 'Referencia 2' = first 2 characters of 'Referencia' (appended last: column K).
+        # Step 1a: 'Referencia 2' = LEFT(Referencia, 2) — the template's =LEFT(C2,2): the first two
+        # characters AS THEY ARE (no trimming), so the value here and the formula in Excel never differ.
         update_status("🔧 Creando 'Referencia 2'...")
-        gallo["Referencia 2"] = gallo[col_ref].astype(str).str.strip().str[:2]
+        referencia_texto = gallo[col_ref].astype(str)
+        gallo["Referencia 2"] = self.referencia2(referencia_texto)
 
-        # Step 3: unique 'Referencia 2' values, in order of appearance.
-        refs_unicas = list(dict.fromkeys(
-            ref for ref in gallo["Referencia 2"] if str(ref).strip() != ""
-        ))
+        avisos = []
+        con_espacio = referencia_texto.str[:1].str.isspace()
+        n_espacio = int(con_espacio.sum())
+        if n_espacio:
+            ejemplo = repr(str(referencia_texto[con_espacio].iloc[0])[:12])
+            avisos.append(
+                f"Gallo: {n_espacio:,} fila(s) con '{col_ref}' que EMPIEZA con espacio (ej.: "
+                f"{ejemplo}). 'Referencia 2' toma los 2 primeros caracteres tal cual, igual que la "
+                f"fórmula =IZQUIERDA(C2,2) (no recorta espacios): ' PP-1' queda como ' P' "
+                f"('Individual') y '  1' queda en blanco; ' 12-AB' sigue siendo 'Global'."
+            )
 
-        # Step 4: Global / Individual.
+        # Letters of the columns the formulas of `para_escribir` point at (checked NOW, not at write).
+        letra_ref  = self._letra_columna(gallo, col_ref)
+        letra_ref2 = self._letra_columna(gallo, "Referencia 2")
+
+        # Step 1b: unique 'Referencia 2' values, in order of appearance (blank ones are not listed).
+        refs_unicas = [ref for ref in pd.unique(gallo["Referencia 2"]) if str(ref).strip() != ""]
+
+        # Step 1c: Global / Individual, then 'Referencia 3' (Referencia 2 → Tipo) as values.
+        update_status("🔁 Cruzando 'Referencia 3'...")
         tipos = [self.clasificar_tipo(ref) for ref in refs_unicas]
         mapa_tipo = dict(zip(refs_unicas, tipos))
+        gallo["Referencia 3"] = (
+            gallo["Referencia 2"].map(mapa_tipo).fillna("")
+        )
+        letra_ref3 = self._letra_columna(gallo, "Referencia 3")
 
-        # Steps 5-6: catalog of 'MX Commercial' documents.
+        # Step 2: filter Asignación = 'MX Commercial' → every row of the filter (block D-E).
         update_status("🔎 Filtrando 'MX Commercial'...")
         mascara_mx = gallo[col_asig].astype(str).str.strip() == self.VALOR_ASIGNACION
         catalogo_docs = gallo.loc[mascara_mx, [col_asig, col_doc]].copy()
 
-        # Step 7: 'Referencia 3' (Referencia 2 → Tipo), as values.
-        update_status("🔁 Cruzando 'Referencia 3' y 'Comercializadora'...")
-        gallo["Referencia 3"] = (
-            gallo["Referencia 2"].map(mapa_tipo).fillna("")
-        )
+        # Step 3: ONLY AFTER step 2, inside that filter, the rows whose 'Referencia 3' is 'Global'
+        # (block G-H). Their Centro / Asignación / Nº documento are frozen here, BEFORE step 4.
+        update_status("🧮 Copiando los 'Global' de 'MX Commercial'...")
+        mascara_global_mx = mascara_mx & (gallo["Referencia 3"] == "Global")
+        n_global_mx = int(mascara_global_mx.sum())
+        if self.MX_POR_DOCUMENTO:
+            # ...plus the Global lines of the SAME documents (a blank Nº documento is never a match).
+            documentos = gallo[col_doc].astype(str).str.strip()
+            documentos_mx = set(documentos[mascara_mx]) - {""}
+            mascara_global_mx = (
+                (mascara_mx | documentos.isin(documentos_mx)) & (gallo["Referencia 3"] == "Global"))
+        globales = gallo.loc[mascara_global_mx, [col_centro, col_asig, col_doc]].copy()
 
-        # Step 8: 'Comercializadora' (Nº documento → Asignación), first match like XLOOKUP: the WHOLE
-        # document is 'MX Commercial' as soon as one of its lines says so. A blank Nº documento is never
-        # looked up (it would paint every blank-document row), and a row whose OWN Asignación is
-        # 'MX Commercial' always gets it, whatever its document says (rule of 24-oct-2026: wherever
-        # Asignación has it, Comercializadora has it too).
-        mapa_comercializadora = {}
-        for doc, asig in zip(
-            catalogo_docs[col_doc].astype(str).str.strip(),
-            catalogo_docs[col_asig].astype(str).str.strip(),
-        ):
-            if doc:
-                mapa_comercializadora.setdefault(doc, asig)
-
-        gallo["Comercializadora"] = (
-            gallo[col_doc].astype(str).str.strip().map(mapa_comercializadora).fillna("")
-        )
-        gallo.loc[mascara_mx, "Comercializadora"] = self.VALOR_ASIGNACION
-
-        # Step 9: final filter (Comercializadora == 'MX Commercial' AND Referencia 3 == 'Global') →
-        # their Asignación / Nº documento (D-E of 'Validación - Doc.') and Centro / Nº documento
-        # (G-H), frozen BEFORE the override below on purpose: they keep the rows it turns Individual.
-        update_status("🧮 Aplicando filtro final (Global + MX Commercial)...")
-        mascara_final = (
-            (gallo["Comercializadora"] == self.VALOR_ASIGNACION)
-            & (gallo["Referencia 3"] == "Global")
-        )
-        globales = gallo.loc[mascara_final, [col_centro, col_asig, col_doc]].copy()
-
-        # 'MX Commercial' override ("step 8.5", AFTER step 9, rule of 24-oct-2026): EVERY row copied
-        # above is settled individually → 'Individual' in 'Referencia 3' (and so out of 'TD'), whatever
-        # its Referencia 2 (SG, RG, PP, a digit...). The SAME mask: what is copied is what changes.
+        # Step 4: once copied, THOSE SAME rows change 'Global' → 'Individual' in 'Gallo' (and so leave
+        # 'TD'), whatever their Referencia 2 (SG, RG, PP, a digit...). The same mask: what is copied
+        # is what changes.
         update_status("🏷️ Reclasificando 'MX Commercial' de 'Global' a 'Individual'...")
-        filas_reclasificadas = int(mascara_final.sum())
-        gallo.loc[mascara_final, "Referencia 3"] = "Individual"
+        filas_reclasificadas = int(mascara_global_mx.sum())
+        gallo.loc[mascara_global_mx, "Referencia 3"] = "Individual"
+        self._mascara_reclasificadas = mascara_global_mx
 
         # ONE amount-parsing pass for every matrix: faster (~1.15M rows for 3 days), and 'TD' and
         # 'TD.Diferencias_Referencias' see exactly the same numbers.
@@ -385,31 +450,84 @@ class EtapaGallo:
         importe_num = gallo[col_importe].map(
             partial(Comun.parse_importe_us, columna=col_importe))
 
+        n_extra = filas_reclasificadas - n_global_mx
+        if n_extra:
+            avisos.append(
+                f"Gallo: {n_extra:,} fila(s) Global de documentos con alguna línea '{self.VALOR_ASIGNACION}' "
+                f"(importe {round(float(importe_num[mascara_global_mx & ~mascara_mx].sum()), 2):,.2f}) "
+                f"también pasaron a 'Individual' (el documento completo se trata como "
+                f"'{self.VALOR_ASIGNACION}'); aparecen en 'Validación - Doc.' G:H con las demás."
+            )
+
         self.resultado = {
             "col_centro":           col_centro,
+            "col_ref":              col_ref,
             "col_asig":             col_asig,
             "col_doc":              col_doc,
             "col_clase":            col_clase,
             "col_fecha":            col_fecha,
             "col_cuenta":           col_cuenta,
             "col_ref_pago":         col_ref_pago,
+            "letra_ref":            letra_ref,
+            "letra_ref2":           letra_ref2,
+            "letra_ref3":           letra_ref3,
             "refs_unicas":          refs_unicas,
             "tipos":                tipos,
             "catalogo_docs":        catalogo_docs,
             "globales":             globales,
             "filas_reclasificadas": filas_reclasificadas,
             "importe_num":          importe_num,
+            "avisos":               avisos,
         }
         return self.resultado
 
+    def para_escribir(self):
+        """The DataFrame to write as 'Gallo'. With REF_COMO_FORMULAS, K and L hold the template's LIVE
+        formulas (row r of the sheet = row r-2 of the frame):
+            K  =LEFT(C2,2)
+            L  =XLOOKUP(K2,'Validación - Doc.'!A:A,'Validación - Doc.'!B:B,"")
+        The rows step 4 turned 'Individual' keep that VALUE in L: it is what was done to them, not a
+        lookup. The `""` closes the only gap between formula and Python: a blank 'Referencia 2' is not
+        listed in 'Validación - Doc.' and its 'Referencia 3' is "" here, so Excel must not show #N/A.
+        Without the flag (or before `preparar`'s results exist) it returns the working frame. The
+        working frame itself is never touched: TD and the matrices read its VALUES.
+        """
+        if self.resultado is None:
+            raise RuntimeError("EtapaGallo.para_escribir requiere llamar antes a preparar().")
+        if not self.REF_COMO_FORMULAS:
+            return self.gallo
+
+        pasos = self.resultado
+        gallo = self.gallo
+        n = len(gallo)
+        hoja = Comun.ref_hoja(self.HOJA_VALIDACION)
+        col_a, col_b = self.VAL_COL_REFERENCIA, self.VAL_COL_TIPO
+        letra_ref, letra_ref2 = pasos["letra_ref"], pasos["letra_ref2"]
+
+        f_ref2 = pd.Series(
+            [f"=LEFT({letra_ref}{fila},2)" for fila in range(2, n + 2)],
+            index=gallo.index, dtype=object)
+        f_ref3 = pd.Series(
+            [f"=_xlfn.XLOOKUP({letra_ref2}{fila},{hoja}!{col_a}:{col_a},{hoja}!{col_b}:{col_b},\"\")"
+             for fila in range(2, n + 2)],
+            index=gallo.index, dtype=object)
+        f_ref3 = f_ref3.mask(self._mascara_reclasificadas, "Individual")
+
+        salida = gallo.copy(deep=False)
+        salida["Referencia 2"] = f_ref2
+        salida["Referencia 3"] = f_ref3
+        return salida
+
     def escribir_validacion(self, ws):
-        """'Validación - Doc.': three blocks side by side — A-B references and their type (steps 3-4),
-        D-E Asignación and Nº documento of the Global 'MX Commercial' rows (the ones the override
-        turns Individual), G-H Centro and Nº documento of those same rows (step 9).
+        """'Validación - Doc.': three blocks side by side — A-B every 'Referencia 2' and its type (the
+        lookup table of 'Referencia 3'), D-E Asignación and Nº documento of ALL the 'MX Commercial'
+        rows (audit control: what the filter showed), G-H Centro and Nº documento of those whose
+        'Referencia 3' was 'Global' (copied before they turn 'Individual').
         """
         pasos         = self.resultado
         refs_unicas   = pasos["refs_unicas"]
         tipos         = pasos["tipos"]
+        catalogo_docs = pasos["catalogo_docs"]
         globales      = pasos["globales"]
         col_asig      = pasos["col_asig"]
         col_doc       = pasos["col_doc"]
@@ -424,12 +542,20 @@ class EtapaGallo:
             ws[celda] = texto
             ws[celda].font = Font(bold=True)
 
+        for celda, texto in (
+            ("D1", f"Filtro {col_asig} = '{self.VALOR_ASIGNACION}' sobre la hoja {self.HOJA_GALLO}: se "
+                   f"copian TODOS los renglones del filtro (control para auditoría)."),
+            ("G1", f"Sólo los renglones de D:E cuya 'Referencia 3' era 'Global'. Se copian ANTES de "
+                   f"pasarlos a 'Individual' en la hoja {self.HOJA_GALLO}."),
+        ):
+            Comun.comentar(ws[celda], texto, ancho=320, alto=90)
+
         for fila, (ref, tipo) in enumerate(zip(refs_unicas, tipos), start=2):
             ws.cell(row=fila, column=1, value=ref)
             ws.cell(row=fila, column=2, value=tipo)
 
         for fila, (asig, doc) in enumerate(
-            zip(globales[col_asig], globales[col_doc]), start=2
+            zip(catalogo_docs[col_asig], catalogo_docs[col_doc]), start=2
         ):
             ws.cell(row=fila, column=4, value=asig)
             ws.cell(row=fila, column=5, value=doc)
@@ -461,17 +587,26 @@ class EtapaTD:
     FILA_FILTROS    = 1
     FILA_ENCABEZADO = 5
     FILA_INICIO     = 6
+    # Referencia 2 of the PEP vouchers: the PEP block takes only it, the NOTAS block leaves it out.
+    PEP_REFERENCIA2 = "PP"
     # 'clases' = (document class, 1-based column of its header/sum); one Grand Total column per block.
+    # 'excluir_ref2' = a 'Referencia 2' the block leaves out (None: nothing is left out).
+    # 'tabla' = displayName of the Excel Table that gives the block its filter buttons (created by
+    # EtapaCruceTDMTD, which knows the whole width of the block: the table spans the cross columns too).
     FACTURAS = {
         "titulo": "FACTURAS",
+        "tabla": "TblTDFacturas",
         "col_cedis": 1,                      # A
         "clases": [("C1", 2), ("C5", 3)],    # B / C
+        "excluir_ref2": None,
         "col_grand_total": 4,                # D
     }
     NOTAS = {
         "titulo": "NOTAS DE CRÉDITO",
+        "tabla": "TblTDNotas",
         "col_cedis": 12,                     # L
         "clases": [("C2", 13), ("C6", 14)],  # M / N
+        "excluir_ref2": PEP_REFERENCIA2,     # the 'PP' rows are the PEP VOUCHERS block's
         "col_grand_total": 15,               # O
     }
     # Analysis labels for the stakeholder in the Grand Total column, rows 1-3 (labels only).
@@ -482,11 +617,11 @@ class EtapaTD:
     # 'Individual' (EtapaGallo override), so they cannot be Global here.
     PEP = {
         "titulo": "PEP VOUCHERS",
+        "tabla": "TblTDPEP",
         "col_cedis": 23,           # W
         "col_valor": 24,           # X
         "encabezado_valor": "C2",  # class of the filter (goes in X5)
     }
-    PEP_REFERENCIA2 = "PP"
     PEP_CLASE = "C2"
 
     def __init__(self, gallo, pasos_gallo):
@@ -504,7 +639,7 @@ class EtapaTD:
         """Aggregate the three 'TD' blocks. Each derives its OWN cedis list from its OWN filters, so
         the blocks may list different centros (no range clipping):
             Facturas  Referencia 3 == 'Global', Asignación != 'MX Commercial', Clase in {C1, C5}
-            Notas     the same base, Clase in {C2, C6}
+            Notas     the same base, Clase in {C2, C6}, Referencia 2 ≠ 'PP' (those are PEP's)
             PEP       Referencia 3 == 'Global', Referencia 2 == 'PP', Clase == 'C2' ('MX Commercial' rows
                       are already 'Individual' by then)
         All three need a non-blank Centro: rows without one are counted and reported in 'avisos'
@@ -552,8 +687,8 @@ class EtapaTD:
             return {"cedis": cedis,
                     "suma": {k: round(float(v), 2) for k, v in serie.items()}}
 
-        facturas = _bloque(base, self.FACTURAS["clases"])
-        notas    = _bloque(base, self.NOTAS["clases"])
+        facturas = _bloque(self._con_exclusion(base, self.FACTURAS, ref2_norm), self.FACTURAS["clases"])
+        notas    = _bloque(self._con_exclusion(base, self.NOTAS, ref2_norm), self.NOTAS["clases"])
 
         filtro_pep = (
             es_global
@@ -577,8 +712,10 @@ class EtapaTD:
         clases_notas    = {clase for clase, _ in self.NOTAS["clases"]}
         avisos = []
         for titulo, mascara in (
-            (self.FACTURAS["titulo"], base_sin_centro & clase_norm.isin(clases_facturas)),
-            (self.NOTAS["titulo"],    base_sin_centro & clase_norm.isin(clases_notas)),
+            (self.FACTURAS["titulo"], self._con_exclusion(base_sin_centro, self.FACTURAS, ref2_norm)
+                                      & clase_norm.isin(clases_facturas)),
+            (self.NOTAS["titulo"],    self._con_exclusion(base_sin_centro, self.NOTAS, ref2_norm)
+                                      & clase_norm.isin(clases_notas)),
             (self.PEP["titulo"],      filtro_pep & ~con_centro),
         ):
             n_filas = int(mascara.sum())
@@ -608,14 +745,24 @@ class EtapaTD:
         }
         return self.resultado
 
-    def mascara_bloque(self, clases):
+    @staticmethod
+    def _con_exclusion(mascara, bloque, ref2_norm):
+        """`mascara` without the rows whose 'Referencia 2' the block leaves out (`excluir_ref2`)."""
+        excluir = bloque.get("excluir_ref2")
+        if excluir is None:
+            return mascara
+        return mascara & (ref2_norm != str(excluir).strip().upper())
+
+    def mascara_bloque(self, clases, excluir_ref2=None):
         """Mask of the Gallo rows of a two-class block — the SAME rows `preparar` summed (Global, not
-        MX Commercial, non-blank Centro, Clase in `clases`). Call it after `preparar`;
-        EtapaTDReferencias builds the micro table from it.
+        MX Commercial, non-blank Centro, Clase in `clases`, and without `excluir_ref2` when given: pass
+        the block's own `bloque["excluir_ref2"]`). Call it after `preparar`; EtapaTDReferencias builds
+        the micro table from it.
         """
         if self._base is None:
             raise RuntimeError("EtapaTD.mascara_bloque requiere llamar antes a preparar().")
-        return self._base & self.clase_norm.isin({clase for clase, _ in clases})
+        mascara = self._base & self.clase_norm.isin({clase for clase, _ in clases})
+        return self._con_exclusion(mascara, {"excluir_ref2": excluir_ref2}, self.ref2_norm)
 
     def mascara_pep(self):
         """Mask of the Gallo rows of the PEP block — the SAME rows `preparar` summed (Global, Referencia
@@ -631,9 +778,11 @@ class EtapaTD:
         is summed. 'Referencia 3' is not resolved: EtapaGallo creates it with exactly that name.
         """
         clases = " o ".join(f"'{clase}'" for clase, _ in bloque["clases"])
+        excluir = bloque.get("excluir_ref2")
+        ref2 = f"; Referencia 2 ≠ '{excluir}'" if excluir is not None else ""
         return [
             f"Filtros — hoja '{EtapaGallo.HOJA_GALLO}':",
-            f"Referencia 3 = 'Global'; {columnas['centro']} no vacío",
+            f"Referencia 3 = 'Global'{ref2}; {columnas['centro']} no vacío",
             f"{columnas['asignacion']} ≠ '{EtapaGallo.VALOR_ASIGNACION}'; "
             f"{columnas['clase']} = {clases}",
         ]
@@ -651,12 +800,24 @@ class EtapaTD:
             f"('{EtapaGallo.VALOR_ASIGNACION}' ya pasó a 'Individual')",
         ]
 
+    @staticmethod
+    def formula_total(col, primera, ultima):
+        """The 'Grand Total' cell of column `col` (1-based) over rows `primera`..`ultima`: SUBTOTAL(9)
+        skips the rows a filter hides (and text such as 'Sin timbre'), like a PivotTable's Grand Total
+        follows its filters; ROUND(…,2) keeps float noise (-265.44000000000005) out of any comparison
+        made with it. e.g. =ROUND(SUBTOTAL(9,B6:B289),2)
+        """
+        letra = get_column_letter(col)
+        return f"=ROUND(SUBTOTAL(9,{letra}{primera}:{letra}{ultima}),2)"
+
     def escribir(self, ws_td):
         """Write the three blocks on 'TD': rows 1-3 legend + analysis labels, 4 title, 5 headers, 6+
         data, then a 'Grand Total' row (each block computes its own position: row counts differ).
-        Values, not formulas, with a thousands/2-decimals format. The TD × MTD cross (E:G, P:R, Y:AA)
-        is written afterwards by EtapaCruceTDMTD, which looks the bottom label up in 'MTD': it MUST
-        stay Comun.ETIQUETA_GRAND_TOTAL.
+        The centro rows are values (the PivotTable part); the 'Grand Total' row is SUBTOTAL formulas
+        (`formula_total`), so it follows the filters of the block's Table like a PivotTable's does.
+        Thousands/2-decimals format. The TD × MTD cross (E:G, P:R, Y:AA) and the Tables are written
+        afterwards by EtapaCruceTDMTD; the bottom label MUST stay Comun.ETIQUETA_GRAND_TOTAL (the
+        stakeholder's lookups find the row by it).
         """
         td_resumen = self.resultado
         fila_inicio = self.FILA_INICIO
@@ -686,7 +847,6 @@ class EtapaTD:
                 ws_td.cell(row=fila_encabezado, column=col_idx, value=clase).font = Font(bold=True)
             ws_td.cell(row=fila_encabezado, column=col_gt, value="Grand Total").font = Font(bold=True)
 
-            totales_clase = {clase: 0.0 for clase, _ in clases}
             for i, centro in enumerate(cedis):
                 fila = fila_inicio + i
                 ws_td.cell(row=fila, column=col_cedis, value=centro)
@@ -694,24 +854,19 @@ class EtapaTD:
                 for clase, col_idx in clases:
                     valor = round(suma.get((centro, clase), 0.0), 2)
                     ws_td.cell(row=fila, column=col_idx, value=valor).number_format = Comun.FORMATO_NUMERO
-                    totales_clase[clase] += valor
                     suma_fila += valor
                 ws_td.cell(row=fila, column=col_gt,
                            value=round(suma_fila, 2)).number_format = Comun.FORMATO_NUMERO
 
             if n_cedis > 0:
+                ultima = fila_total - 1
                 ws_td.cell(row=fila_total, column=col_cedis,
                            value=Comun.ETIQUETA_GRAND_TOTAL).font = Font(bold=True)
-                suma_total = 0.0
-                for clase, col_idx in clases:
-                    tot = round(totales_clase[clase], 2)
-                    celda = ws_td.cell(row=fila_total, column=col_idx, value=tot)
+                for col_idx in [col for _, col in clases] + [col_gt]:
+                    celda = ws_td.cell(row=fila_total, column=col_idx,
+                                       value=self.formula_total(col_idx, fila_inicio, ultima))
                     celda.number_format = Comun.FORMATO_NUMERO
                     celda.font = Font(bold=True)
-                    suma_total += tot
-                celda_gt = ws_td.cell(row=fila_total, column=col_gt, value=round(suma_total, 2))
-                celda_gt.number_format = Comun.FORMATO_NUMERO
-                celda_gt.font = Font(bold=True)
 
         # --- PEP vouchers (its own cedis, one value column) ---
         cedis_pep      = td_resumen["pep"]["cedis"]
@@ -727,17 +882,17 @@ class EtapaTD:
         ws_td.cell(row=fila_encabezado, column=col_valor_pep,
                    value=self.PEP["encabezado_valor"]).font = Font(bold=True)
 
-        total_pep = 0.0
         for i, centro in enumerate(cedis_pep):
             fila = fila_inicio + i
             ws_td.cell(row=fila, column=col_cedis_pep, value=centro)
             valor = round(suma_pep.get(centro, 0.0), 2)
             ws_td.cell(row=fila, column=col_valor_pep, value=valor).number_format = Comun.FORMATO_NUMERO
-            total_pep += valor
         if cedis_pep:
             ws_td.cell(row=fila_total_pep, column=col_cedis_pep,
                        value=Comun.ETIQUETA_GRAND_TOTAL).font = Font(bold=True)
-            celda_pep = ws_td.cell(row=fila_total_pep, column=col_valor_pep, value=round(total_pep, 2))
+            celda_pep = ws_td.cell(
+                row=fila_total_pep, column=col_valor_pep,
+                value=self.formula_total(col_valor_pep, fila_inicio, fila_total_pep - 1))
             celda_pep.number_format = Comun.FORMATO_NUMERO
             celda_pep.font = Font(bold=True)
 
@@ -752,8 +907,9 @@ class EtapaTD:
 class EtapaDocumentosFB03:
     """The documents the FB03 download pastes into SAP, from the GALLO of the same run: 'Nº documento'
     of the rows with Clase de documento in {C2, C6} (the 'Notas de Crédito' classes of 'TD') AND a
-    Global 'Referencia' (step 4: it starts with a digit, or with PP / RG / SG). It reuses
-    EtapaGallo's pieces and EtapaTD.NOTAS, so it cannot drift from the consolidation.
+    Global 'Referencia' (step 4: it starts with a digit, or with PP / RG / SG). The 'PP' rows STAY on
+    purpose: the PEP Vouchers table of 'TD.Diferencias_Referencias' reads its references from FB too.
+    It reuses EtapaGallo's pieces and EtapaTD.NOTAS, so it cannot drift from the consolidation.
     Deliberately NOT applied (only those two filters were asked for): the 'MX Commercial'
     exclusion, the non-blank Centro and the 'MX Commercial' override — an extra document in FB03 does no
     harm, a missing one would.
@@ -788,8 +944,8 @@ class EtapaDocumentosFB03:
         col_ref, col_doc, col_clase = columnas or EtapaDocumentosFB03.columnas(gallo)
 
         clase = gallo[col_clase].astype(str).str.strip().str.upper()
-        # Steps 2-4 of EtapaGallo; a blank 'Referencia 2' is never Global.
-        referencia2 = gallo[col_ref].astype(str).str.strip().str[:2]
+        # Step 1 of EtapaGallo (the very same definition); a blank 'Referencia 2' is never Global.
+        referencia2 = EtapaGallo.referencia2(gallo[col_ref])
         tipos = {
             ref: EtapaGallo.clasificar_tipo(ref)
             for ref in referencia2.unique() if str(ref).strip() != ""
@@ -842,6 +998,9 @@ class EtapaVentas:
     ORIGEN = ""
     LEYENDA_ORIGEN = ""
     # Accounts are compared NORMALIZED: '4000010', '0004000010' and '4000010.0' are the same.
+
+    # Rows an Excel sheet holds (header included).
+    MAX_FILAS_EXCEL = 1_048_576
 
     ENCABEZADO_FECHA   = "Fecha"
     ETIQUETA_SIN_FECHA = "Sin fecha"
@@ -1555,15 +1714,17 @@ class EtapaMonivoi:
 
 # === Stage: cross 'TD' × 'MTD' — live formulas on the 'TD' sheet ===
 class EtapaCruceTDMTD:
-    """The TD × MTD cross: LIVE Excel formulas on 'TD' (Factura Monitor / Diferencia / Observación)
-    and the warnings they cannot show. It reads the layouts of EtapaTD and EtapaMonivoi, so a layout
-    change keeps working as long as it is made in those constants.
+    """The TD × MTD cross: LIVE Excel formulas on 'TD' (Factura Monitor / Diferencia / Observación),
+    the Excel Table (filter buttons) of each block, and the warnings the formulas cannot show. It reads
+    the layouts of EtapaTD and EtapaMonivoi, so a layout change keeps working as long as it is made in
+    those constants.
     """
 
     # Three columns right of each TD block, with LIVE formulas (auditable, draggable):
     #     Facturas (A..D) ↔ MTD SG (A/B) → E, F, G;  Notas (L..O) ↔ RG (D/E) → P, Q, R;
     #     PEP (W..X) ↔ PP (K/L) → Y, Z, AA.
-    # Also in the 'Grand Total' row: there XLOOKUP finds MTD's Grand Total (same label).
+    # The 'Grand Total' row is different: E and F are SUBTOTALs of the rows above (so they follow the
+    # filters of the block's Table, as the stakeholder's template does) and G judges that total.
     ENCABEZADO_MONITOR     = "Factura Monitor"
     ENCABEZADO_DIFERENCIA  = "Diferencia"
     ENCABEZADO_OBSERVACION = "Observación"
@@ -1581,6 +1742,7 @@ class EtapaCruceTDMTD:
             # negative, so a perfect match gives zero.
             "etiqueta":        "Facturas ↔ SG",
             "td_clave":        "facturas",
+            "tabla":           EtapaTD.FACTURAS["tabla"],
             "col_cedis":       EtapaTD.FACTURAS["col_cedis"],        # A
             "col_contab":      EtapaTD.FACTURAS["col_grand_total"],  # D
             "col_monitor":     5,                                    # E
@@ -1593,6 +1755,7 @@ class EtapaCruceTDMTD:
         {   # Notas de Crédito ↔ RG. Diferencia = O - P.
             "etiqueta":        "Notas de Crédito ↔ RG",
             "td_clave":        "notas",
+            "tabla":           EtapaTD.NOTAS["tabla"],
             "col_cedis":       EtapaTD.NOTAS["col_cedis"],           # L
             "col_contab":      EtapaTD.NOTAS["col_grand_total"],     # O
             "col_monitor":     16,                                   # P
@@ -1605,6 +1768,7 @@ class EtapaCruceTDMTD:
         {   # PEP vouchers ↔ PP. Diferencia = X - Y.
             "etiqueta":        "PEP vouchers ↔ PP",
             "td_clave":        "pep",
+            "tabla":           EtapaTD.PEP["tabla"],
             "col_cedis":       EtapaTD.PEP["col_cedis"],             # W
             "col_contab":      EtapaTD.PEP["col_valor"],             # X
             "col_monitor":     25,                                   # Y
@@ -1623,10 +1787,14 @@ class EtapaCruceTDMTD:
     @staticmethod
     def formulas(cruce, fila):
         """The three formulas of ONE row (Factura Monitor, Diferencia, Observación); Facturas, row 6:
-            E6 =IFERROR(XLOOKUP(A6,MTD!A:A,MTD!B:B),"Sin timbre")
+            E6 =XLOOKUP(A6,MTD!A:A,MTD!B:B,"Sin timbre")
             F6 =IFERROR(D6+E6,"Sin timbre")
             G6 =IF(F6="Sin timbre","Sin timbre",IF(ROUND(F6,2)<-0.01,"","Sin diferencia"))
-        XLOOKUP is written `_xlfn.XLOOKUP` (newer than Excel 2007: without it Excel shows #NAME?).
+        The stakeholder's template wraps E in IFERROR(…); XLOOKUP's own 4th argument gives the same
+        text with one function less. XLOOKUP is written `_xlfn.XLOOKUP` (newer than Excel 2007:
+        without it Excel shows #NAME?). G puts "Sin timbre" FIRST on purpose: in Excel any text is
+        greater than any number, so the template's order (`F>0.01` first) would leave the
+        credit-note and PEP rows without a stamp blank instead of "Sin timbre".
         """
         if cruce["operador"] not in ("+", "-"):
             raise ValueError(
@@ -1656,8 +1824,8 @@ class EtapaCruceTDMTD:
                   else EtapaCruceTDMTD.TOLERANCIA)
 
         f_monitor = (
-            f"=IFERROR(_xlfn.XLOOKUP({cedis},{hoja_mtd}!{col_centro}:{col_centro},"
-            f"{hoja_mtd}!{col_valor}:{col_valor}),{sin_timbre})"
+            f"=_xlfn.XLOOKUP({cedis},{hoja_mtd}!{col_centro}:{col_centro},"
+            f"{hoja_mtd}!{col_valor}:{col_valor},{sin_timbre})"
         )
         f_diferencia = f"=IFERROR({contab}{cruce['operador']}{monitor},{sin_timbre})"
         f_observacion = (
@@ -1666,12 +1834,27 @@ class EtapaCruceTDMTD:
         )
         return f_monitor, f_diferencia, f_observacion
 
+    @classmethod
+    def formulas_total(cls, cruce, fila_total, primera, ultima):
+        """The three cells of the 'Grand Total' row: Factura Monitor and Diferencia are SUBTOTALs of the
+        rows above (`EtapaTD.formula_total`: they follow the filters of the block's Table and skip
+        'Sin timbre'), Observación judges that Diferencia with the same formula as every row.
+        """
+        f_monitor = EtapaTD.formula_total(cruce["col_monitor"], primera, ultima)
+        f_diferencia = EtapaTD.formula_total(cruce["col_diferencia"], primera, ultima)
+        _, _, f_observacion = cls.formulas(cruce, fila_total)
+        return f_monitor, f_diferencia, f_observacion
+
     def escribir(self, ws_td):
-        """Write the cross on 'TD': three columns per block (see CRUCES), the header in row 5 and a
-        formula in every centro row PLUS the 'Grand Total' row (none when the block has no centros).
+        """Write the cross on 'TD': three columns per block (see CRUCES), the header in row 5, a formula
+        in every centro row, the SUBTOTAL 'Grand Total' row (none when the block has no centros), and
+        an Excel Table per block over its whole width (centro … Observación) so each one has filter
+        buttons like 'TD.Diferencias_Referencias' (a sheet takes only ONE plain AutoFilter, three
+        Tables can live side by side). Panes frozen under the headers.
         """
         td_resumen = self.td_resumen
         negrita = Font(bold=True)
+        letra = get_column_letter
         for cruce in self.CRUCES:
             columnas = (
                 (cruce["col_monitor"],     self.ENCABEZADO_MONITOR),
@@ -1680,32 +1863,68 @@ class EtapaCruceTDMTD:
             )
             for col, encabezado in columnas:
                 ws_td.cell(row=EtapaTD.FILA_ENCABEZADO, column=col, value=encabezado).font = negrita
-                ws_td.column_dimensions[get_column_letter(col)].width = max(16, len(encabezado) + 3)
+                ws_td.column_dimensions[letra(col)].width = max(16, len(encabezado) + 3)
 
             n_cedis = len(td_resumen[cruce["td_clave"]]["cedis"])
             if n_cedis == 0:
                 continue
-            fila_total = EtapaTD.FILA_INICIO + n_cedis   # same formula as EtapaTD.escribir
+            primera    = EtapaTD.FILA_INICIO
+            fila_total = primera + n_cedis   # same formula as EtapaTD.escribir
+            ultima     = fila_total - 1
 
-            for fila in range(EtapaTD.FILA_INICIO, fila_total + 1):
+            for fila in range(primera, ultima + 1):
                 f_monitor, f_diferencia, f_observacion = self.formulas(cruce, fila)
-                celda_monitor = ws_td.cell(row=fila, column=cruce["col_monitor"], value=f_monitor)
-                celda_dif     = ws_td.cell(row=fila, column=cruce["col_diferencia"], value=f_diferencia)
-                celda_obs     = ws_td.cell(row=fila, column=cruce["col_observacion"], value=f_observacion)
-                celda_monitor.number_format = Comun.FORMATO_NUMERO
-                celda_dif.number_format     = Comun.FORMATO_NUMERO
-                if fila == fila_total:
-                    for celda in (celda_monitor, celda_dif, celda_obs):
-                        celda.font = negrita
+                ws_td.cell(row=fila, column=cruce["col_monitor"],
+                           value=f_monitor).number_format = Comun.FORMATO_NUMERO
+                ws_td.cell(row=fila, column=cruce["col_diferencia"],
+                           value=f_diferencia).number_format = Comun.FORMATO_NUMERO
+                ws_td.cell(row=fila, column=cruce["col_observacion"], value=f_observacion)
+
+            f_monitor, f_diferencia, f_observacion = self.formulas_total(
+                cruce, fila_total, primera, ultima)
+            celda_monitor = ws_td.cell(row=fila_total, column=cruce["col_monitor"], value=f_monitor)
+            celda_dif     = ws_td.cell(row=fila_total, column=cruce["col_diferencia"], value=f_diferencia)
+            celda_obs     = ws_td.cell(row=fila_total, column=cruce["col_observacion"], value=f_observacion)
+            celda_monitor.number_format = Comun.FORMATO_NUMERO
+            celda_dif.number_format     = Comun.FORMATO_NUMERO
+            for celda in (celda_monitor, celda_dif, celda_obs):
+                celda.font = negrita
+
+            tabla = Table(
+                displayName=cruce["tabla"],
+                ref=(f"{letra(cruce['col_cedis'])}{EtapaTD.FILA_ENCABEZADO}:"
+                     f"{letra(cruce['col_observacion'])}{ultima}"),
+            )
+            tabla.tableStyleInfo = TableStyleInfo(
+                name=None, showFirstColumn=False, showLastColumn=False,
+                showRowStripes=False, showColumnStripes=False)
+            ws_td.add_table(tabla)
+
+            Comun.comentar(
+                ws_td.cell(row=4, column=cruce["col_cedis"]),
+                "Cada bloque tiene su propio filtro, pero un filtro oculta RENGLONES COMPLETOS de la "
+                "hoja: al filtrar un bloque también se ocultan los renglones de los demás que quedan "
+                "en esas mismas filas. Quita el filtro antes de revisar otro bloque.",
+            )
+            Comun.comentar(
+                ws_td.cell(row=EtapaTD.FILA_ENCABEZADO, column=cruce["col_monitor"]),
+                f"Fórmula en cada renglón: busca el Centro en {EtapaMonivoi.HOJA_MTD} y regresa su "
+                f"importe; sin coincidencia: '{self.TEXTO_SIN_TIMBRE}'. El 'Grand Total' de esta "
+                f"columna y de Diferencia es un SUBTOTAL: suma sólo los renglones visibles (sigue "
+                f"los filtros) y no cuenta los '{self.TEXTO_SIN_TIMBRE}'.",
+            )
+
+        ws_td.freeze_panes = f"A{EtapaTD.FILA_INICIO}"
 
     def avisos(self):
-        """Warnings the formulas cannot show: centros the monitor stamped that have no TD row (they only
-        weigh in the Grand Total), and centros that differ only in case (XLOOKUP ignores case and keeps
+        """Warnings the formulas cannot show: centros the monitor stamped that have no TD row (their
+        amount is in MTD's Grand Total but not in TD's), and centros that differ only in case (XLOOKUP ignores case and keeps
         the first match). Returns list[str].
         """
         td_resumen = self.td_resumen
         mtd = self.mtd
         avisos = []
+        encabezado_monitor = self.ENCABEZADO_MONITOR
         for cruce in self.CRUCES:
             etiqueta    = f"Cruce TD ({cruce['etiqueta']})"
             cedis_td    = td_resumen[cruce["td_clave"]]["cedis"]
@@ -1724,8 +1943,9 @@ class EtapaCruceTDMTD:
                 if cedis_td:
                     avisos.append(
                         f"{etiqueta}: {len(sin_renglon):,} centro(s) del monitor sin "
-                        f"renglón en TD ({listado}); su importe sólo pesa en el "
-                        f"'{Comun.ETIQUETA_GRAND_TOTAL}'."
+                        f"renglón en TD ({listado}); su importe NO entra en el "
+                        f"'{Comun.ETIQUETA_GRAND_TOTAL}' de '{encabezado_monitor}' en TD (sí en el de "
+                        f"{EtapaMonivoi.HOJA_MTD}): de ahí sale la diferencia entre ambos totales."
                     )
                 else:
                     avisos.append(
@@ -1948,7 +2168,7 @@ class EtapaTDReferencias:
     # Excel's hard limit of rows per sheet.
     MAX_FILAS_EXCEL = 1_048_576
 
-    AUTOR_COMENTARIOS = "Validación Factura Global"
+    AUTOR_COMENTARIOS = Comun.AUTOR_COMENTARIOS
 
     def __init__(self, gallo, pasos_gallo, etapa_td, etapa_vbrl):
         """`pasos_gallo` must come from EtapaGallo(con_ref_pago=True); `etapa_td` and `etapa_vbrl` must
@@ -2399,14 +2619,16 @@ class EtapaTDNotasPEP:
         Centro | Nº documento | Importe | Referencia de pago | Factura Monitor | Diferencia
     The first three are values (the PivotTable part: Centro × Nº documento); the last three are LIVE
     formulas copied VERBATIM from that workbook (only the column letters move with the block):
-        Referencia de pago  =+XLOOKUP(VALUE(<doc>),FB!C:C,FB!D:D)
+        Referencia de pago  =+XLOOKUP(<doc>,FB!C:C,FB!D:D)   (since 26-oct-2026, in both blocks:
+                                                              no VALUE(), the Nº documento is written
+                                                              as a NUMBER, like FB!C:C holds it)
         Factura Monitor     =+XLOOKUP(<ref>,VBRL!D:D,VBRL!E:E)
         Diferencia          =<importe>-<monitor>
     There is NO IFERROR, as in the reference: a document that is not in FB, or a reference that is
     not in VBRL, shows #N/A (the warnings count them). Each block is an Excel Table (a sheet takes
     only one plain AutoFilter, and Facturas already has it).
-        Notas de crédito (H:M)  Referencia 3 = 'Global', Referencia 2 ≠ 'PP', Clase C2 / C6 — the
-                                rows of 'TD' NOTAS DE CRÉDITO without its 'PP' ones
+        Notas de crédito (H:M)  Referencia 3 = 'Global', Referencia 2 ≠ 'PP', Clase C2 / C6 — exactly
+                                the rows of 'TD' NOTAS DE CRÉDITO (which excludes 'PP' itself)
         PEP Vouchers (O:T)      Referencia 3 = 'Global', Referencia 2 = 'PP', Clase C2 — the rows of
                                 'TD' PEP VOUCHERS
     Both take their rows from EtapaTD, so their totals tie to the 'TD' blocks.
@@ -2425,10 +2647,13 @@ class EtapaTDNotasPEP:
     ENCABEZADO_MONITOR    = EtapaTDReferencias.ENCABEZADO_MONITOR
     ENCABEZADO_DIFERENCIA = EtapaTDReferencias.ENCABEZADO_DIFERENCIA
 
+    # 'con_value' = the 'Referencia de pago' formula wraps the document in VALUE() (the document is then
+    # written as TEXT); without it the document is written as a NUMBER, the way FB!C:C holds it.
+    # Neither block uses it since 26-oct-2026 (the machinery stays: it is the one switch per block).
     NOTAS = {"clave": "notas", "titulo": "Notas de crédito", "col_inicio": 8,    # H
-             "tabla": "TblNotasCredito"}
+             "tabla": "TblNotasCredito", "con_value": False}
     PEP   = {"clave": "pep",   "titulo": "PEP Vouchers",     "col_inicio": 15,   # O
-             "tabla": "TblPEPVouchers"}
+             "tabla": "TblPEPVouchers", "con_value": False}
     BLOQUES = (NOTAS, PEP)
 
     # Reconciliation tolerance against the 'TD' blocks (cents).
@@ -2447,13 +2672,14 @@ class EtapaTDNotasPEP:
         self.resultado = None
 
     @staticmethod
-    def formulas(col_inicio, fila):
+    def formulas(col_inicio, fila, con_value=True):
         """The three formulas of ONE row (Referencia de pago, Factura Monitor, Diferencia) of the block
-        that starts at `col_inicio`, e.g. the block H:M, row 6:
+        that starts at `col_inicio`, e.g. the block H:M, row 6 (`con_value`, PEP Vouchers):
             K6 =+_xlfn.XLOOKUP(VALUE(I6),FB!C:C,FB!D:D)
             L6 =+_xlfn.XLOOKUP(K6,VBRL!D:D,VBRL!E:E)
             M6 =J6-L6
-        Same text as the reference workbook's D6:F6 with the letters of the block.
+        Same text as the reference workbook's D6:F6 with the letters of the block. Without `con_value`
+        (Notas de crédito) K6 is `=+_xlfn.XLOOKUP(I6,FB!C:C,FB!D:D)`: I6 must then hold a number.
         """
         letra = get_column_letter
         documento  = f"{letra(col_inicio + EtapaTDNotasPEP.OFF_DOCUMENTO)}{fila}"
@@ -2467,8 +2693,9 @@ class EtapaTDNotasPEP:
         vbrl_fact  = letra(EtapaVBRL.COL_FACTURA)
         vbrl_imp   = letra(EtapaVBRL.COL_IMPORTE)
 
+        buscado = f"VALUE({documento})" if con_value else documento
         f_referencia = (
-            f"=+_xlfn.XLOOKUP(VALUE({documento}),"
+            f"=+_xlfn.XLOOKUP({buscado},"
             f"{hoja_fb}!{fb_doc}:{fb_doc},{hoja_fb}!{fb_clave}:{fb_clave})"
         )
         f_monitor = (
@@ -2505,15 +2732,30 @@ class EtapaTDNotasPEP:
     _RE_VALOR_NUMERICO = re.compile(r"[0-9]+(?:\.[0-9]*)?")
 
     @classmethod
-    def resolver(cls, documento, mapa_fb, mapa_vbrl):
+    def resolver(cls, documento, mapa_fb, mapa_vbrl, con_value=True):
         """How the formulas of ONE row end, as Excel will compute them → (estado, numero):
             K =XLOOKUP(VALUE(doc),FB!C:C,FB!D:D)  L =XLOOKUP(K,VBRL!D:D,VBRL!E:E)  M =importe-L
         `estado` is OK, VALOR (#VALUE!) or one of ESTADOS_NA; `numero` is the FB!C:C key K found
         (SIN_CLAVE / SIN_VBRL / OK), else None. An empty document is written as an empty cell:
         VALUE() of it is 0. A number with more than 15 digits cannot be in FB!C:C (FB keeps those
         as text), so it ends in SIN_FB.
+        Without `con_value` (Notas de crédito: K =XLOOKUP(doc,…), no VALUE) there is no #VALUE!: the
+        cell holds what `EtapaFB.convertir_documento` makes of the document — the SAME function that
+        builds FB!C:C, so a number meets a number and a text meets a text — and a document that is
+        in no FB row is simply #N/A.
         """
         texto = str(documento).strip()
+        if not con_value:
+            clave = EtapaFB.convertir_documento(texto)
+            numero = 0 if clave is None else clave      # an empty cell looks up as 0
+            if numero not in mapa_fb:
+                return cls.SIN_FB, None
+            referencia = mapa_fb[numero]
+            if referencia == "":
+                return cls.SIN_CLAVE, numero
+            if referencia not in mapa_vbrl:
+                return cls.SIN_VBRL, numero
+            return cls.OK, numero
         if texto == "":
             numero = 0
         elif cls._RE_VALOR_NUMERICO.fullmatch(texto):
@@ -2539,8 +2781,7 @@ class EtapaTDNotasPEP:
         """Mask of the Gallo rows of a block, taken from EtapaTD so it cannot drift from 'TD'."""
         td = self.etapa_td
         if bloque is self.NOTAS:
-            sin_pp = td.ref2_norm != EtapaTD.PEP_REFERENCIA2
-            return td.mascara_bloque(EtapaTD.NOTAS["clases"]) & sin_pp
+            return td.mascara_bloque(EtapaTD.NOTAS["clases"], EtapaTD.NOTAS["excluir_ref2"])
         return td.mascara_pep()
 
     def preparar(self):
@@ -2587,7 +2828,7 @@ class EtapaTDNotasPEP:
             conteo = {estado: 0 for estado in (self.VALOR, *self.ESTADOS_NA)}
             importes = {estado: 0.0 for estado in conteo}
             for _, doc, importe in filas:
-                estado, _ = self.resolver(doc, mapa_fb, mapa_vbrl)
+                estado, _ = self.resolver(doc, mapa_fb, mapa_vbrl, bloque["con_value"])
                 estados.append(estado)
                 if estado in conteo:
                     conteo[estado] += 1
@@ -2627,13 +2868,8 @@ class EtapaTDNotasPEP:
 
         # --- Reconciliation with the 'TD' blocks ---
         td_resumen = td.resultado
-        mascara_notas = td.mascara_bloque(EtapaTD.NOTAS["clases"])
-        con_pp = mascara_notas & (td.ref2_norm == EtapaTD.PEP_REFERENCIA2)
-        pp_en_notas = round(float(importe_num[con_pp].sum()), 2)
-        esperado_notas = round(td_resumen["total_notas"] - pp_en_notas, 2)
         esperados = (
-            (self.NOTAS, esperado_notas,
-             f"{EtapaTD.NOTAS['titulo']} de 'TD' sin sus renglones 'PP'"),
+            (self.NOTAS, td_resumen["total_notas"], f"{EtapaTD.NOTAS['titulo']} de 'TD'"),
             (self.PEP, td_resumen["total_pep"], f"{EtapaTD.PEP['titulo']} de 'TD'"),
         )
         for bloque, esperado, descripcion in esperados:
@@ -2707,7 +2943,8 @@ class EtapaTDNotasPEP:
             letra_vbrl_i = letra(EtapaVBRL.COL_IMPORTE)
             EtapaTDReferencias._comentar(
                 ws.cell(row=fila_encabezado, column=inicio + self.OFF_REFERENCIA),
-                f"Fórmula en cada renglón: busca el Nº documento (como número) en "
+                f"Fórmula en cada renglón: busca el Nº documento ("
+                f"{'convertido a número con VALUE' if bloque['con_value'] else 'ya escrito como número, sin VALUE'}) en "
                 f"{EtapaFB.HOJA_FB}!{letra_fb_doc}:{letra_fb_doc} y regresa "
                 f"{EtapaFB.HOJA_FB}!{letra_fb_clave}:{letra_fb_clave} (clave de referencia). "
                 f"Sin coincidencia: #N/A (sin IFERROR, igual que el Excel de referencia).",
@@ -2728,12 +2965,20 @@ class EtapaTDNotasPEP:
             fila = fila_inicio
             for centro, documento, importe in filas:
                 ws.cell(row=fila, column=inicio + self.OFF_CENTRO, value=centro)
-                # Text on purpose (as in the reference): the formula turns it into a number. An empty
-                # one stays an EMPTY cell, which is what `resolver` assumes (VALUE() of it is 0).
-                ws.cell(row=fila, column=inicio + self.OFF_DOCUMENTO, value=documento or None)
+                # With VALUE() in the formula (`con_value`) the document is TEXT on purpose, as in the reference.
+                # Without it (Notas) it is the NUMBER the formula must meet in FB!C:C (the very
+                # conversion that builds FB!C:C). An empty one stays an EMPTY cell, which is what
+                # `resolver` assumes (it looks up as 0).
+                celda_doc = ws.cell(row=fila, column=inicio + self.OFF_DOCUMENTO,
+                                    value=documento or None)
+                if not bloque["con_value"] and documento:
+                    clave_doc = EtapaFB.convertir_documento(documento)
+                    celda_doc.value = clave_doc
+                    if isinstance(clave_doc, int):
+                        celda_doc.number_format = "0"     # 10+ digits: never scientific notation
                 ws.cell(row=fila, column=inicio + self.OFF_IMPORTE,
                         value=importe).number_format = formato
-                f_ref, f_monitor, f_dif = self.formulas(inicio, fila)
+                f_ref, f_monitor, f_dif = self.formulas(inicio, fila, bloque["con_value"])
                 ws.cell(row=fila, column=inicio + self.OFF_REFERENCIA, value=f_ref)
                 ws.cell(row=fila, column=inicio + self.OFF_MONITOR,
                         value=f_monitor).number_format = formato
@@ -2765,6 +3010,168 @@ class EtapaTDNotasPEP:
         # Spacer columns between the tables (G, N).
         for bloque in self.BLOQUES:
             ws.column_dimensions[letra(bloque["col_inicio"] - 1)].width = 4
+
+
+# === Stage: 'Validación_doc' — the #N/A rows of the three tables, side by side (audit control) ===
+class EtapaValidacionDoc:
+    """The 'Validación_doc' sheet (NOT 'Validación - Doc.', the Gallo's lookup sheet): the three tables
+    of 'TD.Diferencias_Referencias' cut to their first FOUR columns and to the rows whose 'Diferencia'
+    ends in #N/A — the documents still waiting to be validated. Values, a snapshot of what the formulas
+    of those tables will show once Excel calculates them (the same mirrors that feed the 2nd-run lists,
+    so the two can never disagree):
+        Facturas (A:D)           Centro | Nº documento | Referencia de pago | Importe
+        Notas de crédito (F:I)   Centro | Nº documento | Importe | Referencia de pago
+        PEP Vouchers (Q:T)       the same as Notas de crédito
+    'Referencia de pago' of the last two is what that table's FB formula SHOWS: the invoice reference
+    that is not in VBRL, '#N/A' when the document is not in FB, 0 when FB has it empty. A #VALUE! row
+    is not #N/A: left out. The Importe columns are D, H and S ON PURPOSE: they are the ones the
+    stakeholder's semáforo ('Diferencias', rows 1-3 of 'TD') adds up with SUM(Validación_doc!D:D),
+    H:H and S:S. That is also why the sheet has NO totals row: the SUM of a whole column would count
+    it twice.
+    """
+
+    HOJA = "Validación_doc"
+
+    # 'orden' = what each column of the block holds, left to right (the order of the source table).
+    BLOQUES = (
+        {"clave": "facturas", "titulo": "Facturas", "col_inicio": 1,
+         "orden": ("centro", "documento", "referencia", "importe")},       # A:D, importe D
+        {"clave": "notas", "titulo": "Notas de crédito", "col_inicio": 6,
+         "orden": ("centro", "documento", "importe", "referencia")},       # F:I, importe H
+        {"clave": "pep", "titulo": "PEP Vouchers", "col_inicio": 17,
+         "orden": ("centro", "documento", "importe", "referencia")},       # Q:T, importe S
+    )
+
+    # What a Notas / PEP row shows in 'Referencia de pago' when it is not a reference.
+    TEXTO_NO_DISPONIBLE = "#N/A"
+
+    # Reconciliation tolerance against the #N/A amounts the tables themselves report (cents).
+    TOLERANCIA_CUADRE = 0.01
+
+    def __init__(self, etapa_td_ref, etapa_notas_pep=None):
+        """`etapa_td_ref` (and `etapa_notas_pep`, when there is one) must already be prepared."""
+        self.etapa_td_ref = etapa_td_ref
+        self.etapa_notas_pep = etapa_notas_pep
+        self.resultado = None
+
+    @classmethod
+    def col_importe(cls, bloque):
+        """1-based column of the 'Importe' of `bloque` (D, H, S)."""
+        return bloque["col_inicio"] + bloque["orden"].index("importe")
+
+    def preparar(self):
+        """Pick the #N/A rows of each table → {'bloques': {clave: {filas, total}}, 'avisos',
+        'columnas'}; `filas` are (centro, documento, referencia, importe) in the order of the source
+        table. A cross-check against the tables' own #N/A amounts goes to 'avisos'.
+        """
+        ref = self.etapa_td_ref.resultado
+        bloques = {}
+        avisos = []
+
+        facturas = [
+            (centro, documento, EtapaTDReferencias.texto_referencia(referencia), importe)
+            for (centro, documento, referencia, importe), es_na in zip(ref["filas"], ref["na"])
+            if es_na
+        ]
+        bloques["facturas"] = {"filas": facturas, "esperado": ref["na_importe"]}
+
+        columnas = dict(ref["columnas"])
+        np_ = self.etapa_notas_pep
+        if np_ is not None:
+            mapa_fb = np_.etapa_fb.resultado["mapa"]
+            texto_fb = np_.etapa_fb.resultado["mapa_texto"]
+            mapa_vbrl = np_.etapa_vbrl.resultado["mapa"]
+            for clave in ("notas", "pep"):
+                origen = np_.resultado["bloques"][clave]
+                filas = []
+                for (centro, documento, importe), estado in zip(origen["filas"], origen["estados"]):
+                    if estado not in EtapaTDNotasPEP.ESTADOS_NA:
+                        continue
+                    if estado == EtapaTDNotasPEP.SIN_FB:
+                        referencia = self.TEXTO_NO_DISPONIBLE
+                    elif estado == EtapaTDNotasPEP.SIN_CLAVE:
+                        referencia = 0                      # FB!D empty: the formula shows 0
+                    else:                                   # SIN_VBRL: the FB reference VBRL lacks
+                        _, numero = EtapaTDNotasPEP.resolver(documento, mapa_fb, mapa_vbrl)
+                        referencia = texto_fb.get(numero) or None
+                    filas.append((centro, documento, referencia, importe))
+                bloques[clave] = {"filas": filas, "esperado": origen["na_importe"]}
+
+        for clave, datos in bloques.items():
+            datos["total"] = round(sum(fila[3] for fila in datos["filas"]), 2)
+            if abs(datos["total"] - datos["esperado"]) > self.TOLERANCIA_CUADRE:
+                avisos.append(
+                    f"{self.HOJA} ({clave}): el importe de los renglones #N/A ({datos['total']:,.2f}) "
+                    f"no cuadra con el que reporta su tabla ({datos['esperado']:,.2f})."
+                )
+
+        self.resultado = {"bloques": bloques, "avisos": avisos, "columnas": columnas}
+        return self.resultado
+
+    @staticmethod
+    def _poner_texto(ws, fila, columna, valor):
+        """Write a value copied from SAP as DATA, never as a formula: openpyxl turns any string that
+        starts with '=' into a formula, and a reference like '=HYPERLINK(...)' would then run when the
+        stakeholder opens the workbook. The literal '#N/A' of the tables stays an error value (that is
+        what the source tables show).
+        """
+        celda = ws.cell(row=fila, column=columna, value=valor)
+        if celda.data_type == "f":
+            celda.data_type = "s"
+        return celda
+
+    def escribir(self, ws):
+        """Write the blocks on `ws`: row 1 headers (bold), #N/A rows from row 2, panes frozen under the
+        headers. A table with no #N/A rows keeps its headers. Only the blocks `preparar` found: without
+        FB03 there is just Facturas.
+        """
+        resultado = self.resultado
+        columnas = resultado["columnas"]
+        negrita = Font(bold=True)
+        textos = {
+            "centro":     columnas["centro"],
+            "documento":  columnas["documento"],
+            "importe":    Comun.ENCABEZADO_IMPORTE,
+        }
+        for bloque in self.BLOQUES:
+            datos = resultado["bloques"].get(bloque["clave"])
+            if datos is None:
+                continue
+            inicio = bloque["col_inicio"]
+            referencia_encabezado = (columnas["referencia"] if bloque["clave"] == "facturas"
+                                     else EtapaTDNotasPEP.ENCABEZADO_REFERENCIA)
+            encabezados = dict(textos, referencia=referencia_encabezado)
+
+            for desplazamiento, campo in enumerate(bloque["orden"]):
+                celda = ws.cell(row=1, column=inicio + desplazamiento, value=str(encabezados[campo]))
+                celda.font = negrita
+
+            Comun.comentar(
+                ws.cell(row=1, column=inicio),
+                f"{bloque['titulo']}: los renglones de la tabla de '"
+                f"{EtapaTDReferencias.HOJA_TD_REFERENCIAS}' cuya Diferencia termina en #N/A "
+                f"(sus primeras cuatro columnas, como valores).",
+                ancho=320, alto=90,
+            )
+            Comun.comentar(
+                ws.cell(row=1, column=self.col_importe(bloque)),
+                "Sin renglón de totales a propósito: el semáforo de TD suma la columna completa "
+                "(SUM(Validación_doc!D:D), H:H, S:S) y un total la contaría dos veces.",
+                ancho=320, alto=90,
+            )
+
+            posiciones = {campo: inicio + i for i, campo in enumerate(bloque["orden"])}
+            for fila, (centro, documento, referencia, importe) in enumerate(datos["filas"], start=2):
+                self._poner_texto(ws, fila, posiciones["centro"], centro)
+                self._poner_texto(ws, fila, posiciones["documento"], documento or None)
+                self._poner_texto(ws, fila, posiciones["referencia"], referencia)
+                ws.cell(row=fila, column=posiciones["importe"],
+                        value=importe).number_format = Comun.FORMATO_NUMERO
+
+            for desplazamiento, ancho in zip(range(4), (12, 16, 22, 22)):
+                ws.column_dimensions[get_column_letter(inicio + desplazamiento)].width = ancho
+
+        ws.freeze_panes = "A2"
 
 
 # === Stage: the lists of the 2nd run of downloads (from 'TD.Diferencias_Referencias') ===
@@ -2946,15 +3353,15 @@ def preparar_tablas_diferencias(gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_
 class Consolidador:
     """Runs the consolidation: reads the CSVs, runs the stages in order and writes the workbook (the
     stages hold the logic): EtapaGallo → EtapaTD → EtapaMonivoi → EtapaCruceTDMTD → [EtapaVBRL →
-    EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaListasSegundaCorrida]. The VBRL and the FB03 are
+    EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaValidacionDoc →
+    EtapaListasSegundaCorrida]. The VBRL and the FB03 are
     OPTIONAL on purpose: an old date from before those downloads must still consolidate (just
     without their sheets; the Notas de crédito / PEP Vouchers tables need BOTH).
     """
 
     def __init__(self, ruta_gallo, ruta_monivoi, ruta_output, nombre_salida=None,
                  callback_status=None, ruta_vbrl=None, ruta_fb03=None):
-        """`ruta_vbrl` adds the 'VBRL' and
-        'TD.Diferencias_Referencias' sheets; `ruta_fb03` (together with `ruta_vbrl`) adds the 'FB' sheet
+        """`ruta_vbrl` adds the 'VBRL', 'TD.Diferencias_Referencias' and 'Validación_doc' sheets; `ruta_fb03` (together with `ruta_vbrl`) adds the 'FB' sheet
         and the 'Notas de crédito' / 'PEP Vouchers' tables; `nombre_salida` defaults to
         'Consolidado_<Gallo CSV>.xlsx'.
         """
@@ -3012,7 +3419,7 @@ class Consolidador:
             etapa_fb = EtapaFB(fb, Comun.es_sin_datos(fb))
             etapa_fb.preparar()
 
-        # Gallo: steps 2-9 + 'MX Commercial' override + amounts (adds K, L, M).
+        # Gallo: 'Referencia 2' / 'Referencia 3' (K, L), the 'MX Commercial' copy and override, amounts.
         etapa_gallo = EtapaGallo(gallo, update_status, con_ref_pago=con_vbrl)
         pasos_gallo = etapa_gallo.preparar()
 
@@ -3036,10 +3443,14 @@ class Consolidador:
         # 'TD.Diferencias_Referencias' (only with VBRL).
         # 'Notas de crédito' / 'PEP Vouchers' (only with VBRL and FB03) and the lists of the 2nd run
         # of downloads: the SAME helper the 2nd run uses on its own (calcular_listas_segunda_corrida).
-        etapa_td_ref = etapa_notas_pep = listas_2da = None
+        etapa_td_ref = etapa_notas_pep = listas_2da = etapa_validacion = None
         if con_vbrl:
             etapa_td_ref, etapa_notas_pep, listas_2da = preparar_tablas_diferencias(
                 gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb, update_status)
+            # 'Validación_doc': the #N/A rows of those same tables, side by side.
+            update_status("📋 Construyendo 'Validación_doc'...")
+            etapa_validacion = EtapaValidacionDoc(etapa_td_ref, etapa_notas_pep)
+            etapa_validacion.preparar()
 
         # Export the workbook.
         update_status("💾 Guardando Excel consolidado...")
@@ -3053,7 +3464,9 @@ class Consolidador:
 
         # The tab order of the workbook is the order of the writes below.
         with pd.ExcelWriter(ruta_final, engine="openpyxl") as writer:
-            gallo.to_excel(writer, sheet_name=EtapaGallo.HOJA_GALLO, index=False)
+            # 'Gallo' as the stage hands it: K and L as the template's formulas (or values).
+            etapa_gallo.para_escribir().to_excel(
+                writer, sheet_name=EtapaGallo.HOJA_GALLO, index=False)
             monivoi.to_excel(writer, sheet_name=EtapaMonivoi.HOJA_MONIVOI, index=False)
 
             if etapa_vbrl is not None:
@@ -3079,12 +3492,16 @@ class Consolidador:
 
             etapa_monivoi.escribir_mtd(writer.book.create_sheet(EtapaMonivoi.HOJA_MTD))
 
+            if etapa_validacion is not None:
+                etapa_validacion.escribir(writer.book.create_sheet(EtapaValidacionDoc.HOJA))
+
         update_status("✅ Consolidación completada")
 
         resumen_vbrl = etapa_vbrl.resultado if etapa_vbrl is not None else None
         resumen_ref = etapa_td_ref.resultado if etapa_td_ref is not None else None
         resumen_fb = etapa_fb.resultado if etapa_fb is not None else None
         resumen_np = etapa_notas_pep.resultado if etapa_notas_pep is not None else None
+        resumen_val = etapa_validacion.resultado if etapa_validacion is not None else None
         notas_pep_avisos = []
         if con_vbrl != con_fb:
             faltante = "FB03" if con_vbrl else "VBRL"
@@ -3113,7 +3530,7 @@ class Consolidador:
             "total_notas":          td_resumen["total_notas"],
             "total_pep":            td_resumen["total_pep"],
             "total_importe_gallo":  total_importe_gallo,
-            "td_avisos":            td_resumen["avisos"],
+            "td_avisos":            pasos_gallo["avisos"] + td_resumen["avisos"],
             "centros_mtd_todos":    len(mtd["bloques"]["todos"]["filas"]),
             "mtd_filas_sin_uuid":   mtd["filas_sin_uuid"],
             "mtd_avisos":           mtd["avisos"],
@@ -3125,7 +3542,11 @@ class Consolidador:
             "filas_td_referencias": len(resumen_ref["filas"]) if resumen_ref else 0,
             "total_td_referencias": resumen_ref["total"] if resumen_ref else 0.0,
             "td_referencias_na":    resumen_ref["na_n"] if resumen_ref else 0,
-            "td_referencias_avisos": resumen_ref["avisos"] if resumen_ref else [],
+            "td_referencias_avisos": (resumen_ref["avisos"] + resumen_val["avisos"]) if resumen_ref else [],
+            # #N/A rows copied to 'Validación_doc' per table (empty without VBRL).
+            "filas_validacion_doc": (
+                {clave: len(datos["filas"]) for clave, datos in resumen_val["bloques"].items()}
+                if resumen_val else {}),
             "fb03_incluido":        con_notas_pep,
             "filas_fb":             resumen_fb["filas"] if resumen_fb else 0,
             "filas_notas_ref":      len(resumen_np["bloques"]["notas"]["filas"]) if resumen_np else 0,
@@ -3161,7 +3582,7 @@ def consolidar_gallo_monivoi(
 
 def calcular_listas_segunda_corrida(ruta_gallo, ruta_vbrl, ruta_fb03=None, callback_status=None):
     """The 2nd-run lists WITHOUT writing a workbook (the '2a corrida' download button): the files of
-    the 1st run go through the same stages as in the consolidation — Gallo (steps 2-9, amounts) →
+    the 1st run go through the same stages as in the consolidation — Gallo (Referencia 2/3, 'MX Commercial', amounts) →
     'TD' → preparar_tablas_diferencias — so the lists are exactly the #N/A rows the consolidated
     'TD.Diferencias_Referencias' shows for those files. `ruta_fb03` is optional (without it, only
     the Facturas table: a warning in 'avisos'). Returns EtapaListasSegundaCorrida.resultado.
@@ -3199,8 +3620,9 @@ def calcular_listas_segunda_corrida(ruta_gallo, ruta_vbrl, ruta_fb03=None, callb
 
 def _consolidar_venta(etapa_cls, ruta_csv, ruta_output, nombre_salida, callback_status,
                       fechas_seleccionadas):
-    """The workbook of ONE sale: its CSV → the single tab of `etapa_cls` (EtapaVentaDSD / EtapaVentaEIAP).
-    Returns the summary dict the GUI shows: ruta, filas_archivo, total_venta, venta_avisos.
+    """The workbook of ONE sale: its CSV as the 'Gallo' tab (the base that was downloaded, as it came)
+    followed by the sale's tab of `etapa_cls` (EtapaVentaDSD / EtapaVentaEIAP). Returns the summary
+    dict the GUI shows: ruta, filas_archivo, total_venta, venta_avisos.
     """
     status = callback_status or (lambda _mensaje: None)
     fechas_sel = EtapaVentas.parsear_fechas_seleccionadas(fechas_seleccionadas)
@@ -3214,6 +3636,14 @@ def _consolidar_venta(etapa_cls, ruta_csv, ruta_output, nombre_salida, callback_
             "No hay nada que consolidar."
         )
 
+    # The base goes into the workbook as it was downloaded: it has to fit in one Excel sheet.
+    if len(datos) + 1 > EtapaVentas.MAX_FILAS_EXCEL:
+        raise ValueError(
+            f"El archivo de {etapa_cls.ORIGEN} trae {len(datos):,} filas y no cabe en la pestaña "
+            f"'{EtapaGallo.HOJA_GALLO}' de Excel ({EtapaVentas.MAX_FILAS_EXCEL:,} filas con el "
+            "encabezado). Descarga un periodo más corto."
+        )
+
     status(f"📆 Construyendo '{nombre_hoja}'...")
     etapa = etapa_cls.desde_csv(datos, fechas_sel)
     ventas = etapa.preparar()
@@ -3224,11 +3654,11 @@ def _consolidar_venta(etapa_cls, ruta_csv, ruta_output, nombre_salida, callback_
         nombre_salida = f"Consolidado_{os.path.splitext(os.path.basename(ruta_csv))[0]}.xlsx"
     ruta_final = os.path.join(ruta_output, nombre_salida)
 
-    libro = Workbook()
-    hoja = libro.active
-    hoja.title = nombre_hoja
-    etapa.escribir(hoja, clave)
-    libro.save(ruta_final)
+    # Tab order = order of the writes: 'Gallo' (the downloaded base, like the full workbook) and then
+    # the sale's tab.
+    with pd.ExcelWriter(ruta_final, engine="openpyxl") as writer:
+        datos.to_excel(writer, sheet_name=EtapaGallo.HOJA_GALLO, index=False)
+        etapa.escribir(writer.book.create_sheet(nombre_hoja), clave)
 
     status("✅ Consolidación completada")
     return {
@@ -3241,7 +3671,7 @@ def _consolidar_venta(etapa_cls, ruta_csv, ruta_output, nombre_salida, callback_
 
 def consolidar_venta_dsd(ruta_dsd, ruta_output, nombre_salida=None, callback_status=None,
                          fechas_seleccionadas=None):
-    """The controller's entry point for the 'Venta DSD' button: a workbook with the single tab 'Venta DSD'.
+    """The controller's entry point for the 'Venta DSD' button: a workbook with the tabs 'Gallo' and 'Venta DSD'.
     `fechas_seleccionadas` ('DD.MM.YYYY'): every day of the queried range, which show up even without
     amounts. FileNotFoundError / ValueError as in Consolidador.ejecutar().
     """
@@ -3251,7 +3681,7 @@ def consolidar_venta_dsd(ruta_dsd, ruta_output, nombre_salida=None, callback_sta
 
 def consolidar_venta_eiap(ruta_eiap, ruta_output, nombre_salida=None, callback_status=None,
                           fechas_seleccionadas=None):
-    """The controller's entry point for the 'Venta EIAP' button: a workbook with the single tab
+    """The controller's entry point for the 'Venta EIAP' button: a workbook with the tabs 'Gallo' and
     'Venta EIAP'. Same arguments and errors as consolidar_venta_dsd().
     """
     return _consolidar_venta(EtapaVentaEIAP, ruta_eiap, ruta_output, nombre_salida, callback_status,
