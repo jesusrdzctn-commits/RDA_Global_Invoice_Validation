@@ -15,7 +15,7 @@ FORMATO_FECHA = "%d.%m.%Y"
 # was too big and the program failed). What SAP is asked for AND what its tab sums come from these
 # lists (one source for both). To add an account or a class to a sale, add it to ITS list: the query
 # and the tab follow. (4000010 is in both lists; the classes do not overlap.)
-CUENTAS_EIAP = ("4000010", "4000020", "4000802", "4300013")
+CUENTAS_EIAP = ("4000010", "4000020", "4000802", "4300013", "4300014")
 CLASES_EIAP = ("RV", "DA")
 CUENTAS_DSD = ("4000005", "4000010")
 CLASES_DSD = ("C1", "C2", "C5", "C6", "X0")

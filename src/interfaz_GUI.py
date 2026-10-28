@@ -32,21 +32,24 @@ def _ruta_config():
 
 
 class ValidacionFacturaGUI:
+    """Tkinter window: tab 1 (downloads + consolidation), tab 2 (company code, folders) and an
+    always-visible status bar. Method sections: config.json, interface, folder pickers, file names,
+    validation, button state, handlers."""
+
     # Design size = MINIMUM size: _ajustar_alto_ventana grows it when the content needs more room.
     ANCHO_BASE = 580
     ALTO_BASE  = 690
 
-    # The two runs: radio buttons for the downloads and for the consolidations, each with a legend.
     LEYENDAS_DESCARGA = {
         1: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[1]),
         2: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[2]),
     }
     LEYENDAS_CONSOLIDACION = {
         1: "Gallo + Monivoi + VBRL + FB03 → Excel consolidado",
-        2: "Por definir",
+        2: "1a consolidación + 6 pestañas de la 2a corrida + Diferencias",
     }
-    # The 2nd consolidation is not defined yet: its radio button stays disabled until it is.
-    CONSOLIDACION_2_DISPONIBLE = False
+    # Switch for the 2nd consolidation's radio button (False keeps it disabled).
+    CONSOLIDACION_2_DISPONIBLE = True
 
     def __init__(self, root):
         self.root = root
@@ -73,15 +76,13 @@ class ValidacionFacturaGUI:
 
         self.mode_var = tk.StringVar(value="single")
 
-        # Parallel run by passes (opt-in): it always starts unchecked (sequential is the safe default).
+        # Parallel run by passes (opt-in): always starts unchecked (sequential is the safe default).
         self.paralelo_var = tk.BooleanVar(value=False)
 
         # Which run the main buttons execute (1a / 2a); always the 1st when the window opens.
         self.corrida_descarga_var = tk.IntVar(value=1)
         self.corrida_consolidacion_var = tk.IntVar(value=1)
 
-        # Download folder: the user's Documents path by default; it can be changed (e.g. a synced SharePoint
-        # folder) and is remembered in config.json, like the consolidation folder.
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
         user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
@@ -103,7 +104,6 @@ class ValidacionFacturaGUI:
         self._ajustar_alto_ventana()
         self._on_mode_change()
 
-    # --- config.json (last folders used) ---
     def _cargar_config(self):
         """Read the whole config.json (dict). If it does not exist or fails → {}."""
         try:
@@ -127,7 +127,6 @@ class ValidacionFacturaGUI:
         except OSError as e:
             print(f"[CONFIG] No se pudo guardar la configuración: {e}")
 
-    # --- Interface: header, Notebook with two tabs, status bar always visible below ---
     def _build_ui(self):
         main = tk.Frame(self.root, bg=self.bg_color, padx=24, pady=18)
         main.pack(fill="both", expand=True)
@@ -170,12 +169,10 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg="#666666",
         ).pack(pady=(12, 0))
 
-    # --- Tab 1: Descarga y Consolidación ---
     def _build_tab_descarga(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
 
-        # --- Mode selector ---
         mode_frame = tk.LabelFrame(
             cont, text="  Tipo de intervalo  ",
             font=("Segoe UI", 10, "bold"),
@@ -192,13 +189,11 @@ class ValidacionFacturaGUI:
                 cursor="hand2", command=self._on_mode_change,
             ).pack(side=tk.LEFT, padx=(0, 16))
 
-        # --- Date container (switches between single/range) ---
         self.date_container = tk.Frame(cont, bg=self.bg_color)
         self.date_container.pack(fill="x", pady=(0, 10))
 
         hoy = datetime.now().strftime("%d.%m.%Y")
 
-        # "Single day" frame
         self.single_frame = tk.LabelFrame(
             self.date_container, text="  Fecha  ",
             font=("Segoe UI", 10, "bold"),
@@ -221,7 +216,6 @@ class ValidacionFacturaGUI:
             bg=self.bg_color, fg="#999999",
         ).grid(row=0, column=2, sticky="w")
 
-        # "Several days" frame
         self.range_frame = tk.LabelFrame(
             self.date_container, text="  Intervalo de Tiempo  ",
             font=("Segoe UI", 10, "bold"),
@@ -253,7 +247,6 @@ class ValidacionFacturaGUI:
         for var in (self.date_single_var, self.date_from_var, self.date_to_var):
             var.trace_add("write", lambda *_: self._update_filename_preview())
 
-        # --- Runs: downloads (left) and consolidations (right), each with its legend ---
         corridas = tk.Frame(cont, bg=self.bg_color)
         corridas.pack(fill="x", pady=(0, 10))
         corridas.columnconfigure(0, weight=1, uniform="corridas")
@@ -267,7 +260,6 @@ class ValidacionFacturaGUI:
             self._on_corrida_consolidacion_change, (6, 0),
         )
 
-        # --- Output file names (the folder is in the Configuración tab) ---
         info_frame = tk.Frame(cont, bg=self.light_gray, bd=1, relief=tk.SOLID)
         info_frame.pack(fill="x", pady=(0, 10))
 
@@ -279,7 +271,6 @@ class ValidacionFacturaGUI:
             wraplength=500,
         ).pack(fill="x", padx=12, pady=6)
 
-        # --- Action buttons ---
         btn_frame = tk.Frame(cont, bg=self.bg_color)
         btn_frame.pack(fill="x", pady=(4, 0))
 
@@ -290,7 +281,6 @@ class ValidacionFacturaGUI:
             activebackground=self.secondary_color, activeforeground=self.bg_color,
         )
 
-        # Single-transaction buttons: same blue, smaller and in italics (variants of the main one).
         _btn_individual_kwargs = dict(
             _btn_kwargs, font=("Segoe UI", 10, "bold italic"), pady=6,
         )
@@ -312,7 +302,6 @@ class ValidacionFacturaGUI:
         )
         self.download_monivoi_btn.grid(row=0, column=1, sticky="ew", padx=4)
 
-        # The two sales have their own button (a merged query was too big): same range-only rule.
         self.download_dsd_btn = tk.Button(
             fila_individual, text="🛒 Venta DSD",
             command=self._handle_dsd, **_btn_individual_kwargs,
@@ -340,7 +329,6 @@ class ValidacionFacturaGUI:
         )
         self.paralelo_chk.pack(fill="x", pady=(6, 0))
 
-        # Green 'process data', as opposed to the blue 'bring data' buttons.
         _btn_consolidar_kwargs = dict(_btn_kwargs, bg=self.success_color)
         self.consolidar_btn = tk.Button(
             btn_frame, text="", command=self._handle_consolidar, **_btn_consolidar_kwargs,
@@ -392,7 +380,7 @@ class ValidacionFacturaGUI:
         self._estado_radio_consolidacion_2()
 
     def _estado_radio_consolidacion_2(self):
-        """The 2nd consolidation radio is only usable once that consolidation exists."""
+        """The 2nd consolidation radio is disabled while CONSOLIDACION_2_DISPONIBLE is False."""
         if not self.CONSOLIDACION_2_DISPONIBLE:
             self.radios_consolidacion[2].config(state="disabled")
 
@@ -404,7 +392,6 @@ class ValidacionFacturaGUI:
         """1 or 2: the consolidation the green button executes (read by the controller)."""
         return 2 if self.corrida_consolidacion_var.get() == 2 else 1
 
-    # --- Tab 2: Configuración (company code and folders) ---
     def _build_tab_config(self, parent):
         cont = tk.Frame(parent, bg=self.bg_color, padx=16, pady=16)
         cont.pack(fill="both", expand=True)
@@ -474,7 +461,6 @@ class ValidacionFacturaGUI:
             cursor="hand2", padx=12, command=self._elegir_carpeta_consolidacion,
         ).pack(side=tk.LEFT)
 
-    # --- Folder pickers ---
     def _elegir_carpeta(self):
         """Open the file browser so the stakeholder can pick the download folder."""
         carpeta = filedialog.askdirectory(
@@ -495,7 +481,6 @@ class ValidacionFacturaGUI:
             self.consolidacion_path_var.set(os.path.normpath(carpeta))
             self._guardar_config()
 
-    # --- File names: the typed dates, no offsets (those only apply to the SAP queries) ---
     def _preview_nombre(self):
         try:
             if self.mode_var.get() == "single":
@@ -601,17 +586,16 @@ class ValidacionFacturaGUI:
         self._update_filename_preview()
 
     def _ajustar_alto_ventana(self):
-        """Grow the window ONLY when display scaling makes the content taller than the design size
-        (measured with the taller 'Varios días' frame AND its file names, the longest preview text:
-        measured with an empty preview, a wrapped name line was left out of view).
-        """
+        """Grow the window ONLY when display scaling makes the content taller than the design size (measured
+        with the taller 'Varios días' frame AND its file names: an empty preview left a wrapped name line
+        out of view)."""
         modo = self.mode_var.get()
         corrida = self.corrida_descarga_var.get()
         self.mode_var.set("range")
         self.single_frame.pack_forget()
         self.range_frame.pack(fill="x")
         ancho, alto = self.ANCHO_BASE, self.ALTO_BASE
-        for opcion in CORRIDAS_DESCARGA:               # every run's legend and file names
+        for opcion in CORRIDAS_DESCARGA:
             self.corrida_descarga_var.set(opcion)
             self._on_corrida_descarga_change()
             self.root.update_idletasks()
@@ -623,7 +607,6 @@ class ValidacionFacturaGUI:
         self.root.geometry(f"{ancho}x{alto}")
         self.range_frame.pack_forget()
 
-    # --- Validation and configuration ---
     def validate_dates(self):
         try:
             if self.mode_var.get() == "single":
@@ -693,7 +676,6 @@ class ValidacionFacturaGUI:
         self.status_var.set(message)
         self.root.update_idletasks()
 
-    # --- Button state ---
     def _botones_accion(self):
         """(button, enabled color) for EVERY button that starts a process."""
         return (
@@ -727,7 +709,6 @@ class ValidacionFacturaGUI:
         """True if the 'en paralelo' checkbox is ticked (read by the controller)."""
         return bool(self.paralelo_var.get())
 
-    # --- Handlers ---
     def _disparar(self, callback, transaccion="gallo"):
         """Validate inputs and call the controller callback (or warn if unwired)."""
         if not self.validate_dates():

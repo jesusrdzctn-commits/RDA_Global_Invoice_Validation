@@ -49,19 +49,17 @@ def _fmt_duracion(segundos):
 
 
 class ValidacionFacturaController:
-    """Connects the GUI with the SAP downloads (Gallo, Monivoi, VBRL, FB03, and the 2nd run) and the
-    consolidation."""
+    """Connects the GUI with the SAP downloads (Gallo, Monivoi, VBRL, FB03, 2nd run) and the consolidation.
+    Sections: download entry points → engines (sequential, parallel) → consolidation → 2nd run → sales
+    buttons."""
 
-    # 2nd run, in parallel: two PASSES of three transactions (one SAP window each). A pass starts when
-    # the previous one is over, so VBRK (pass 1) has ended, whatever its result, by the time FBL5N and
-    # KNVP (pass 2) read its 'Solic.' column: no waiting between windows is needed.
+    # 2nd run in parallel: two PASSES of three; a pass starts when the previous one is over.
     PASADAS_2DA = (("vbrk", "vbrp", "vbrl2"), ("fbl5n", "knvp", "bkpf"))
 
     def __init__(self, gui):
         self.gui = gui
 
-        # Transaction profiles: "descarga" functions share (DateFrom, DateTo, FolderPath, FileName,
-        # sociedad); optional "validar" (config → error text, before the confirmation) and "nota".
+        # Profiles: "descarga" (DateFrom, DateTo, FolderPath, FileName, sociedad), optional "validar" / "nota".
         self._TX_GALLO = {
             "clave":    "gallo",
             "nombre":   "Gallo (FAGLL03)",
@@ -72,9 +70,6 @@ class ValidacionFacturaController:
             "nombre":   "Monivoi (ZLMXCOM_TRN_MONINVOI)",
             "descarga": Monivoi_ZLMXCOM,
         }
-        # The two sales have their OWN Gallo query (the accounts and classes of each, in utils): a merged
-        # one was too big. Only for a range, SAP queried up to the end date minus one day. Each has its own
-        # file and its own workbook, and neither is part of the full process.
         self._TX_DSD = {
             "clave":    "dsd",
             "nombre":   "Venta DSD (FAGLL03)",
@@ -89,10 +84,7 @@ class ValidacionFacturaController:
             "validar":  lambda config: self._validar_venta("Venta EIAP", config),
             "nota":     lambda config: self._nota_venta(config, CUENTAS_EIAP, CLASES_EIAP),
         }
-        # VBRL and FB03: ONE query for the period with a list read from the file another transaction
-        # downloaded in THIS run: "requiere" (that one, which must run before), "leer_documentos"
-        # (path → documents, rows, column), "unidad" and "lista" (for the messages). FB03's
-        # "sin_documentos_es_vacio": a Gallo without C2/C6 Global rows is a normal empty day.
+        # VBRL / FB03: ONE query, list read from a file another transaction downloaded in THIS run ("requiere").
         self._TX_VBRL = {
             "clave":    "vbrl",
             "nombre":   "VBRL (ZSE16)",
@@ -113,9 +105,7 @@ class ValidacionFacturaController:
             "sin_documentos_es_vacio": True,
             "filtro":   EtapaDocumentosFB03.DESCRIPCION_FILTRO,
         }
-        # 2nd run (after the consolidation). VBRP, VBRK, VBRL 2nd run and BKPF take their list from the
-        # consolidation ("lista_de": a key of resumen["listas_2da"], copied into the config as
-        # "documentos"); FBL5N and KNVP read 'Solic.' from THIS run's VBRK ("requiere").
+        # 2nd run: lists from the consolidation ("lista_de" → "documentos"); FBL5N / KNVP read VBRK's 'Solic.'.
         self._TX_VBRP = {
             "clave": "vbrp", "nombre": "VBRP (ZSE16)", "ejecutar": self._descargar_lista_2da,
             "descarga": VBRP_ZSE16, "lista_de": "referencias", "unidad": "referencia(s)",
@@ -153,7 +143,6 @@ class ValidacionFacturaController:
                        self._TX_FBL5N, self._TX_KNVP)
         }
 
-        # Re-entrancy guard: one run at a time.
         self._ocupado = False
 
         self.gui.on_download_gallo   = self.execute_download_gallo
@@ -163,7 +152,6 @@ class ValidacionFacturaController:
         self.gui.on_download_todos   = self.execute_download_todos
         self.gui.on_consolidar = self.execute_consolidacion
 
-    # --- Download entry points (one per button) ---
     def execute_download_gallo(self):
         self._execute_download([self._TX_GALLO], "Gallo")
 
@@ -177,9 +165,8 @@ class ValidacionFacturaController:
         self._execute_download([self._TX_EIAP], "Venta EIAP")
 
     def execute_download_todos(self):
-        """The main download button: the run its GUI radio button selects. 1a = Gallo, Monivoi, VBRL,
-        FB03 (utils.CORRIDAS_DESCARGA[1]); 2a = the six downloads of execute_download_segunda.
-        """
+        """Main download button: the run its GUI radio selects (1a = Gallo, Monivoi, VBRL, FB03; 2a = the
+        six downloads of execute_download_segunda)."""
         if self._corrida_gui("corrida_descarga") == 2:
             self.execute_download_segunda()
             return
@@ -198,10 +185,8 @@ class ValidacionFacturaController:
         return 2 if callable(leer) and leer() == 2 else 1
 
     def execute_download_segunda(self):
-        """'2a corrida' radio button + download button: the six downloads, with the lists the 1st
-        consolidation shows, recomputed from the 1st run's files of the GUI dates (Gallo, VBRL and,
-        if it is there, FB03) by calcular_listas_segunda_corrida — the consolidation's own code path.
-        """
+        """'2a corrida' radio + download button: the six downloads, with the 1st consolidation's lists
+        recomputed from the 1st run's files (calcular_listas_segunda_corrida)."""
         if self._ocupado:
             return
         if not self.gui.validate_dates():
@@ -267,17 +252,15 @@ class ValidacionFacturaController:
                 )
         try:
             self._ofrecer_segunda_corrida(listas, cfg["gallo"], origen="\n".join(origen))
-        except Exception as e:                    # shown, never lost in Tk's console
+        except Exception as e:
             self.gui.set_status("❌ Error al preparar la 2a corrida")
             messagebox.showerror("2a corrida de descargas", f"No pude preparar la 2a corrida:\n\n{e}")
 
-    # --- Download engine ---
     def _execute_download(self, txs, etiqueta, paralelo=False):
         """Run `txs` (one after another, or in parallel by passes) and show ONE summary."""
         if not txs:
             raise ValueError("No se indicó ninguna transacción a descargar.")
-        # A dependent transaction (VBRL needs THIS run's Monivoi) must come after its parent,
-        # otherwise it could read a stale file of an earlier run.
+        # A dependent transaction (VBRL needs THIS run's Monivoi) goes after its parent: no stale files.
         for pos, tx in enumerate(txs):
             requiere = tx.get("requiere")
             if requiere and requiere not in [t["clave"] for t in txs[:pos]]:
@@ -292,7 +275,6 @@ class ValidacionFacturaController:
         base = self.gui.get_config(txs[0]["clave"])
         mode = base["mode"]
 
-        # Checks BEFORE the confirmation, so a request that cannot run never reaches SAP.
         for tx in txs:
             validar = tx.get("validar")
             problema = validar(self.gui.get_config(tx["clave"])) if validar else None
@@ -304,7 +286,7 @@ class ValidacionFacturaController:
         paralelo = n_ventanas > 1
         configs = None
         if paralelo:
-            # Read everything the workers need NOW: Tk may only be touched by its own thread.
+            # Read everything workers need NOW: Tk may only be touched by its own thread.
             configs = {tx["clave"]: self.gui.get_config(tx["clave"]) for tx in txs}
             problema = self._validar_paralelo(txs, configs)
             if problema:
@@ -408,7 +390,6 @@ class ValidacionFacturaController:
             if estado_final is None:
                 self.gui.set_status("✓ Listo para comenzar")
 
-    # --- One transaction (shared by both engines) ---
     def _ejecutar_tx(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
         """Run ONE transaction → (estado "datos" | "vacio" | "error", summary line). Never raises."""
         inicio_tx = time.time()
@@ -429,7 +410,6 @@ class ValidacionFacturaController:
         except Exception as e:
             return "error", f"❌ {tx['nombre']}: error — {e}"
 
-    # --- Sequential engine (the default) ---
     def _correr_secuencial(self, txs, configs=None):
         """Run `txs` one after another → three dicts by "clave": lines, estados, seconds. `configs`
         ({clave: config}, the 2nd run) replaces reading the GUI, also for the parent's file.
@@ -457,7 +437,6 @@ class ValidacionFacturaController:
             duraciones[clave] = time.time() - inicio
         return lineas, resultados, duraciones
 
-    # --- Parallel engine (opt-in): by passes, one SAP window per transaction ---
     @staticmethod
     def _niveles(txs):
         """{clave: level}: 0 if it needs no other transaction, else the level of the one it needs + 1,
@@ -475,12 +454,9 @@ class ValidacionFacturaController:
 
     @classmethod
     def _pasadas(cls, txs, n_ventanas):
-        """Split `txs` into PASSES: the transactions of a pass run at the same time, one per window;
-        a pass starts when the previous one is over, a transaction always goes after the one it
-        needs, and no pass holds more transactions than windows. Gallo, Monivoi, VBRL, FB03 on 2
-        windows → [[Gallo, Monivoi], [VBRL, FB03]]. Each pass starts with all its windows idle
-        (connection.Children(i) waits while window i is busy).
-        """
+        """Split `txs` into PASSES: a pass runs its transactions at once, one per window; it starts when the
+        previous one is over, after the transactions it needs, with no more transactions than windows.
+        E.g. Gallo, Monivoi, VBRL, FB03 on 2 windows → [[Gallo, Monivoi], [VBRL, FB03]]."""
         if int(n_ventanas) < 1:
             raise ValueError("Se necesita al menos una ventana de SAP.")
         nivel = cls._niveles(txs)
@@ -561,10 +537,9 @@ class ValidacionFacturaController:
         return min(max((len(pasada) for pasada in pasadas), default=1), MAX_VENTANAS_SAP)
 
     def _descargar_en_paralelo(self, txs, configs, n_ventanas, pasadas=None):
-        """The P&L way: SAP windows 1..n, the ones the USER already has open (this code never opens
-        one), then the passes (`pasadas`: fixed ones, else split by dependency). With a single
-        window it falls back to the sequential engine.
-        """
+        """The P&L way: SAP windows 1..n, the ones the USER already has open (this code never opens one),
+        then the passes (`pasadas`: fixed ones, else split by dependency). With a single window it falls
+        back to the sequential engine."""
         self.gui.set_status("⏳ Preparando las ventanas de SAP... (no cierre SAP)")
         disponibles = Paralelo.ventanas_disponibles(n_ventanas)
         if disponibles < 2:
@@ -596,13 +571,9 @@ class ValidacionFacturaController:
         ]
 
     def _correr_paralelo(self, txs, configs, n_ventanas, pasadas=None):
-        """Run `txs` pass by pass on SAP windows 1..n_ventanas (Paralelo.correr), each pass inside
-        its own Excel.modo_paralelo(); a pass starts when every transaction of the previous one
-        is over, whatever its result. `pasadas`: fixed passes (the 2nd run's, cut to the windows
-        there are); by default they are split by dependency (`_pasadas`). Runs in the MAIN thread,
-        the only one that touches Tk.
-        Returns the dicts of _correr_secuencial plus, per pass, {"numero", "claves", "segundos"}.
-        """
+        """Run `txs` pass by pass on SAP windows 1..n, each pass inside Excel.modo_paralelo(), the next one
+        starting when the previous is over, whatever its result. `pasadas`: fixed, else `_pasadas`. MAIN
+        thread (Tk). Returns _correr_secuencial's dicts + per pass {numero, claves, segundos}."""
         lineas, resultados, duraciones = {}, {}, {}
         if pasadas is None:
             pasadas = self._pasadas(txs, n_ventanas)
@@ -635,7 +606,6 @@ class ValidacionFacturaController:
                 if ok:
                     estado_tx, linea, segundos = valor
                 else:
-                    # The window itself failed (closed, SAP gone...) before its transaction ran.
                     estado_tx, linea, segundos = (
                         "error", f"❌ {tx['nombre']}: error — {valor}", time.time() - inicio_pasada
                     )
@@ -679,19 +649,13 @@ class ValidacionFacturaController:
         prefijo = f"⚡ Pasada {pasada}/{total_pasadas} · " if pasada else "⚡ "
         return prefijo + "  ".join(partes) + f"  ({minutos}:{seg:02d})"
 
-    # --- Consolidation ---
     def execute_consolidacion(self):
         """Consolidate the Gallo and Monivoi CSVs of the GUI dates (VBRL and FB03 optional), offering to
-        pick by hand a file that is not where it is expected.
-        """
+        pick by hand a file that is not where it is expected."""
         if self._ocupado:
             return
         if self._corrida_gui("corrida_consolidacion") == 2:
-            # The GUI keeps that radio button disabled until the 2nd consolidation is defined.
-            messagebox.showinfo(
-                "2a consolidación",
-                "La 2a consolidación todavía no está definida: por ahora sólo existe la 1a.",
-            )
+            self.execute_consolidacion_segunda()
             return
         if not self.gui.validate_dates():
             return
@@ -715,8 +679,7 @@ class ValidacionFacturaController:
         ruta_vbrl, cancelar = self._resolver_vbrl(input_path, cfg_vbrl["filename"], ruta_monivoi)
         if cancelar:
             return
-        # The FB03 only matters together with the VBRL (the Notas de crédito / PEP Vouchers tables
-        # read both): without a VBRL it is not even asked for.
+        # FB03 only matters with a VBRL (the Notas / PEP tables read both): without one it is not asked for.
         ruta_fb03 = None
         if ruta_vbrl:
             cfg_fb03 = self.gui.get_config("fb03")
@@ -772,16 +735,7 @@ class ValidacionFacturaController:
                 "\n⚠️ El archivo de Monivoi venía sin datos; su pestaña quedó vacía."
                 if resumen["monivoi_sin_datos"] else ""
             )
-            # Warnings (not errors) the stakeholder must see before comparing against the monitor.
-            avisos = (
-                (resumen.get("td_avisos") or [])
-                + (resumen.get("mtd_avisos") or [])
-                + (resumen.get("cruce_avisos") or [])
-                + (resumen.get("vbrl_avisos") or [])
-                + (resumen.get("td_referencias_avisos") or [])
-                + (resumen.get("notas_pep_avisos") or [])
-                + ((resumen.get("listas_2da") or {}).get("avisos") or [])
-            )
+            avisos = self._avisos_consolidacion(resumen)
             nota_ventas = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
 
             lineas_vbrl = ""
@@ -817,7 +771,6 @@ class ValidacionFacturaController:
                 f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}"
                 f"{lineas_vbrl}{nota_monivoi}{nota_ventas}"
             )
-            # Only once the workbook exists and the summary was seen: the 2nd run comes next.
             listas_2da = resumen.get("listas_2da")
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la consolidación")
@@ -831,8 +784,6 @@ class ValidacionFacturaController:
             if "completada" not in self.gui.status_var.get():
                 self.gui.set_status("✓ Listo para comenzar")
         if listas_2da is not None:
-            # Same folder, company code and period the consolidation read (not the GUI as it is now).
-            # The workbook is already saved: a failure here must be shown, never lost in Tk's console.
             try:
                 self._ofrecer_segunda_corrida(listas_2da, cfg_gallo)
             except Exception as e:
@@ -842,7 +793,156 @@ class ValidacionFacturaController:
                     f"El Excel consolidado sí se generó, pero no pude preparar la 2a corrida:\n\n{e}",
                 )
 
-    # The sales buttons' files: (GUI key, name, consolidation function).
+    @staticmethod
+    def _avisos_consolidacion(resumen):
+        """Every warning of a consolidation summary, in the order the stakeholder should read them
+        (the 2nd consolidation's own come last)."""
+        return (
+            (resumen.get("td_avisos") or [])
+            + (resumen.get("mtd_avisos") or [])
+            + (resumen.get("cruce_avisos") or [])
+            + (resumen.get("vbrl_avisos") or [])
+            + (resumen.get("td_referencias_avisos") or [])
+            + (resumen.get("notas_pep_avisos") or [])
+            + ((resumen.get("listas_2da") or {}).get("avisos") or [])
+            + (resumen.get("segunda_avisos") or [])
+        )
+
+    _ETIQUETAS_SEGUNDA = (
+        ("vbrk", "VBRK"), ("fbl5n", "FBL5N"), ("vbrp", "VBRP"),
+        ("knvp", "KNVP"), ("vbrl2", "VBRL (2a corrida)"), ("bkpf", "BKPF"),
+    )
+    # A 2nd-run file older than this many seconds was asked for an older 1st run (lookups may miss).
+    _TOLERANCIA_ANTIGUEDAD = 2
+
+    def execute_consolidacion_segunda(self):
+        """'2a corrida' radio + consolidation button: the 1st consolidation plus the six sheets of the 2nd
+        run and the 'Diferencias' tab (same file name, same code path)."""
+        if self._ocupado:
+            return
+        if not self.gui.validate_dates():
+            return
+
+        cfg_gallo   = self.gui.get_config("gallo")
+        cfg_monivoi = self.gui.get_config("monivoi")
+        input_path  = cfg_gallo["input_path"]
+
+        ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
+        if not ruta_gallo:
+            return
+        ruta_monivoi = self._localizar_archivo(input_path, cfg_monivoi["filename"], "Monivoi")
+        if not ruta_monivoi:
+            return
+        # The VBRL is NOT optional here: 'Diferencias' lists the #N/A rows of the tables it feeds.
+        ruta_vbrl = self._localizar_archivo(
+            input_path, self.gui.get_config("vbrl")["filename"], "VBRL")
+        if not ruta_vbrl:
+            return
+        ruta_fb03, cancelar = self._resolver_fb03(
+            input_path, self.gui.get_config("fb03")["filename"], ruta_gallo)
+        if cancelar:
+            return
+
+        rutas_segunda = {}
+        for clave, etiqueta in self._ETIQUETAS_SEGUNDA:
+            nombre = self.gui.get_config(clave)["filename"]
+            if clave == "fbl5n":
+                ruta = self._localizar_archivo(
+                    input_path, nombre, etiqueta,
+                    tipos=[("Listas de SAP", "*.XLS *.xls *.txt"), ("Todos los archivos", "*.*")])
+            else:
+                ruta = self._localizar_archivo(input_path, nombre, etiqueta)
+            if not ruta:
+                return
+            rutas_segunda[clave] = ruta
+
+        padres = [ruta for ruta in (ruta_gallo, ruta_monivoi, ruta_vbrl, ruta_fb03) if ruta]
+        try:
+            ultimo_padre = max(os.path.getmtime(ruta) for ruta in padres)
+            anteriores = [os.path.basename(ruta) for ruta in rutas_segunda.values()
+                          if os.path.getmtime(ruta) < ultimo_padre - self._TOLERANCIA_ANTIGUEDAD]
+        except OSError:
+            anteriores = []
+        if anteriores:
+            if not messagebox.askyesno(
+                "Descargas de la 2a corrida anteriores a la 1a",
+                "Estos archivos de la 2a corrida se descargaron ANTES que alguno de la 1a corrida:\n\n"
+                + "".join(f"  • {nombre}\n" for nombre in anteriores)
+                + "\nProbablemente no cubren los documentos actuales y 'Diferencias' mostraría #N/A "
+                "de más.\n\n¿Consolidar de todos modos?",
+            ):
+                return
+
+        try:
+            ruta_output = self.gui.get_consolidacion_path()
+        except OSError as e:
+            messagebox.showerror("Error", f"No se pudo usar la carpeta de consolidación:\n{e}")
+            return
+        nombre_salida = f"Consolidado_{os.path.splitext(cfg_gallo['filename'])[0]}.xlsx"
+        ruta_final = os.path.join(ruta_output, nombre_salida)
+
+        linea_fb03 = (f"  📑 FB03    : {os.path.basename(ruta_fb03)}\n" if ruta_fb03 else
+                      "  📑 FB03    : (sin FB03: 'Diferencias' sólo con las Facturas)\n")
+        lineas_segunda = "".join(
+            f"  • {etiqueta:<17}: {os.path.basename(rutas_segunda[clave])}\n"
+            for clave, etiqueta in self._ETIQUETAS_SEGUNDA)
+        reemplaza = ("\n⚠️ Ya existe y se REEMPLAZA (el mismo Excel, completado con las pestañas nuevas)."
+                     if os.path.exists(ruta_final) else "")
+        if not messagebox.askyesno(
+            "Confirmar 2a consolidación",
+            "¿Completar la consolidación con la 2a corrida?\n\n"
+            f"  🐓 Gallo   : {os.path.basename(ruta_gallo)}\n"
+            f"  📊 Monivoi : {os.path.basename(ruta_monivoi)}\n"
+            f"  🧾 VBRL    : {os.path.basename(ruta_vbrl)}\n"
+            f"{linea_fb03}\n"
+            f"2a corrida:\n{lineas_segunda}\n"
+            f"Se generará:\n  {nombre_salida}{reemplaza}\n\n"
+            f"En la carpeta:\n  {ruta_output}"
+        ):
+            return
+
+        self._ocupado = True
+        try:
+            self.gui.disable_buttons()
+            resumen = consolidar_gallo_monivoi(
+                ruta_gallo, ruta_monivoi, ruta_output,
+                nombre_salida=nombre_salida,
+                callback_status=self.gui.set_status,
+                ruta_vbrl=ruta_vbrl,
+                ruta_fb03=ruta_fb03,
+                rutas_segunda=rutas_segunda,
+            )
+            avisos = self._avisos_consolidacion(resumen)
+            nota_avisos = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
+            d = resumen["diferencias"]
+            por_tipo = d["por_tipo"]
+            self.gui.set_status("✅ ¡2a consolidación completada!")
+            messagebox.showinfo(
+                "2a consolidación completada",
+                f"Archivo generado:\n{resumen['ruta']}\n\n"
+                f"  • Renglones en 'Diferencias': {d['filas']:,}"
+                f"  (Facturas {por_tipo.get('Factura', 0):,} · NC {por_tipo.get('NC', 0):,}"
+                f" · PV {por_tipo.get('PV', 0):,})\n"
+                f"  • Σ Monto                    : {d['importe']:,.2f}\n"
+                f"  • Sin No cliente (VBRK)      : {d['sin_vbrk']:,}\n"
+                f"  • Sin Lista de factura       : {d['sin_lista']:,}\n"
+                f"  • Documentos anulados        : {d['anuladas']:,}\n"
+                f"  • Cliente Global / Vendedor / Individual: "
+                f"{d['cliente_global']:,} / {d['vendedor']:,} / {d['cliente_individual']:,}"
+                f"{nota_avisos}"
+            )
+        except (FileNotFoundError, ValueError) as e:
+            self.gui.set_status("❌ Error en la 2a consolidación")
+            messagebox.showerror("Error en la 2a consolidación", str(e))
+        except Exception as e:
+            self.gui.set_status("❌ Error en la 2a consolidación")
+            messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
+        finally:
+            self._ocupado = False
+            self.gui.enable_buttons()
+            if "completada" not in self.gui.status_var.get():
+                self.gui.set_status("✓ Listo para comenzar")
+
     _VENTAS = (
         ("dsd",  "Venta DSD",  consolidar_venta_dsd),
         ("eiap", "Venta EIAP", consolidar_venta_eiap),
@@ -850,9 +950,8 @@ class ValidacionFacturaController:
 
     def _ventas_solas(self, cfg_gallo, cfg_monivoi):
         """The sales downloaded for the GUI range — [(name, config, consolidation function)] — when the
-        folder has NEITHER the Gallo nor the Monivoi file: only the sales buttons were used. [] otherwise
-        (with a Gallo or a Monivoi file, or in "Un día", the usual flow runs).
-        """
+        folder has NEITHER the Gallo nor the Monivoi file (only the sales buttons were used); []
+        otherwise."""
         def existe(cfg):
             return os.path.exists(os.path.join(cfg["input_path"], cfg["filename"]))
         if existe(cfg_gallo) or existe(cfg_monivoi):
@@ -881,7 +980,7 @@ class ValidacionFacturaController:
 
         nombres = [nombre for nombre, _, _ in ventas]
         trabajos = []         # (name, CSV path, workbook name, days SAP was queried for, function)
-        lineas = []           # (CSV file name, period, workbook name) to tell the user
+        lineas = []
         for nombre, cfg, consolidar in ventas:
             hasta = fecha_efectiva_eiap(cfg["date_to"]).strftime(FORMATO_FECHA)
             # Every day SAP was queried for (Hasta - 1), so they all show even without amounts.
@@ -1001,9 +1100,8 @@ class ValidacionFacturaController:
         return ruta, False
 
     def _resolver_fb03(self, input_path, filename, ruta_gallo):
-        """The FB03 CSV (OPTIONAL, only asked for together with a VBRL) → (ruta or None = without FB03,
-        cancelar = do not consolidate).
-        """
+        """The FB03 CSV (OPTIONAL, only asked for with a VBRL) → (ruta or None = without FB03, cancelar = do
+        not consolidate)."""
         ruta = os.path.join(input_path, filename)
         if not os.path.exists(ruta):
             decision = messagebox.askyesnocancel(
@@ -1049,8 +1147,9 @@ class ValidacionFacturaController:
                 return None, False
         return ruta, False
 
-    def _localizar_archivo(self, input_path, filename, etiqueta):
-        """The CSV with the expected name, or one picked by hand if it is not there; None = cancel."""
+    def _localizar_archivo(self, input_path, filename, etiqueta, tipos=None):
+        """The file with the expected name, or one picked by hand if it is not there; None = cancel.
+        `tipos`: the dialog's file types (CSV by default; FBL5N is SAP's text list)."""
         ruta = os.path.join(input_path, filename)
         if os.path.exists(ruta):
             return ruta
@@ -1065,13 +1164,12 @@ class ValidacionFacturaController:
             return None
 
         ruta_manual = filedialog.askopenfilename(
-            title=f"Selecciona el CSV de {etiqueta}",
+            title=f"Selecciona el archivo de {etiqueta}" if tipos else f"Selecciona el CSV de {etiqueta}",
             initialdir=input_path,
-            filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
+            filetypes=tipos or [("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
         )
         return ruta_manual or None
 
-    # --- 2nd run (after the consolidation): VBRK, VBRP, VBRL 2nd run, FBL5N, KNVP, BKPF ---
     def _txs_segunda_corrida(self):
         """PASADAS_2DA as transaction profiles: one list per pass (its transactions share a pass,
         one SAP window each)."""
@@ -1079,10 +1177,9 @@ class ValidacionFacturaController:
 
     @staticmethod
     def _configs_segunda_corrida(base, listas, txs):
-        """One config per transaction from `base`, the config the consolidation read (folder, company
-        code, period) — never the GUI again: it may have been edited while consolidating. The list
-        transactions get their list (a key of `listas`) as "documentos".
-        """
+        """One config per transaction from `base`, the config the consolidation read (folder, company code,
+        period) — never the GUI again: it may have been edited meanwhile. List transactions get their
+        list (a key of `listas`) as "documentos"."""
         configs = {}
         for tx in txs:
             cfg = {campo: base[campo] for campo in
@@ -1111,9 +1208,8 @@ class ValidacionFacturaController:
         self._execute_segunda_corrida(listas, base, origen=origen)
 
     def _execute_segunda_corrida(self, listas, base, origen=None):
-        """Confirm and run the 2nd run (two passes of three at once with the GUI checkbox, else one
-        after another) and show ONE summary.
-        """
+        """Confirm and run the 2nd run (two passes of three at once with the GUI checkbox, else one after
+        another) and show ONE summary."""
         if self._ocupado:
             return
         pasadas = self._txs_segunda_corrida()
@@ -1265,7 +1361,6 @@ class ValidacionFacturaController:
             tx, config, resultados, descargar, cfg_padre=cfg_padre, estado_cb=estado_cb)
         return estado, linea + self._texto_info(info)
 
-    # --- Download cores ---
     def _descargar_vbrl(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
         """VBRL step of the download engine (see `_descargar_con_documentos`)."""
         extra = {} if session is None else {"session": session}
@@ -1299,16 +1394,12 @@ class ValidacionFacturaController:
     def _descargar_con_documentos(
         self, tx, config, resultados, descargar, *, cfg_padre=None, estado_cb=None
     ):
-        """Step of the transactions queried ONCE with a list read from the file their parent
-        (tx["requiere"]) downloaded in THIS run: VBRL ← Monivoi 'Factura'; FB03 ← Gallo
-        'Nº documento' (C2/C6, Global). `descargar(documents)` runs the SAP function. A worker
-        passes `cfg_padre` (read in the main thread) and no `estado_cb`: only the main thread
-        may touch Tk. Returns (estado, summary line).
-        """
+        """Step of transactions queried ONCE with a list from the file their parent (tx["requiere"])
+        downloaded in THIS run: VBRL ← Monivoi 'Factura'; FB03 ← Gallo 'Nº documento' (C2/C6, Global).
+        Workers get `cfg_padre`, no `estado_cb` (Tk: main thread only). Returns (estado, summary line)."""
         padre = tx["requiere"]
         nombre_padre = self._nombre_corto(self._TX_POR_CLAVE[padre]) if padre in self._TX_POR_CLAVE else padre
         if padre not in resultados:
-            # Not downloaded in THIS run: an older file must never be used.
             return "error", (
                 f"⚠️ {tx['nombre']}: omitido — {nombre_padre} no se descargó en esta corrida"
             )
@@ -1324,7 +1415,6 @@ class ValidacionFacturaController:
 
         documentos, filas, col_documento = tx["leer_documentos"](ruta_padre)
         if filas == 0:
-            # The parent is the 'Sin datos' placeholder: nothing to ask SAP, same placeholder here.
             Archivos.crear_sin_datos(ruta_salida)
             return "vacio", f"⚠️ {tx['nombre']}: {nombre_padre} sin datos → {config['filename']} (vacío)"
         if not documentos:
@@ -1382,7 +1472,6 @@ class ValidacionFacturaController:
             **extra,
         )
 
-    # --- Helpers ---
     @staticmethod
     def _iterar_dias(desde, hasta):
         """Return the list of 'DD.MM.YYYY' dates between desde and hasta (inclusive)."""
@@ -1394,7 +1483,6 @@ class ValidacionFacturaController:
             d += timedelta(days=1)
         return dias
 
-    # --- 'Venta DSD' / 'Venta EIAP' ---
     @staticmethod
     def _validar_venta(nombre, config):
         """A sales button (`nombre`: 'Venta DSD' / 'Venta EIAP') needs a range that still makes sense once

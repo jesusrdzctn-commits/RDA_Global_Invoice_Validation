@@ -193,10 +193,8 @@ class SAP:
 
     @staticmethod
     def sin_partidas(session, ruta_archivo, mensajes_extra=()):
-        """
-        SAP said "no entries" (one of the texts the transaction passes, lower case):
-        close the message, write the 'Sin datos' placeholder and return True. Never raises.
-        """
+        """SAP said "no entries" (one of the texts the transaction passes, lower case): close the message,
+        write the 'Sin datos' placeholder and return True. Never raises."""
         try:
             mensajes = tuple(mensajes_extra)
             textos = [SAP.aviso(session)]
@@ -233,10 +231,8 @@ class SAP:
 
     @staticmethod
     def renglones_de_lista(elementos):
-        """
-        Those elements by list row: {row: {"texto": its labels left to right,
-        "etiquetas": [(column, label, text)], "casillas": [checkboxes]}}.
-        """
+        """The elements (from elementos_de_lista) grouped by list row: {row: {"texto": labels left to right,
+        "etiquetas": [(column, label, text)], "casillas": [checkboxes]}}."""
         renglones = {}
         for componente, tipo, texto, posicion in elementos:
             if posicion is None:
@@ -264,11 +260,9 @@ class SAP:
 # Clipboard
 # ======================================================================
 class Portapapeles:
-    """
-    The Windows clipboard, ONE for the whole machine. Every list pasted into SAP goes
-    write → read back → SAP imports it inside exclusivo(), so another SAP window cannot
-    overwrite it halfway. NOTE: it replaces whatever the user had copied.
-    """
+    """The Windows clipboard, ONE for the whole machine. Every list pasted into SAP goes write → read back →
+    SAP imports it inside exclusivo(), so another SAP window cannot overwrite it halfway. NOTE: it
+    replaces whatever the user had copied."""
     _lock = threading.RLock()
     ESPERA = 300                   # s a window waits for another one to release it
 
@@ -352,12 +346,9 @@ class Portapapeles:
 # Excel (shared by every SAP window)
 # ======================================================================
 class Excel:
-    """
-    After an export SAP opens the file in Excel, and while Excel holds it the temporary
-    .xlsx cannot be deleted. Excel is SHARED by every SAP window: during a parallel run
-    (modo_paralelo) only the file of the own export is closed; quitting empty instances
-    and killing a stuck Excel wait until nothing is in flight (limpiar_tras_paralelo).
-    """
+    """After an export SAP opens the file in Excel; while Excel holds it the temporary .xlsx cannot be
+    deleted. Excel is SHARED by every SAP window: in a parallel run (modo_paralelo) only the own export's
+    file is closed; quitting empty instances and killing a stuck Excel wait for limpiar_tras_paralelo."""
     _lock = threading.Lock()
     _nivel = 0                     # > 0 while a parallel run is active
     _pendientes = []               # temporary .xlsx that stayed locked during a parallel run
@@ -381,12 +372,9 @@ class Excel:
 
     @staticmethod
     def liberar_archivo(ruta_archivo):
-        """
-        Last resort for a file still locked: ask the Windows Restart Manager which processes
-        hold it and terminate only the ones named Excel, never SAP (typical in Gallo: an Excel
-        stuck on a modal dialog ignores COM but keeps the file). The data is already on disk;
-        other workbooks open in that same Excel would lose their unsaved changes.
-        """
+        """Last resort for a file still locked: ask the Windows Restart Manager which processes hold it and
+        terminate only the Excel ones, never SAP (an Excel stuck on a modal dialog ignores COM but keeps
+        the file). Unsaved changes of other workbooks in that Excel are lost."""
         try:
             rstrtmgr = ctypes.WinDLL("rstrtmgr")
 
@@ -409,7 +397,7 @@ class Excel:
                 ]
 
             sesion = wintypes.DWORD(0)
-            clave = (ctypes.c_wchar * (32 + 1))()          # CCH_RM_SESSION_KEY = 32
+            clave = (ctypes.c_wchar * (32 + 1))()
             if rstrtmgr.RmStartSession(ctypes.byref(sesion), 0, clave) != 0:
                 print("[RM] No se pudo iniciar la sesión de Restart Manager.")
                 return False
@@ -424,7 +412,6 @@ class Excel:
                 necesarios = wintypes.UINT(0)
                 cuantos = wintypes.UINT(0)
                 razon = wintypes.DWORD(0)
-                # 1st call: how many processes (it returns ERROR_MORE_DATA)
                 rstrtmgr.RmGetList(sesion, ctypes.byref(necesarios),
                                    ctypes.byref(cuantos), None, ctypes.byref(razon))
                 if necesarios.value == 0:
@@ -442,7 +429,7 @@ class Excel:
                     nombre = infos[i].strAppName or "<desconocido>"
                     pid = int(infos[i].Process.dwProcessId)
                     print(f"[RM] '{os.path.basename(ruta_archivo)}' lo tiene: {nombre} (PID {pid})")
-                    if "excel" in nombre.lower():                 # ONLY Excel
+                    if "excel" in nombre.lower():
                         if Excel.terminar_proceso(pid):
                             print(f"[RM] Excel cerrado (PID {pid}) → archivo liberado.")
                             liberado = True
@@ -457,11 +444,9 @@ class Excel:
 
     @staticmethod
     def instancias():
-        """
-        EVERY Excel instance of the machine, found through the workbooks registered in the
-        Running Object Table (SAP often opens its export in an instance of its own, which
-        GetObject alone would never reach), plus the main one. Never raises.
-        """
+        """EVERY Excel instance of the machine, found through the workbooks in the Running Object Table (SAP
+        often opens its export in an instance GetObject alone would never reach), plus the main one.
+        Never raises."""
         instancias = {}
         try:
             rot = pythoncom.GetRunningObjectTable()
@@ -505,12 +490,9 @@ class Excel:
 
     @classmethod
     def cerrar_libro(cls, ruta_archivo, intentos=3, espera=1):
-        """
-        Close (without saving) the exported file in every Excel instance: regular workbooks (by
-        full path, or by name: SAP may report the path in another shape) and Protected View
-        windows (Excel opens big exports there, outside Workbooks). An instance left empty is
-        quit, except during a parallel run. Retries in case Excel had not finished opening it.
-        """
+        """Close (unsaved) the exported file in every Excel instance: regular workbooks (by full path or by
+        name: SAP may report another path shape) and Protected View windows. An emptied instance is quit,
+        except in a parallel run. Retries in case Excel had not finished opening it."""
         ruta_abs = os.path.normcase(os.path.abspath(ruta_archivo))
         objetivo = os.path.normcase(os.path.basename(ruta_archivo))
         for _ in range(intentos):
@@ -550,7 +532,6 @@ class Excel:
                                 continue
                     except Exception:
                         pass
-                    # The empty Excel may be the one ANOTHER window's export is starting up in.
                     if not cls.activo() and cls.cerrar_si_vacia(excel):
                         print("[EXCEL] Instancia de Excel cerrada (sin libros abiertos)")
                 finally:
@@ -586,11 +567,9 @@ class Excel:
 
     @classmethod
     def borrar_xlsx(cls, ruta_xlsx, intentos=10, espera=2):
-        """
-        Delete the temporary .xlsx, closing it in Excel before every attempt (a cold Excel takes
-        a while to open a big file). Halfway through, the Restart Manager may close the Excel
-        that holds it, except during a parallel run: then the file waits for limpiar_tras_paralelo.
-        """
+        """Delete the temporary .xlsx, closing it in Excel before every attempt (a cold Excel takes a while
+        to open a big file). The Restart Manager may close the holding Excel midway, except in a parallel
+        run (then the file waits for limpiar_tras_paralelo)."""
         for intento in range(1, intentos + 1):
             cls.cerrar_libro(ruta_xlsx)
             try:
@@ -704,10 +683,8 @@ class Archivos:
 
     @staticmethod
     def esperar_nuevo(ruta, desde, timeout=90, estable=1.0):
-        """
-        True once SAP finished WRITING `ruta`: it exists, it was modified after `desde` (a file
-        of an earlier run must not count) and its size did not change for `estable` s.
-        """
+        """True once SAP finished WRITING `ruta`: it exists, was modified after `desde` (an earlier run's
+        file must not count) and its size held for `estable` s."""
         limite = time.time() + timeout
         ultimo_tam = None
         estable_desde = None
@@ -742,11 +719,8 @@ class Archivos:
 
     @staticmethod
     def normalizar_documentos(documentos, etiqueta):
-        """
-        The document numbers for the clipboard: text, trimmed, no blanks or duplicates (first
-        order kept), without the '.0' of a float. ValueError if nothing is left: with an empty
-        selection field SAP would read the WHOLE table.
-        """
+        """Document numbers for the clipboard: text, trimmed, no blanks or duplicates (order kept), no '.0'.
+        ValueError if nothing is left: an empty selection field would make SAP read the WHOLE table."""
         if documentos is None or isinstance(documentos, (str, bytes)):
             raise ValueError("La lista de documentos debe ser una colección (lista), no un texto suelto.")
         vistos = set()
@@ -774,12 +748,9 @@ class Archivos:
 
     @staticmethod
     def validar_csv(ruta_csv, documentos, etiqueta, unidad=("documento(s)", "pedido(s)"), revisar=None):
-        """
-        Check a converted download before it replaces the final file: it must have rows and
-        pass `revisar(df)` (RuntimeError otherwise). Then report how many of the requested
-        documents appear in its best column (only reported: the table may key its rows by
-        another folio). Returns (rows, requested, found).
-        """
+        """Check a converted download before it replaces the final file: it must have rows and pass
+        `revisar(df)` (RuntimeError otherwise). Reports how many requested documents appear in its best
+        column (report only: the table may key rows by another folio). Returns (rows, requested, found)."""
         df = pd.read_csv(ruta_csv, dtype=str, encoding="utf-8-sig", keep_default_na=False)
         if df.shape[1] < 1 or df.empty:
             raise RuntimeError(f"El archivo exportado de {etiqueta} no trae filas.")
@@ -806,23 +777,18 @@ class Archivos:
 # Several SAP windows at once
 # ======================================================================
 class Paralelo:
-    """
-    The P&L way: the SAP windows of the first connection are opened by the USER (three of them,
-    always, before running the program; this code never opens one), then one thread per window:
-    it initializes COM, takes its window BY INDEX (connection.Children(i)) and runs its download.
-    Each thread can label the console lines it prints (etiqueta/marca) to show whether the
-    windows really overlapped.
-    """
+    """The P&L way: the USER opens three SAP windows of the first connection before running (this code never
+    opens one); then one thread per window initializes COM, takes its window BY INDEX
+    (connection.Children(i)) and runs its download. Threads can label console lines (etiqueta/marca) to
+    show whether windows overlapped."""
     DESFASE = 0                    # s between the starts of two windows of a pass (P&L used 30)
     _hilo = threading.local()
 
     @staticmethod
     def ventanas_disponibles(deseadas):
-        """
-        How many windows of the first connection can be used: the ones that are open, up to
-        `deseadas` (at most MAX_VENTANAS_SAP). It NEVER opens a window: with fewer than wanted, the
-        caller works with what there is. ConnectionError if SAP GUI is not running.
-        """
+        """How many windows of the first connection can be used: the open ones, up to `deseadas` (max
+        MAX_VENTANAS_SAP). It NEVER opens one; with fewer than wanted the caller works with what there
+        is. ConnectionError if SAP GUI is not running."""
         deseadas = min(int(deseadas), MAX_VENTANAS_SAP)
         if deseadas < 1:
             raise ValueError("Se necesita al menos una ventana de SAP.")
@@ -830,11 +796,8 @@ class Paralelo:
 
     @staticmethod
     def en_ventana(indice, funcion, *args, **kwargs):
-        """
-        Run funcion(*args, session=<window `indice`>, **kwargs) in the CURRENT thread, inside
-        its own COM apartment (a COM object only works in the thread that got it). Whatever
-        `funcion` returns is returned and whatever it raises is raised again.
-        """
+        """Run funcion(*args, session=<window `indice`>, **kwargs) in the CURRENT thread, inside its own COM
+        apartment (a COM object only works in the thread that got it); returns its result or re-raises."""
         pythoncom.CoInitialize()
         error = resultado = None
         try:
@@ -872,15 +835,9 @@ class Paralelo:
 
     @classmethod
     def correr(cls, trabajos, al_esperar=None, intervalo=1.0, al_terminar=None):
-        """
-        Run every job — (window index, function, args) — in its own thread at the same time and
-        wait for all of them. Returns, in order, (True, result) or (False, exception) per job.
-        `al_esperar(positions still running)` is called from THIS thread about every `intervalo`
-        s (Tk must only be touched by its own thread); if it raises, the windows are still
-        waited for before the error goes up. `al_terminar(position)` runs in the job's own
-        thread as soon as it ends, WHATEVER happened (even if its window could not be reached):
-        the place to release another window that waits for this one. Never Tk there.
-        """
+        """Run every job (window index, function, args) in its own thread and wait → per job (True, result)
+        or (False, exception). `al_esperar(running)` runs in THIS thread every `intervalo` s (the only Tk
+        user); `al_terminar(position)` runs in the job's thread at its end, whatever happened."""
         salidas = [None] * len(trabajos)
 
         def correr_uno(posicion, indice, funcion, args):
@@ -945,12 +902,9 @@ class Paralelo:
 # Downloads
 # ======================================================================
 class Descarga:
-    """
-    What every download shares: the paths, the SAP window, the error handling and the clean-up.
-    A subclass writes its recording in pasos(); ejecutar() returns True (data) / False (no data
-    or a handled error, already printed). ExportacionTruncadaError and DescargaPorRevisarError
-    go up to the controller, which shows them in the summary.
-    """
+    """What every download shares: paths, SAP window, error handling and clean-up. A subclass writes its
+    recording in pasos(); ejecutar() returns True (data) / False (no data or handled error, already
+    printed). ExportacionTruncadaError / DescargaPorRevisarError go up to the controller."""
     NOMBRE = ""                    # name in the console messages ('Gallo_FAGLL03')
     MARCA = ""                     # prefix of its timeline lines ('FAGLL03')
 
@@ -965,7 +919,7 @@ class Descarga:
         self.ruta_xlsx = os.path.join(self.carpeta, self.nombre_xlsx)
         self._recibida = session                  # adopted by conectar(), so a run that fails its
         self.session = None                       # checks never touches (presses Back in) a window
-        self.en_menu = False                      # True once the run left SAP on the main menu
+        self.en_menu = False
 
     def ejecutar(self):
         try:
@@ -1051,10 +1005,9 @@ class Gallo(Descarga):
         self.clases = tuple(clases or ())              # document classes to filter by (empty = all)
 
     def filtrar_clases(self, s):
-        """Dynamic selections > document class = self.clases (port of the EIAP recording). The classes
-        are pasted through the clipboard, like the accounts: the recording typed them row by row, and
-        the popup only shows a few rows, so seven classes would not fit without scrolling.
-        """
+        """Dynamic selections > document class = self.clases (port of the EIAP recording), pasted through
+        the clipboard like the accounts: the popup shows few rows, so seven classes would not fit without
+        scrolling."""
         s.findById("wnd[0]/tbar[1]/btn[25]").press()
         arbol = s.findById(self.ARBOL)
         arbol.expandNode(self.NODO_PADRE)
@@ -1069,15 +1022,14 @@ class Gallo(Descarga):
             Portapapeles.importar_en_popup(s)
             time.sleep(1)
         self.verificar_clases(s)
-        s.findById("wnd[1]/tbar[0]/btn[8]").press()                   # copy
+        s.findById("wnd[1]/tbar[0]/btn[8]").press()
         if not SAP.esperar_cierre(s):
             raise RuntimeError("El popup de selección de clases de documento sigue abierto.")
         s.findById("wnd[0]/tbar[0]/btn[11]").press()
 
     def verificar_clases(self, s):
-        """After the paste: the first rows of the popup (as many as it shows) must be the classes asked
-        for, in order. A paste that landed somewhere else would query the wrong documents.
-        """
+        """After the paste: the first rows of the popup (as many as it shows) must be the classes asked for,
+        in order; a paste that landed elsewhere would query the wrong documents."""
         for i, clase in enumerate(self.clases):
             fila = self.FILA_CLASE.format(i)
             if not SAP.existe(s, fila):
@@ -1097,7 +1049,6 @@ class Gallo(Descarga):
             datetime.strptime(fecha, "%d.%m.%Y")          # ValueError if malformed
         os.makedirs(self.carpeta, exist_ok=True)
         s = self.conectar()
-        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFAGLL03"
         s.findById("wnd[0]").sendVKey(0)
         if self.clases:
@@ -1112,11 +1063,11 @@ class Gallo(Descarga):
         s.findById("wnd[1]/tbar[0]/btn[0]").press()
         s.findById("wnd[1]/tbar[0]/btn[8]").press()
 
-        s.findById("wnd[0]/usr/radX_AISEL").select()                  # all items
+        s.findById("wnd[0]/usr/radX_AISEL").select()
         s.findById("wnd[0]/usr/ctxtSD_BUKRS-LOW").text = self.sociedad
         s.findById("wnd[0]/usr/ctxtSO_BUDAT-LOW").text = self.desde
         s.findById("wnd[0]/usr/ctxtSO_BUDAT-HIGH").text = self.hasta
-        campo = s.findById("wnd[0]/usr/ctxtPA_VARI")                  # layout always by name
+        campo = s.findById("wnd[0]/usr/ctxtPA_VARI")
         campo.text = self.variante
         campo.setFocus()
         campo.caretPosition = len(self.variante)
@@ -1213,15 +1164,13 @@ class Monivoi(Descarga):
 
 
 class ZSE16:
-    """
-    ZSE16 popups. 'Fields for selection' is remembered PER USER, so the VBRL download sets
-    it on every run; the list of layouts comes as an ALV grid or as a classic list.
-    """
-    MENU_CAMPOS = "wnd[0]/mbar/menu[3]/menu[2]"        # Settings > Fields for selection
-    BTN_DESMARCAR = "wnd[1]/tbar[0]/btn[14]"           # Deselect all
-    BTN_BUSCAR = "wnd[1]/tbar[0]/btn[71]"              # Find (of a list popup)
-    COLUMNA_LAYOUT = "VARIANT"                         # technical name of the grid's 'Layout' column
-    COLUMNA_DESCRIPCION = "TEXT"                       # ... and of its 'Layout description' column
+    """ZSE16 popups. 'Fields for selection' is remembered PER USER, so the VBRL download sets it on every
+    run; the list of layouts comes as an ALV grid or as a classic list."""
+    MENU_CAMPOS = "wnd[0]/mbar/menu[3]/menu[2]"
+    BTN_DESMARCAR = "wnd[1]/tbar[0]/btn[14]"
+    BTN_BUSCAR = "wnd[1]/tbar[0]/btn[71]"
+    COLUMNA_LAYOUT = "VARIANT"
+    COLUMNA_DESCRIPCION = "TEXT"
 
     @staticmethod
     def patron(campo):
@@ -1231,12 +1180,9 @@ class ZSE16:
 
     @staticmethod
     def renglon_del_campo(session, campo):
-        """
-        Among the lines of 'Fields for selection' on screen, the one of `campo`: it has a
-        CHECKBOX and the whole name in its texts (whether SAP writes it first, after the
-        description or in the same label). Returns (row or None, rows); RuntimeError if two
-        lines could be it (a wrong field would query other documents).
-        """
+        """Among the 'Fields for selection' lines on screen, the one of `campo`: it has a CHECKBOX and the
+        whole name in its texts (wherever SAP puts it). Returns (row or None, rows); RuntimeError if two
+        lines could be it (a wrong field would query other documents)."""
         patron = ZSE16.patron(campo)
         renglones = SAP.renglones_de_lista(SAP.elementos_de_lista(session, "wnd[1]/usr"))
         candidatos = sorted(f for f, r in renglones.items()
@@ -1251,12 +1197,9 @@ class ZSE16:
 
     @staticmethod
     def buscar_campo(session, campo, intentos=3):
-        """
-        Bring `campo` into view with the recording's Find (type it → hit list → F2). The hits
-        with the whole name are tried in order, those that START with it first; after every F2
-        the field line must be on screen, so a wrong hit costs one more Find, never a wrong field.
-        Returns its row; RuntimeError if it never shows up.
-        """
+        """Bring `campo` into view with the recording's Find (type → hits → F2). Hits with the whole name
+        are tried in order, START-with ones first; the field line must show after each F2, so a wrong hit
+        costs one more Find, never a wrong field. Returns its row; RuntimeError if never found."""
         patron = ZSE16.patron(campo)
         al_inicio = re.compile(rf"[\W\d_]*{re.escape(campo.strip().upper())}(?![A-Z0-9_/])")
         vistos = "(ninguna)"
@@ -1282,16 +1225,15 @@ class ZSE16:
                                        (etiquetas[0][1], etiquetas[0][2]))
                 etiqueta.setFocus()
                 etiqueta.caretPosition = min(3, len(texto))
-                session.findById("wnd[3]").sendVKey(2)                  # go to the hit
-            elif SAP.existe(session, "wnd[2]"):                         # the Find found nothing
+                session.findById("wnd[3]").sendVKey(2)
+            elif SAP.existe(session, "wnd[2]"):
                 aviso = SAP.aviso(session)
                 SAP.cerrar_popups(session, encima_de=1)
                 raise RuntimeError(f"SAP no encontró el campo '{campo}' en 'Campos para selección' "
                                    f"(mensaje: '{aviso or 'sin mensaje'}').")
-            # (neither wnd[3] nor wnd[2]: SAP jumped straight to its only hit)
 
             if SAP.existe(session, "wnd[2]"):
-                SAP.cerrar_popups(session, encima_de=1)                # that hit was not a line to go to
+                SAP.cerrar_popups(session, encima_de=1)
             if not SAP.esperar(session, "wnd[1]/usr", 5):
                 raise RuntimeError("La ventana 'Campos para selección' se cerró al buscar el campo.")
             fila, _ = ZSE16.renglon_del_campo(session, campo)
@@ -1315,14 +1257,9 @@ class ZSE16:
 
     @staticmethod
     def dejar_solo_campo(session, campo, ok_extra=False):
-        """
-        `campo` as the ONLY selection field, like VBRL.vbs: Fields for selection → Deselect all
-        → tick its line → OK. The line is found by its text (the recording ticks a fixed
-        chk[2,5]); the Find is only used when it is not on screen. Guards: no other visible
-        field left ticked, the tick read back, and exactly ONE field (I1, no I2) at the end.
-        `ok_extra`: the recording presses OK a SECOND time (VBRP.vbs), see confirmar_campos.
-        Returns the text of the line it ticked ('VBELN  Lista de facturas'), to show which field is queried.
-        """
+        """`campo` as the ONLY selection field: Fields for selection → Deselect all → tick its line (found
+        by text; Find only if off screen) → OK. Guards: no other visible field ticked, tick read back,
+        exactly ONE field (I1, no I2). `ok_extra`: 2nd OK (VBRP.vbs). Returns the ticked line's text."""
         session.findById(ZSE16.MENU_CAMPOS).select()
         if not SAP.esperar(session, ZSE16.BTN_DESMARCAR, 10):
             raise RuntimeError("SAP no abrió la ventana 'Campos para selección' de ZSE16.")
@@ -1358,13 +1295,10 @@ class ZSE16:
             )
         return renglones[fila]["texto"]
 
-    # Seconds a popup may take to close (or to show up, for VBRP's recorded 2nd OK) after an OK.
+    # Seconds a popup may take to close (or to show up, VBRP's recorded 2nd OK) after an OK.
     ESPERA_CIERRE = 10
     ESPERA_SEGUNDO_POPUP = 2
-    # Informational windows SAP shows after that OK and to which OK is the recorded answer (VBRP.vbs
-    # presses OK twice). Upper-case fragments of their text, so they do not depend on SAP's language.
-    # Seen on 23-oct-2026: 'Información': "Tipo FLTP del Dictionary ABAP para el elemento de dynpro no
-    # permitido" (ZSE16 cannot put a floating-point field on its selection screen and says so).
+    # Informational windows answered with OK, as recorded: upper-case fragments, language-proof.
     AVISOS_CONOCIDOS = ("FLTP",)
 
     @staticmethod
@@ -1375,18 +1309,13 @@ class ZSE16:
 
     @staticmethod
     def confirmar_campos(session, ok_extra=False):
-        """OK of 'Fields for selection', then OK once more ONLY for what the recording answers with OK:
-        the SAME popup still open, or one of the known informational windows (AVISOS_CONOCIDOS), which
-        gets a calm one-line log. With `ok_extra` (VBRP.vbs: SAP shows its 2nd window a moment after the
-        1st OK) it also waits ESPERA_SEGUNDO_POPUP s for that window to appear. Any OTHER window is
-        never confirmed blindly: it is an error that names it (title and text). The callers then check
-        the selection screen (I1..In), so a second OK that did something else never goes unnoticed.
-        """
-        session.findById("wnd[1]/tbar[0]/btn[0]").press()                 # OK
+        """OK of 'Fields for selection', then a 2nd OK ONLY for what the recording answers with OK: the SAME
+        popup still open or a known informational window (AVISOS_CONOCIDOS); `ok_extra` (VBRP.vbs) waits
+        ESPERA_SEGUNDO_POPUP s for it. Any OTHER window raises an error naming it."""
+        session.findById("wnd[1]/tbar[0]/btn[0]").press()
         SAP.esperar_libre(session)
         cerrada = SAP.esperar_cierre(session, timeout=ZSE16.ESPERA_CIERRE)
         if ok_extra and cerrada:
-            # The recorded second window may open a moment after the first one closed.
             cerrada = not SAP.esperar(session, "wnd[1]", ZSE16.ESPERA_SEGUNDO_POPUP)
         if not cerrada:
             mismo_popup = SAP.existe(session, ZSE16.BTN_DESMARCAR)
@@ -1397,7 +1326,7 @@ class ZSE16:
             elif ZSE16.es_aviso_conocido(ventana):
                 print(f"[ZSE16] SAP mostró el aviso informativo {ventana}: le doy OK, como en la grabación.")
             if mismo_popup or ZSE16.es_aviso_conocido(ventana):
-                session.findById("wnd[1]/tbar[0]/btn[0]").press()         # OK again, as recorded
+                session.findById("wnd[1]/tbar[0]/btn[0]").press()
                 SAP.esperar_libre(session)
                 cerrada = SAP.esperar_cierre(session, timeout=ZSE16.ESPERA_CIERRE)
         if not cerrada:
@@ -1453,11 +1382,9 @@ class ZSE16:
 
     @staticmethod
     def marcar_campos(session, campos):
-        """`campos` (technical names, in TABLE order) as the ONLY selection fields, so they become
-        I1..In in that order. They are the first fields of the table, so they must all be on screen
-        when the popup opens (no Find: it would scroll the others away) and their lines must follow
-        the given order; otherwise I1..In would not be those fields. Returns their rows.
-        """
+        """`campos` (technical names, TABLE order) as the ONLY selection fields, so they become I1..In in
+        that order. They are the table's first fields: all must be on screen when the popup opens (no
+        Find: it would scroll the others away) and follow the given order. Returns their rows."""
         renglones = ZSE16._abrir_campos_desmarcados(session)
         filas = []
         for campo in campos:
@@ -1486,14 +1413,9 @@ class ZSE16:
 
     @staticmethod
     def elegir_layout_en_grid(session, id_grid, nombre):
-        """
-        The layout `nombre` in the ALV grid of layouts, BY NAME (the recording clicks a fixed row,
-        which is whatever layout sorts there). Tried in this order, each step must find EXACTLY one
-        row (two = ambiguous = error; none = next step): 1) the layout name ('VARIANT'), ignoring
-        case — so a name that matches exactly behaves as always; 2) the name without accents
-        ('VALIDACIÓN' == 'VALIDACION'); 3) the layout DESCRIPTION ('TEXT'), without accents. The
-        popup must close after the click. Returns the name it chose.
-        """
+        """Layout `nombre` in the ALV grid, BY NAME (the recording clicks a fixed row). Each step must find
+        EXACTLY one row (two = ambiguous = error; none = next step): 1) name ('VARIANT') ignoring case;
+        2) name without accents; 3) DESCRIPTION ('TEXT') without accents. Returns the name chosen."""
         grid = session.findById(id_grid)
         try:
             nombres = [str(grid.GetCellValue(i, ZSE16.COLUMNA_LAYOUT)).strip()
@@ -1509,7 +1431,7 @@ class ZSE16:
             textos = [str(grid.GetCellValue(i, ZSE16.COLUMNA_DESCRIPCION)).strip()
                       for i in range(len(nombres))]
         except Exception:
-            textos = [""] * len(nombres)          # no description column: steps 1 and 2 only
+            textos = [""] * len(nombres)
         buscado = ZSE16.sin_acentos(nombre)
         pasos = (
             ("nombre", lambda i: nombres[i].upper() == nombre.strip().upper()),
@@ -1568,11 +1490,9 @@ class ZSE16:
 
     @staticmethod
     def indice_coincidencia(textos, nombre, que="el layout"):
-        """
-        Which hit line is the item `nombre`: it must contain the WHOLE name ('VALS2', '/VALS'
-        are other items) and START with it (not a description or a header that mentions it),
-        and exactly one line may qualify. RuntimeError listing the lines otherwise.
-        """
+        """Which hit line is the item `nombre`: it must contain the WHOLE name ('VALS2', '/VALS' are other
+        items), START with it, and exactly one line may qualify; RuntimeError listing the lines
+        otherwise."""
         objetivo = re.escape(nombre.strip().upper())
         palabra = re.compile(rf"(?<![A-Z0-9_/]){objetivo}(?![A-Z0-9_])")
         al_inicio = re.compile(rf"[\W\d_]*{objetivo}(?![A-Z0-9_])")
@@ -1589,13 +1509,9 @@ class ZSE16:
 
 
 class DescargaConLista(Descarga):
-    """
-    VBRL and FB03: ONE query for a list of documents pasted through the clipboard, saved as
-    .csv. The conversion goes to a '.part' that replaces the final file only once checked;
-    if something fails after SAP exported, the CSV is still kept as *_REVISAR.csv (or as the
-    .part if even that rename fails; the consolidation reads neither) and
-    DescargaPorRevisarError says why.
-    """
+    """VBRL and FB03: ONE query for a document list pasted via the clipboard, saved as .csv. Converted to a
+    '.part' that replaces the final file only once checked; if it fails after SAP exported, the CSV is
+    kept as *_REVISAR.csv (not read by the consolidation) and DescargaPorRevisarError says why."""
     ETIQUETA = ""                  # 'VBRL' / 'FB03'
     UNIDAD = ("documento(s)", "pedido(s)")
     MENSAJES_SIN_DATOS = ()        # status-bar texts (lower case) meaning "no entries"
@@ -1635,16 +1551,14 @@ class DescargaConLista(Descarga):
         s.findById(boton).press()
         with Portapapeles.exclusivo():
             Portapapeles.copiar_y_verificar("\r\n".join(self.lista))
-            s.findById("wnd[1]/tbar[0]/btn[24]").press()            # import from clipboard
+            s.findById("wnd[1]/tbar[0]/btn[24]").press()
             time.sleep(1 + len(self.lista) / 5000)                   # let SAP load the list
         s.findById("wnd[1]/tbar[0]/btn[8]").press()                 # copy and close (no Enter before it)
         SAP.esperar_libre(s)
 
     def sin_resultados(self, id_seleccion, que):
-        """
-        After Execute: True if SAP said there are no entries (placeholder written). Still on
-        the selection screen with any other message: RuntimeError with SAP's text (no guessing).
-        """
+        """After Execute: True if SAP said there are no entries (placeholder written). Still on the
+        selection screen with any other message: RuntimeError with SAP's text (no guessing)."""
         if SAP.sin_partidas(self.session, self.ruta, self.MENSAJES_SIN_DATOS):
             return True
         if SAP.existe(self.session, id_seleccion):
@@ -1732,17 +1646,15 @@ class VBRL(DescargaConLista):
     ETIQUETA = "VBRL"
     ARCHIVO = "VBRL.csv"
     UNIDAD = ("factura(s)", "pedida(s)")
-    CAMPO = "VBELN"                # the ONLY selection field: the invoice of the Monivoi 'Factura' column
-    LAYOUT = "VALS"                # always picked BY NAME
+    CAMPO = "VBELN"
+    LAYOUT = "VALS"
     GRID_LAYOUTS = "wnd[1]/usr/ssubD0500_SUBSCREEN:SAPLSLVC_DIALOG:0501/cntlG51_CONTAINER/shellcont/shell"
     MENU_EXPORTAR_GRID = "wnd[0]/mbar/menu[0]/menu[10]/menu[3]/menu[1]"     # 17-oct-2026 recording
-    MENU_EXPORTAR_LISTA = "wnd[0]/mbar/menu[0]/menu[10]/menu[1]/menu[1]"    # earlier recording
-    # The consolidation reads VBRL BY POSITION (D = invoice, E = amount, like the stakeholder's
-    # XLOOKUP): keep these in sync with Consolidacion.EtapaVBRL.COL_FACTURA / COL_IMPORTE.
+    MENU_EXPORTAR_LISTA = "wnd[0]/mbar/menu[0]/menu[10]/menu[1]/menu[1]"
+    # The consolidation reads VBRL BY POSITION (D invoice, E amount): keep in step with Consolidacion.EtapaVBRL.
     MIN_COLUMNAS = 5
-    COL_FACTURA = 3                # 0-based: column D
-    # Share of column D that must look like an invoice as SAP exports it: 'C' + digits ('C270043678'),
-    # or the bare digits of a billing document (~0.2% of the rows).
+    COL_FACTURA = 3
+    # Share of column D that must look like an invoice: 'C' + digits, or the bare digits of a billing document.
     MIN_NUMERICA = 0.9
     PATRON_FACTURA = r"[Cc]?[0-9]+(\.0+)?"
     MENSAJES_SIN_DATOS = (
@@ -1751,8 +1663,7 @@ class VBRL(DescargaConLista):
         "no existen entradas de tabla",
         "no se encontraron entradas de tabla",
         "no se han encontrado entradas de tabla",
-        # What SAP really answered (23-oct-2026, VBRL_2): "No se han encontrado entradas en la tabla
-        # para la clave indicada." The other ZSE16 tables (TablaZSE16) share this list.
+        # SAP's real answer (23-oct-2026): "No se han encontrado entradas en la tabla..."; shared by TablaZSE16.
         "no se han encontrado entradas en la tabla",
     )
 
@@ -1922,11 +1833,9 @@ class FB03(DescargaConLista):
 # from the 'Solic.' column of this run's VBRK.
 # ======================================================================
 class TablaZSE16(DescargaConLista):
-    """
-    A ZSE16 table queried with a list pasted through the clipboard, saved as .csv (the checks and
-    the *_REVISAR.csv of DescargaConLista). `info` (a dict, optional) receives what the run chose
-    and the user must be able to confirm without a console: 'layout' (the name it picked).
-    """
+    """A ZSE16 table queried with a list pasted through the clipboard, saved as .csv (checks and
+    *_REVISAR.csv of DescargaConLista). `info` (optional dict) receives what the run chose and the user
+    must confirm without a console: 'layout' (the name picked)."""
     TABLA = ""
     ARCHIVO = ""
     LAYOUT = None                  # layout NAME (given by the user); None = no layout step (recording)
@@ -2003,11 +1912,9 @@ class TablaZSE16(DescargaConLista):
 
 
 class VBRP(TablaZSE16):
-    """
-    ZSE16 on table VBRP for the 'Referencia de pago' of the #N/A rows, as VBRP.vbs does. Its
-    recording presses OK in 'Fields for selection' TWICE (a second window shows up in wnd[1]):
-    ZSE16.confirmar_campos(ok_extra=True).
-    """
+    """ZSE16 on table VBRP for the 'Referencia de pago' of the #N/A rows, as VBRP.vbs does. Its recording
+    presses OK in 'Fields for selection' TWICE (a second window shows in wnd[1]):
+    ZSE16.confirmar_campos(ok_extra=True)."""
     NOMBRE = "VBRP_ZSE16"
     MARCA = "ZSE16/VBRP"
     ETIQUETA = "VBRP"
@@ -2029,10 +1936,8 @@ class VBRP(TablaZSE16):
 
 
 class VBRK(TablaZSE16):
-    """
-    ZSE16 on table VBRK for the same references, as VBRK.vbs does. Its 'Solic.' column is the list
-    of FBL5N and KNVP, so the file is only accepted with that column.
-    """
+    """ZSE16 on table VBRK for the same references, as VBRK.vbs does. Its 'Solic.' column feeds FBL5N and
+    KNVP, so the file is only accepted with that column."""
     NOMBRE = "VBRK_ZSE16"
     MARCA = "ZSE16/VBRK"
     ETIQUETA = "VBRK"
@@ -2064,21 +1969,16 @@ class VBRK(TablaZSE16):
 
 
 class VBRL2(TablaZSE16):
-    """
-    ZSE16 on table VBRL (2nd run) for the same references. VBRL_2do_run.vbs ticks lines 5 and 7 of
-    'Fields for selection' and pastes into the second one (I2): line 7, 'VBELN_VF' (billing
-    document). The user corrected (25-oct-2026) the earlier VBELN (line 5): the references go in
-    VBELN_VF. It is the ONLY selection field (found by its name), so the list is pasted into I1,
-    which queries the same field as the recording's I2; no layout step (as recorded).
-    """
+    """ZSE16 on table VBRL (2nd run) for the same references, as VBRL_2do_run.vbs. The recording ticks lines
+    5 and 7 and pastes into I2 (line 7, 'VBELN_VF', billing document; the earlier VBELN was wrong,
+    25-oct-2026). Here it is the ONLY selection field (found by name), so the list goes into I1; no
+    layout step."""
     NOMBRE = "VBRL2_ZSE16"
     MARCA = "ZSE16/VBRL_2"
     ETIQUETA = "VBRL_2"
     TABLA = "VBRL"
     ARCHIVO = "VBRL_2.csv"
     UNIDAD = ("referencia(s)", "pedida(s)")
-    # The field the references are looked up in: line 7, "VBELN_VF" (confirmed on 25-oct-2026; line 5,
-    # "VBELN", was wrong). The recording ticks lines 5 AND 7 and pastes into the second one (I2).
     # ZSE16.patron matches the WHOLE name, so "VBELN_VF" never picks the "VBELN" line (nor the reverse).
     CAMPO = "VBELN_VF"
 
@@ -2103,11 +2003,9 @@ class VBRL2(TablaZSE16):
 
 
 class KNVP(TablaZSE16):
-    """
-    ZSE16 on table KNVP for the 'Solic.' customers of this run's VBRK, as KNVP.vbs does: the eight
-    first fields of the table as selection fields (I1..I8), the customers pasted into I1 (KUNNR)
-    and the fixed values of the recording in I2..I5; no layout step.
-    """
+    """ZSE16 on table KNVP for the 'Solic.' customers of this run's VBRK, as KNVP.vbs does: the table's
+    first eight fields as selection fields (I1..I8), customers pasted into I1 (KUNNR), the recording's
+    fixed values in I2..I5 (VKORG, VTWEG, SPART, PARVW); no layout step."""
     NOMBRE = "KNVP_ZSE16"
     MARCA = "ZSE16/KNVP"
     ETIQUETA = "KNVP"
@@ -2117,10 +2015,10 @@ class KNVP(TablaZSE16):
     # KNVP.vbs ticks lines 5..12: the table's first eight fields, in table order (they become I1..I8).
     CAMPOS = ("KUNNR", "VKORG", "VTWEG", "SPART", "PARVW", "PARZA", "KUNN2", "LIFNR")
     VALORES_FIJOS = (
-        ("wnd[0]/usr/ctxtI2-LOW", "MX21"),     # VKORG  sales organization
-        ("wnd[0]/usr/ctxtI3-LOW", "01"),       # VTWEG  distribution channel
-        ("wnd[0]/usr/ctxtI4-LOW", "01"),       # SPART  division
-        ("wnd[0]/usr/ctxtI5-LOW", "re"),       # PARVW  partner function, typed as recorded
+        ("wnd[0]/usr/ctxtI2-LOW", "MX21"),
+        ("wnd[0]/usr/ctxtI3-LOW", "01"),
+        ("wnd[0]/usr/ctxtI4-LOW", "01"),
+        ("wnd[0]/usr/ctxtI5-LOW", "re"),
     )
 
     def pasos(self):
@@ -2137,11 +2035,9 @@ class KNVP(TablaZSE16):
 
 
 class BKPF(TablaZSE16):
-    """
-    ZSE16 on table BKPF for the 'Nº documento' of the #N/A rows, as BKPF.vbs does: eight selection
-    fields (I1..I8), company code in I1, the documents pasted into I2 (BELNR) and the fiscal year in
-    I3 — from the year of DateFrom to the year of DateTo, like FB03.
-    """
+    """ZSE16 on table BKPF for the 'Nº documento' of the #N/A rows, as BKPF.vbs does: eight selection fields
+    (I1..I8), company code in I1, documents pasted into I2 (BELNR), fiscal year in I3 (from the year of
+    DateFrom to that of DateTo, like FB03)."""
     NOMBRE = "BKPF_ZSE16"
     MARCA = "ZSE16/BKPF"
     ETIQUETA = "BKPF"
@@ -2187,27 +2083,25 @@ class BKPF(TablaZSE16):
 
 
 class FBL5N(DescargaConLista):
-    """
-    FBL5N.vbs: the report is NOT executed. F4 on the customer field opens its search help; the
-    'Solic.' customers of this run's VBRK are pasted into the multiple selection of line 5 of its
-    first tab, the hit list is saved with 'Save list in file' (first format option, as recorded)
-    and the popups are closed. SAP writes that file itself (a TEXT list, not a workbook): it is kept
-    as SAP writes it, under the date name with the recorded extension. It is saved first under a
-    temporary name and only replaces the final file once checked (*_REVISAR otherwise).
-    """
+    """FBL5N.vbs: the report is NOT executed. F4 on the customer field opens its search help; the 'Solic.'
+    customers of this run's VBRK are pasted into the multiple selection of line 8 of tab TAB006 (the one
+    carrying the RFC) and the hit list is saved with 'Save list in file'. SAP writes that TEXT list
+    itself: kept as is, saved under a temporary name and moved over the final file only once checked
+    (*_REVISAR otherwise)."""
     NOMBRE = "FBL5N_Deudores"
     MARCA = "FBL5N"
     ETIQUETA = "FBL5N"
     ARCHIVO = "FBL5N.XLS"
     UNIDAD = ("cliente(s)", "pedido(s)")
     EXTENSIONES = (".xls", ".txt")
-    CAMPO_DEUDOR = "wnd[0]/usr/ctxtDD_KUNNR-LOW"          # where F4 is pressed (the default cursor)
+    CAMPO_DEUDOR = "wnd[0]/usr/ctxtDD_KUNNR-LOW"
     TABS = "wnd[1]/usr/tabsG_SELONETABSTRIP"
-    PESTANA = TABS + "/tabpTAB001"
+    PESTANA = TABS + "/tabpTAB006"
     SUBPANTALLA = PESTANA + "/ssubSUBSCR_PRESEL:SAPLSDH4:0220/sub:SAPLSDH4:0220"
-    BTN_MULTIPLE = SUBPANTALLA + "/btnG_SELFLD_TAB-MORE[5,56]"            # as recorded
+    BTN_MULTIPLE = SUBPANTALLA + "/btnG_SELFLD_TAB-MORE[8,56]"
     MAX_ACIERTOS = (SUBPANTALLA + "/txtDDSHF4CTRL-MAXRECORDS", "wnd[1]/usr/txtDDSHF4CTRL-MAXRECORDS")
-    CELDA_LISTA = "wnd[1]/usr/lbl[53,8]"
+    CELDA_LISTA = "wnd[1]/usr/lbl[1,6]"
+    BTN_SALIR = "wnd[0]/tbar[0]/btn[15]"
     RADIO_FORMATO = ("wnd[2]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/"
                      "radSPOPLI-SELFLAG[1,0]")
     MENSAJES_SIN_DATOS = (
@@ -2240,22 +2134,23 @@ class FBL5N(DescargaConLista):
         self.borrar_restos()
         s = self.conectar()
         SAP.cerrar_popups(s)
-        #s.findById("wnd[0]").maximize()
         s.findById("wnd[0]/tbar[0]/okcd").text = "/nFBL5N"
         s.findById("wnd[0]").sendVKey(0)
         if not SAP.esperar(s, self.CAMPO_DEUDOR, 10):
             raise RuntimeError(f"FBL5N no mostró el campo de cuenta de deudor. SAP dice: "
                                f"'{SAP.aviso(s) or '(sin mensaje)'}'.")
         s.findById(self.CAMPO_DEUDOR).setFocus()                      # the recording relies on the default cursor
-        s.findById("wnd[0]").sendVKey(4)                              # F4: search help
+        s.findById("wnd[0]").sendVKey(4)
         if not SAP.esperar(s, self.TABS, 10):
             raise RuntimeError("SAP no abrió la ayuda de búsqueda de deudores (F4) de FBL5N.")
-        if SAP.existe(s, self.PESTANA):
-            s.findById(self.PESTANA).select()                         # SAP remembers the last tab used
+        if not SAP.existe(s, self.PESTANA):
+            raise RuntimeError("La ayuda de búsqueda de FBL5N no tiene la pestaña TAB006, la que trae el "
+                               "RFC de los clientes (grabación FBL5N.vbs).")
+        s.findById(self.PESTANA).select()                             # SAP remembers the last tab used
         self.ampliar_aciertos()
         if not SAP.existe(s, self.BTN_MULTIPLE):
             raise RuntimeError("La ayuda de búsqueda de FBL5N no tiene el botón de selección múltiple "
-                               "del renglón 5 de su primera pestaña (grabación FBL5N.vbs).")
+                               "del renglón 8 de su pestaña TAB006 (grabación FBL5N.vbs).")
 
         print(f"[{self.ETIQUETA}] {len(self.lista):,} cliente(s) único(s) a consultar.")
         s.findById(self.BTN_MULTIPLE).press()
@@ -2263,15 +2158,15 @@ class FBL5N(DescargaConLista):
             raise RuntimeError("SAP no abrió la selección múltiple de la ayuda de búsqueda de FBL5N.")
         with Portapapeles.exclusivo():
             Portapapeles.copiar_y_verificar("\r\n".join(self.lista))
-            s.findById("wnd[2]/tbar[0]/btn[24]").press()             # import from clipboard
+            s.findById("wnd[2]/tbar[0]/btn[24]").press()
             time.sleep(1 + len(self.lista) / 5000)
-        s.findById("wnd[2]/tbar[0]/btn[8]").press()                  # copy and close
+        s.findById("wnd[2]/tbar[0]/btn[8]").press()
         SAP.esperar_libre(s)
         if not SAP.esperar_cierre(s, "wnd[2]"):
             raise RuntimeError("La selección múltiple de FBL5N sigue abierta después de copiar.")
 
         Paralelo.marca(f"{self.MARCA}: búsqueda enviada a SAP")
-        s.findById("wnd[1]/tbar[0]/btn[0]").press()                  # start the search
+        s.findById("wnd[1]/tbar[0]/btn[0]").press()
         SAP.esperar_libre(s, timeout=_ESPERA_CONSULTA)
         Paralelo.marca(f"{self.MARCA}: SAP respondió la búsqueda")
         if self.sin_aciertos():
@@ -2280,7 +2175,7 @@ class FBL5N(DescargaConLista):
         if SAP.existe(s, self.CELDA_LISTA):
             s.findById(self.CELDA_LISTA).setFocus()
             s.findById(self.CELDA_LISTA).caretPosition = 0
-        s.findById("wnd[1]").sendVKey(14)                            # save list in file
+        s.findById("wnd[1]").sendVKey(14)
         if not SAP.esperar(s, self.RADIO_FORMATO, 10):
             raise RuntimeError("SAP no mostró las opciones de formato para guardar la lista de FBL5N.")
         s.findById(self.RADIO_FORMATO).select()
@@ -2347,7 +2242,7 @@ class FBL5N(DescargaConLista):
                            f"texto a FBL5N.MENSAJES_SIN_DATOS.")
 
     def cerrar_ayuda(self):
-        """Close the hit list, then Back, as recorded. The file is already written: only reported."""
+        """Close the hit list, then Exit, as recorded. The file is already written: only reported."""
         s = self.session
         try:
             if SAP.existe(s, "wnd[2]"):
@@ -2355,7 +2250,7 @@ class FBL5N(DescargaConLista):
             s.findById("wnd[1]").close()
             if not SAP.esperar_cierre(s):
                 raise RuntimeError("la lista de clientes sigue abierta")
-            s.findById("wnd[0]/tbar[0]/btn[3]").press()
+            s.findById(self.BTN_SALIR).press()
             self.en_menu = True
         except Exception as e:
             print(f"[{self.ETIQUETA}] ⚠️ No pude regresar al menú principal de SAP "
@@ -2435,11 +2330,9 @@ def Gallo_FAGLL03(DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SO
 
 def _Venta_FAGLL03(venta, cuentas, clases, nombre_archivo, DateFrom, DateTo, FolderPath, FileName,
                    sociedad, session):
-    """
-    Gallo with the accounts and document classes of ONE sale (`venta`: 'Venta DSD' / 'Venta EIAP', for
-    the messages), up to DateTo MINUS one day (utils.fecha_efectiva_eiap); the file name keeps the typed
-    dates. ValueError if that leaves an empty or backwards range.
-    """
+    """Gallo with the accounts and document classes of ONE sale (`venta`: 'Venta DSD' / 'Venta EIAP', for
+    messages), up to DateTo MINUS one day (utils.fecha_efectiva_eiap); the file name keeps the typed
+    dates. ValueError for an empty or backwards range."""
     desde = parse_fecha(DateFrom)
     hasta = fecha_efectiva_eiap(DateTo)
     if hasta < desde:
