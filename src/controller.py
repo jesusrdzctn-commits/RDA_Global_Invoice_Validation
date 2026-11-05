@@ -4,11 +4,11 @@ downloads (Descargas_SAP.py) and the consolidation (Consolidacion.py).
 The main download button runs Gallo, Monivoi, VBRL and FB03 one after another (default) or,
 with the GUI checkbox, IN PARALLEL by passes: Gallo ‖ Monivoi, then VBRL ‖ FB03 (VBRL needs
 the Monivoi file and FB03 the Gallo file of pass 1).
-After a consolidation, the 2nd run (VBRK, VBRP, VBRL 2nd run, FBL5N, KNVP, BKPF) pastes into SAP
-what the #N/A rows of 'TD.Diferencias_Referencias' carry: one after another, or, with the same
-checkbox, IN PARALLEL as two passes of THREE transactions, each one in its own SAP window
-(PASADAS_2DA): VBRK ‖ VBRP ‖ VBRL 2nd run, then FBL5N ‖ KNVP ‖ BKPF (FBL5N and KNVP paste the
-'Solic.' column of the VBRK downloaded in pass 1).
+After a consolidation, the 2nd run (VBRK, VBRP, VBRL 2nd run, FBL5N, KNVP, BKPF, Monivoi 2nd run)
+pastes into SAP what the #N/A rows of 'TD.Diferencias_Referencias' carry: one after another, or, with
+the same checkbox, IN PARALLEL by passes of up to THREE windows (PASADAS_2DA): VBRK ‖ VBRP ‖ VBRL 2nd
+run, then FBL5N ‖ KNVP ‖ BKPF, then Monivoi 2nd run (FBL5N and KNVP paste the 'Solic.' column of the
+VBRK of pass 1; Monivoi 2nd run the 'List.fact.' lists of the VBRL 2nd run).
 """
 
 import os
@@ -21,13 +21,13 @@ import pandas as pd
 from Descargas_SAP import (
     Gallo_FAGLL03, Monivoi_ZLMXCOM, VentaEIAP_FAGLL03, VentaDSD_FAGLL03,
     VBRL_ZSE16, FB03_Documentos, DescargaPorRevisarError,
-    VBRP_ZSE16, VBRK_ZSE16, VBRL2_ZSE16, KNVP_ZSE16, BKPF_ZSE16, FBL5N_Deudores,
+    VBRP_ZSE16, VBRK_ZSE16, VBRL2_ZSE16, KNVP_ZSE16, BKPF_ZSE16, FBL5N_Deudores, Monivoi2_ZLMXCOM,
     Archivos, Excel, Paralelo, MAX_VENTANAS_SAP,
 )
 from Consolidacion import (
     consolidar_gallo_monivoi, consolidar_venta_dsd, consolidar_venta_eiap, leer_documentos_monivoi,
     leer_documentos_gallo_fb03, leer_solicitantes_vbrk, calcular_listas_segunda_corrida,
-    EtapaDocumentosFB03,
+    leer_listas_vbrl2, EtapaDocumentosFB03,
 )
 from utils import (
     FORMATO_FECHA, parse_fecha, fecha_efectiva_eiap,
@@ -53,8 +53,8 @@ class ValidacionFacturaController:
     Sections: download entry points → engines (sequential, parallel) → consolidation → 2nd run → sales
     buttons."""
 
-    # 2nd run in parallel: two PASSES of three; a pass starts when the previous one is over.
-    PASADAS_2DA = (("vbrk", "vbrp", "vbrl2"), ("fbl5n", "knvp", "bkpf"))
+    # 2nd run in parallel: PASSES of up to 3 windows (a 4th stays free); each starts when the previous one ends.
+    PASADAS_2DA = (("vbrk", "vbrp", "vbrl2"), ("fbl5n", "knvp", "bkpf"), ("monivoi2",))
 
     def __init__(self, gui):
         self.gui = gui
@@ -105,7 +105,7 @@ class ValidacionFacturaController:
             "sin_documentos_es_vacio": True,
             "filtro":   EtapaDocumentosFB03.DESCRIPCION_FILTRO,
         }
-        # 2nd run: lists from the consolidation ("lista_de" → "documentos"); FBL5N / KNVP read VBRK's 'Solic.'.
+        # 2nd run: lists from the consolidation ("lista_de"); FBL5N / KNVP read VBRK's 'Solic.', Monivoi 2 VBRL_2's.
         self._TX_VBRP = {
             "clave": "vbrp", "nombre": "VBRP (ZSE16)", "ejecutar": self._descargar_lista_2da,
             "descarga": VBRP_ZSE16, "lista_de": "referencias", "unidad": "referencia(s)",
@@ -135,12 +135,19 @@ class ValidacionFacturaController:
             "unidad": "cliente(s)",
             "lista": "los solicitantes (columna 'Solic.') del VBRK de esta corrida",
         }
+        self._TX_MONIVOI2 = {
+            "clave": "monivoi2", "nombre": "Monivoi 2a corrida (ZLMXCOM_TRN_MONINVOI)",
+            "ejecutar": self._descargar_monivoi2, "requiere": "vbrl2",
+            "leer_documentos": leer_listas_vbrl2, "unidad": "lista(s) de factura",
+            "lista": "las listas de factura ('List.fact.') del VBRL 2a corrida recién descargado",
+            "sin_documentos_es_vacio": True, "filtro": "Lista de factura ('List.fact.')",
+        }
         self._TX_POR_CLAVE = {
             tx["clave"]: tx
             for tx in (self._TX_GALLO, self._TX_MONIVOI, self._TX_DSD, self._TX_EIAP, self._TX_VBRL,
                        self._TX_FB03,
                        self._TX_VBRP, self._TX_VBRK, self._TX_VBRL2, self._TX_BKPF,
-                       self._TX_FBL5N, self._TX_KNVP)
+                       self._TX_FBL5N, self._TX_KNVP, self._TX_MONIVOI2)
         }
 
         self._ocupado = False
@@ -166,7 +173,7 @@ class ValidacionFacturaController:
 
     def execute_download_todos(self):
         """Main download button: the run its GUI radio selects (1a = Gallo, Monivoi, VBRL, FB03; 2a = the
-        six downloads of execute_download_segunda)."""
+        seven downloads of execute_download_segunda)."""
         if self._corrida_gui("corrida_descarga") == 2:
             self.execute_download_segunda()
             return
@@ -184,8 +191,17 @@ class ValidacionFacturaController:
         leer = getattr(self.gui, metodo, None)
         return 2 if callable(leer) and leer() == 2 else 1
 
+    def _marcar_paso(self, paso, estado):
+        """Report the state of a step of the process to the GUI's progress rail ('descarga1',
+        'consolidacion1', 'descarga2', 'consolidacion2' x 'en_curso', 'listo', 'parcial', 'error').
+        `paso` None (a single-transaction download) and a GUI without `marcar_paso` (older GUI, test
+        doubles) are skipped. Main thread only: it touches Tk."""
+        marcar = getattr(self.gui, "marcar_paso", None)
+        if paso is not None and callable(marcar):
+            marcar(paso, estado)
+
     def execute_download_segunda(self):
-        """'2a corrida' radio + download button: the six downloads, with the 1st consolidation's lists
+        """'2a corrida' radio + download button: the seven downloads, with the 1st consolidation's lists
         recomputed from the 1st run's files (calcular_listas_segunda_corrida)."""
         if self._ocupado:
             return
@@ -224,9 +240,11 @@ class ValidacionFacturaController:
                 rutas["gallo"], rutas["vbrl"], ruta_fb03, callback_status=self.gui.set_status)
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error al calcular las listas de la 2a corrida")
+            self._marcar_paso("descarga2", "error")
             messagebox.showerror("2a corrida de descargas", f"No pude calcular las listas:\n\n{e}")
         except Exception as e:
             self.gui.set_status("❌ Error al calcular las listas de la 2a corrida")
+            self._marcar_paso("descarga2", "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado al calcular las listas:\n\n{e}")
         finally:
             self._ocupado = False
@@ -254,6 +272,7 @@ class ValidacionFacturaController:
             self._ofrecer_segunda_corrida(listas, cfg["gallo"], origen="\n".join(origen))
         except Exception as e:
             self.gui.set_status("❌ Error al preparar la 2a corrida")
+            self._marcar_paso("descarga2", "error")
             messagebox.showerror("2a corrida de descargas", f"No pude preparar la 2a corrida:\n\n{e}")
 
     def _execute_download(self, txs, etiqueta, paralelo=False):
@@ -347,10 +366,13 @@ class ValidacionFacturaController:
         if not confirm:
             return
 
+        # Only the whole 1st run is a step of the process; single downloads are not.
+        paso = "descarga1" if [tx["clave"] for tx in txs] == [c for c, _ in CORRIDAS_DESCARGA[1]] else None
         self._ocupado = True
         estado_final = None
         try:
             self.gui.disable_buttons()
+            self._marcar_paso(paso, "en_curso")
             os.makedirs(base["input_path"], exist_ok=True)
             inicio_total = time.time()
             if paralelo:
@@ -372,6 +394,7 @@ class ValidacionFacturaController:
                 else f"⚠️ Descarga de {etiqueta} terminada con avisos"
             )
             self.gui.set_status(estado_final)
+            self._marcar_paso(paso, "listo" if todo_ok else "parcial")
             mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
             mostrar(
                 f"Resumen de descarga ({etiqueta})",
@@ -383,6 +406,7 @@ class ValidacionFacturaController:
         except Exception as e:
             estado_final = None
             self.gui.set_status("❌ Error en la descarga")
+            self._marcar_paso(paso, "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
         finally:
             self._ocupado = False
@@ -723,6 +747,7 @@ class ValidacionFacturaController:
         listas_2da = None
         try:
             self.gui.disable_buttons()
+            self._marcar_paso("consolidacion1", "en_curso")
             resumen = consolidar_gallo_monivoi(
                 ruta_gallo, ruta_monivoi, ruta_output,
                 nombre_salida=nombre_salida,
@@ -760,6 +785,10 @@ class ValidacionFacturaController:
                 listas = resumen.get("listas_2da")
 
             self.gui.set_status("✅ ¡Consolidación completada!")
+            self._marcar_paso(
+                "consolidacion1",
+                "parcial" if (avisos or nota_monivoi or resumen.get("vbrl_sin_datos")) else "listo",
+            )
             messagebox.showinfo(
                 "Consolidación completada",
                 f"Archivo generado:\n{resumen['ruta']}\n\n"
@@ -774,9 +803,11 @@ class ValidacionFacturaController:
             listas_2da = resumen.get("listas_2da")
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la consolidación")
+            self._marcar_paso("consolidacion1", "error")
             messagebox.showerror("Error en la consolidación", str(e))
         except Exception as e:
             self.gui.set_status("❌ Error en la consolidación")
+            self._marcar_paso("consolidacion1", "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
         finally:
             self._ocupado = False
@@ -788,6 +819,7 @@ class ValidacionFacturaController:
                 self._ofrecer_segunda_corrida(listas_2da, cfg_gallo)
             except Exception as e:
                 self.gui.set_status("❌ Error al preparar la 2a corrida")
+                self._marcar_paso("descarga2", "error")
                 messagebox.showerror(
                     "2a corrida de descargas",
                     f"El Excel consolidado sí se generó, pero no pude preparar la 2a corrida:\n\n{e}",
@@ -812,12 +844,13 @@ class ValidacionFacturaController:
         ("vbrk", "VBRK"), ("fbl5n", "FBL5N"), ("vbrp", "VBRP"),
         ("knvp", "KNVP"), ("vbrl2", "VBRL (2a corrida)"), ("bkpf", "BKPF"),
     )
+    _ETIQUETA_MONIVOI2 = "Monivoi (2a corrida)"
     # A 2nd-run file older than this many seconds was asked for an older 1st run (lookups may miss).
     _TOLERANCIA_ANTIGUEDAD = 2
 
     def execute_consolidacion_segunda(self):
-        """'2a corrida' radio + consolidation button: the 1st consolidation plus the six sheets of the 2nd
-        run and the 'Diferencias' tab (same file name, same code path)."""
+        """'2a corrida' radio + consolidation button: the 1st consolidation plus the 2nd run's sheets, 'Diferencias'
+        and 'Agrupadores'. A missing Monitoreo_2 is not asked for (VBRL_2 was not downloaded either): blank tab."""
         if self._ocupado:
             return
         if not self.gui.validate_dates():
@@ -855,21 +888,21 @@ class ValidacionFacturaController:
             if not ruta:
                 return
             rutas_segunda[clave] = ruta
+        ruta_monivoi2 = os.path.join(input_path, self.gui.get_config("monivoi2")["filename"])
+        if not os.path.exists(ruta_monivoi2):
+            ruta_monivoi2 = None
+        rutas_segunda["monivoi2"] = ruta_monivoi2
 
         padres = [ruta for ruta in (ruta_gallo, ruta_monivoi, ruta_vbrl, ruta_fb03) if ruta]
-        try:
-            ultimo_padre = max(os.path.getmtime(ruta) for ruta in padres)
-            anteriores = [os.path.basename(ruta) for ruta in rutas_segunda.values()
-                          if os.path.getmtime(ruta) < ultimo_padre - self._TOLERANCIA_ANTIGUEDAD]
-        except OSError:
-            anteriores = []
+        anteriores = self._anteriores_segunda(padres, rutas_segunda)
         if anteriores:
             if not messagebox.askyesno(
                 "Descargas de la 2a corrida anteriores a la 1a",
-                "Estos archivos de la 2a corrida se descargaron ANTES que alguno de la 1a corrida:\n\n"
-                + "".join(f"  • {nombre}\n" for nombre in anteriores)
+                "Estos archivos de la 2a corrida se descargaron ANTES que el archivo del que salieron sus "
+                "listas:\n\n"
+                + "".join(f"  • {linea}\n" for linea in anteriores)
                 + "\nProbablemente no cubren los documentos actuales y 'Diferencias' mostraría #N/A "
-                "de más.\n\n¿Consolidar de todos modos?",
+                "(o 'Sin UUID') de más.\n\n¿Consolidar de todos modos?",
             ):
                 return
 
@@ -886,6 +919,8 @@ class ValidacionFacturaController:
         lineas_segunda = "".join(
             f"  • {etiqueta:<17}: {os.path.basename(rutas_segunda[clave])}\n"
             for clave, etiqueta in self._ETIQUETAS_SEGUNDA)
+        nombre_monivoi2 = os.path.basename(ruta_monivoi2) if ruta_monivoi2 else "(sin archivo: Monitor (2) en blanco)"
+        lineas_segunda += f"  • {self._ETIQUETA_MONIVOI2:<17}: {nombre_monivoi2}\n"
         reemplaza = ("\n⚠️ Ya existe y se REEMPLAZA (el mismo Excel, completado con las pestañas nuevas)."
                      if os.path.exists(ruta_final) else "")
         if not messagebox.askyesno(
@@ -904,6 +939,7 @@ class ValidacionFacturaController:
         self._ocupado = True
         try:
             self.gui.disable_buttons()
+            self._marcar_paso("consolidacion2", "en_curso")
             resumen = consolidar_gallo_monivoi(
                 ruta_gallo, ruta_monivoi, ruta_output,
                 nombre_salida=nombre_salida,
@@ -916,7 +952,9 @@ class ValidacionFacturaController:
             nota_avisos = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
             d = resumen["diferencias"]
             por_tipo = d["por_tipo"]
+            semaforo = d["semaforo"]
             self.gui.set_status("✅ ¡2a consolidación completada!")
+            self._marcar_paso("consolidacion2", "parcial" if avisos else "listo")
             messagebox.showinfo(
                 "2a consolidación completada",
                 f"Archivo generado:\n{resumen['ruta']}\n\n"
@@ -928,14 +966,20 @@ class ValidacionFacturaController:
                 f"  • Sin Lista de factura       : {d['sin_lista']:,}\n"
                 f"  • Documentos anulados        : {d['anuladas']:,}\n"
                 f"  • Cliente Global / Vendedor / Individual: "
-                f"{d['cliente_global']:,} / {d['vendedor']:,} / {d['cliente_individual']:,}"
+                f"{d['cliente_global']:,} / {d['vendedor']:,} / {d['cliente_individual']:,}\n"
+                f"  • Estatus 1 🟢 / 🟡 / 🔴     : {semaforo['verde']:,} / "
+                f"{semaforo['amarillo']:,} / {semaforo['rojo']:,}"
+                f"  (SIN REGLA {d['sin_regla']:,})\n"
+                f"  • W.A BAMA / OXXO: UUID {d['wa_uuid']:,} · Sin UUID {d['wa_sin_uuid']:,}"
                 f"{nota_avisos}"
             )
         except (FileNotFoundError, ValueError) as e:
             self.gui.set_status("❌ Error en la 2a consolidación")
+            self._marcar_paso("consolidacion2", "error")
             messagebox.showerror("Error en la 2a consolidación", str(e))
         except Exception as e:
             self.gui.set_status("❌ Error en la 2a consolidación")
+            self._marcar_paso("consolidacion2", "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
         finally:
             self._ocupado = False
@@ -1147,6 +1191,22 @@ class ValidacionFacturaController:
                 return None, False
         return ruta, False
 
+    def _anteriores_segunda(self, padres, rutas_segunda):
+        """2nd-run files older than the 1st-run files their lists came from (Monitoreo_2: older than its VBRL_2,
+        whose lists it pasted) as 'name (reason)' lines; [] when a date cannot be read."""
+        tolerancia = self._TOLERANCIA_ANTIGUEDAD
+        try:
+            ultimo_padre = max(os.path.getmtime(ruta) for ruta in padres)
+            viejos = {ruta: "anterior a la 1a corrida" for ruta in rutas_segunda.values()
+                      if ruta and os.path.getmtime(ruta) < ultimo_padre - tolerancia}
+            monivoi2, vbrl2 = rutas_segunda.get("monivoi2"), rutas_segunda["vbrl2"]
+            if (monivoi2 and monivoi2 not in viejos
+                    and os.path.getmtime(monivoi2) < os.path.getmtime(vbrl2) - tolerancia):
+                viejos[monivoi2] = f"anterior a {os.path.basename(vbrl2)}"
+        except OSError:
+            return []
+        return [f"{os.path.basename(ruta)} ({motivo})" for ruta, motivo in viejos.items()]
+
     def _localizar_archivo(self, input_path, filename, etiqueta, tipos=None):
         """The file with the expected name, or one picked by hand if it is not there; None = cancel.
         `tipos`: the dialog's file types (CSV by default; FBL5N is SAP's text list)."""
@@ -1202,14 +1262,14 @@ class ValidacionFacturaController:
                 "2a corrida de descargas",
                 "En 'TD.Diferencias_Referencias' ningún renglón quedó en #N/A (o sólo los que\n"
                 "tienen una Referencia de pago que empieza con 'FP'): no hay nada que consultar\n"
-                "en VBRP, VBRK, VBRL, BKPF, FBL5N ni KNVP.",
+                "en VBRP, VBRK, VBRL, BKPF, FBL5N, KNVP ni Monivoi (2a corrida).",
             )
             return
         self._execute_segunda_corrida(listas, base, origen=origen)
 
     def _execute_segunda_corrida(self, listas, base, origen=None):
-        """Confirm and run the 2nd run (two passes of three at once with the GUI checkbox, else one after
-        another) and show ONE summary."""
+        """Confirm and run the 2nd run (PASADAS_2DA at once with the GUI checkbox, else one after another)
+        and show ONE summary."""
         if self._ocupado:
             return
         pasadas = self._txs_segunda_corrida()
@@ -1242,7 +1302,8 @@ class ValidacionFacturaController:
                     f"  Pasada {i}: {' ‖ '.join(self._nombre_corto(tx) for tx in pasada)}\n"
                     for i, pasada in enumerate(pasadas, 1)
                 )
-                + "\nFBL5N y KNVP usan la columna 'Solic.' de VBRK (por eso VBRK va en la pasada 1).\n\n"
+                + "\nFBL5N y KNVP usan la columna 'Solic.' de VBRK (por eso VBRK va en la pasada 1) y "
+                "Monivoi (2a corrida) las listas de factura del VBRL (2a corrida).\n\n"
                 f"Uso las ventanas 1 a {n_ventanas} de SAP que ya estén abiertas... No trabajar en ellas mientras corre.\n"
             )
         else:
@@ -1250,7 +1311,7 @@ class ValidacionFacturaController:
                      + "".join(f"  {i}) {tx['nombre']}\n" for i, tx in enumerate(txs, 1)) + "\n")
         confirm = messagebox.askyesno(
             "2a corrida de descargas",
-            "¿Descargar ahora las 6 transacciones de la 2a corrida?\n\n"
+            f"¿Descargar ahora las {len(txs)} transacciones de la 2a corrida?\n\n"
             f"Sociedad : {base['sociedad']}\n{periodo}\n\n"
             f"{nota_fp}{nota_origen}{nota_avisos}\n"
             f"{orden}"
@@ -1264,6 +1325,7 @@ class ValidacionFacturaController:
         estado_final = None
         try:
             self.gui.disable_buttons()
+            self._marcar_paso("descarga2", "en_curso")
             os.makedirs(base["input_path"], exist_ok=True)
             inicio_total = time.time()
             if paralelo:
@@ -1278,6 +1340,7 @@ class ValidacionFacturaController:
             estado_final = ("✅ ¡2a corrida completada!" if todo_ok
                             else "⚠️ 2a corrida terminada con avisos")
             self.gui.set_status(estado_final)
+            self._marcar_paso("descarga2", "listo" if todo_ok else "parcial")
             mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
             mostrar(
                 "Resumen de la 2a corrida",
@@ -1291,6 +1354,7 @@ class ValidacionFacturaController:
         except Exception as e:
             estado_final = None
             self.gui.set_status("❌ Error en la 2a corrida")
+            self._marcar_paso("descarga2", "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado en la 2a corrida:\n\n{e}")
         finally:
             self._ocupado = False
@@ -1309,6 +1373,9 @@ class ValidacionFacturaController:
         if info.get("presentes"):
             encontrados, pedidos = info["presentes"]
             partes.append(f"{encontrados:,} de {pedidos:,} cliente(s) aparecen en el archivo")
+        if info.get("fechas"):
+            desde, hasta = info["fechas"]
+            partes.append(f"creadas del {desde} al {hasta}")
         return "".join(f" · {parte}" for parte in partes)
 
     def _descargar_lista_2da(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
@@ -1361,6 +1428,28 @@ class ValidacionFacturaController:
             tx, config, resultados, descargar, cfg_padre=cfg_padre, estado_cb=estado_cb)
         return estado, linea + self._texto_info(info)
 
+    def _descargar_monivoi2(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
+        """Monivoi 2nd run: the 'List.fact.' lists of THIS run's VBRL 2nd run (see `_descargar_con_documentos`;
+        a VBRL 2nd run without data → 'Sin datos' file, no SAP query), period of utils.rango_monivoi_2."""
+        if config["mode"] == "single":
+            desde = hasta = config["fecha"]
+        else:
+            desde, hasta = config["date_from"], config["date_to"]
+        info = {}
+        extra = {} if session is None else {"session": session}
+
+        def descargar(documentos):
+            try:
+                return Monivoi2_ZLMXCOM(documentos, desde, hasta, FolderPath=config["input_path"],
+                                        FileName=config["filename"], sociedad=config["sociedad"],
+                                        info=info, **extra)
+            except DescargaPorRevisarError as e:
+                raise DescargaPorRevisarError(f"{e}{self._texto_info(info)}") from e
+
+        estado, linea = self._descargar_con_documentos(
+            tx, config, resultados, descargar, cfg_padre=cfg_padre, estado_cb=estado_cb)
+        return estado, linea + self._texto_info(info)
+
     def _descargar_vbrl(self, tx, config, resultados, *, session=None, cfg_padre=None, estado_cb=None):
         """VBRL step of the download engine (see `_descargar_con_documentos`)."""
         extra = {} if session is None else {"session": session}
@@ -1394,8 +1483,8 @@ class ValidacionFacturaController:
     def _descargar_con_documentos(
         self, tx, config, resultados, descargar, *, cfg_padre=None, estado_cb=None
     ):
-        """Step of transactions queried ONCE with a list from the file their parent (tx["requiere"])
-        downloaded in THIS run: VBRL ← Monivoi 'Factura'; FB03 ← Gallo 'Nº documento' (C2/C6, Global).
+        """Step of transactions queried ONCE with a list from the file their parent (tx["requiere"]) downloaded
+        in THIS run: VBRL ← Monivoi 'Factura'; FB03 ← Gallo 'Nº documento'; Monivoi 2 ← VBRL_2 'List.fact.'.
         Workers get `cfg_padre`, no `estado_cb` (Tk: main thread only). Returns (estado, summary line)."""
         padre = tx["requiere"]
         nombre_padre = self._nombre_corto(self._TX_POR_CLAVE[padre]) if padre in self._TX_POR_CLAVE else padre

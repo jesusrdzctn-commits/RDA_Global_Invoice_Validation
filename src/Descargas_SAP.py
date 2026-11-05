@@ -3,12 +3,12 @@ Validación Factura Global — SAP downloads (SAP GUI scripting)
 
 Gallo (FAGLL03), Monivoi (ZLMXCOM_TRN_MONINVOI), VBRL (ZSE16), FB03 (document list) and
 Venta EIAP and Venta DSD (two FAGLL03 queries, each with the accounts and classes of ITS sale); after the consolidation, the 2nd run: VBRP, VBRK,
-VBRL (2nd run), KNVP, BKPF (ZSE16) and FBL5N (customer search help). Every download follows its
-VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
+VBRL (2nd run), KNVP, BKPF (ZSE16), FBL5N (customer search help) and Monivoi (2nd run). Every download
+follows its VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
 
     SAP, Portapapeles, Excel, Archivos      helpers shared by every download
     Paralelo                                several SAP windows at once (the P&L way)
-    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03, FBL5N, TablaZSE16 → VBRP, VBRK,
+    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03, FBL5N, Monivoi2, TablaZSE16 → VBRP, VBRK,
     VBRL2, KNVP, BKPF
     Gallo_FAGLL03(), Monivoi_ZLMXCOM()...   the entry points the controller calls
 """
@@ -40,6 +40,7 @@ from utils import (
     nombre_archivo_rango_eiap,
     nombre_archivo_rango_dsd,
     fecha_efectiva_monivoi_str,
+    rango_monivoi_2,
     fecha_efectiva_eiap,
     CUENTAS_EIAP,
     CLASES_EIAP,
@@ -2318,6 +2319,142 @@ class FBL5N(DescargaConLista):
         return True
 
 
+class Monivoi2(DescargaConLista):
+    """ZLMXCOM_TRN_MONINVOI again, as Monivoi_2do_run.vbs: VBRL_2's invoice lists pasted into SO_VBELN, the 1st
+    Monivoi's days ±1 (utils.rango_monivoi_2), NO RFC filter (BAMA / OXXO are individual). Its 'Factura' →
+    'UUID' (required columns) gives the W.A. of 'Diferencias'; .csv + *_REVISAR.csv as DescargaConLista."""
+    NOMBRE = "Monivoi2_ZLMXCOM"
+    MARCA = "Monivoi_2"
+    ETIQUETA = "Monivoi_2"
+    ARCHIVO = "Monitoreo_2.csv"
+    UNIDAD = ("lista(s)", "pedida(s)")
+    TX = Monivoi.TX
+    BTN_LISTAS = "wnd[0]/usr/btn%_SO_VBELN_%_APP_%-VALU_PUSH"
+    CAMPO_RFC = "wnd[0]/usr/txtSO_STCD1-LOW"
+    SELECCION = "wnd[0]/usr/ctxtSO_ERDAT-LOW"          # present = still on the selection screen
+    MENU_EXPORTAR = "wnd[0]/mbar/menu[0]/menu[3]/menu[1]"
+    BTN_SALIR = "wnd[0]/tbar[0]/btn[15]"
+    BTN_FIN_LISTA = "wnd[1]/usr/btnSPOP-OPTION1"
+    COL_FACTURA_CANDIDATAS = ("Factura",)
+    COL_UUID_CANDIDATAS = ("UUID", "UUID CFDI", "Folio fiscal", "UUID Fiscal")
+    # "Nothing selected" texts (the report's own is not recorded yet: any OTHER text stops with SAP's words).
+    MENSAJES_SIN_DATOS = (
+        "no se ha seleccionado ninguna partida", "no se seleccionaron datos", "no se han seleccionado datos",
+        "no existen datos", "no hay datos", "no se encontraron datos", "no se han encontrado datos",
+        "no se encontraron registros", "no existen registros", "no data selected", "no data was selected",
+        "no data found", "no entries found",
+    )
+
+    def __init__(self, documentos, desde, hasta, carpeta, archivo, sociedad, session, info=None):
+        super().__init__(documentos, carpeta, archivo or self.ARCHIVO, session)
+        self.desde, self.hasta, self.sociedad = desde, hasta, sociedad
+        self.info = info if info is not None else {}
+
+    def pasos(self):
+        self.preparar()
+        sociedad = "" if self.sociedad is None else str(self.sociedad).strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{1,4}", sociedad):
+            raise ValueError("La sociedad debe ser un código de 1 a 4 letras o dígitos "
+                             f"(se recibió {sociedad!r}).")
+        erdat_desde, erdat_hasta = rango_monivoi_2(self.desde, self.hasta)      # ValueError: bad period
+        self.info["fechas"] = (erdat_desde, erdat_hasta)
+        os.makedirs(self.carpeta, exist_ok=True)
+        self.borrar_restos()
+
+        s = self.conectar()
+        SAP.cerrar_popups(s)                     # a popup left by an earlier run blocks the command field
+        s.findById("wnd[0]/tbar[0]/okcd").text = "/n" + self.TX
+        s.findById("wnd[0]").sendVKey(0)
+        if not SAP.esperar(s, self.SELECCION, 10):
+            raise RuntimeError(f"{self.TX} no abrió su pantalla de selección. SAP dice: "
+                               f"'{SAP.aviso(s) or '(sin mensaje)'}'.")
+        s.findById("wnd[0]/usr/ctxtP_BUKRS").text = sociedad
+        s.findById("wnd[0]/usr/ctxtSO_ERDAT-LOW").text = erdat_desde
+        s.findById("wnd[0]/usr/ctxtSO_ERDAT-HIGH").text = erdat_hasta
+        s.findById("wnd[0]/usr/ctxtSO_VKORG-LOW").text = Monivoi.VKORG
+        s.findById("wnd[0]/usr/ctxtSO_VTWEG-LOW").text = Monivoi.VTWEG
+        self.sin_filtro_rfc(s)
+        print(f"[{self.ETIQUETA}] {len(self.lista):,} lista(s) de factura única(s) a consultar "
+              f"(creadas del {erdat_desde} al {erdat_hasta}).")
+        self.pegar_lista(self.BTN_LISTAS)
+        self.consultar()
+        if self.sin_resultados(self.SELECCION, "la lista de facturas"):
+            return False
+        self.exportar(self.MENU_EXPORTAR)
+        self.volver_al_menu()
+        return self.guardar(self.revisar_columnas)
+
+    def sin_filtro_rfc(self, s):
+        """The recording leaves the RFC field alone; a value remembered from the 1st Monivoi (XAXX010101000)
+        would silently drop BAMA / OXXO, so it is emptied and read back."""
+        if not SAP.existe(s, self.CAMPO_RFC):
+            return
+        s.findById(self.CAMPO_RFC).text = ""
+        if str(s.findById(self.CAMPO_RFC).text).strip():
+            raise RuntimeError("No pude vaciar el filtro de RFC de la Monivoi: la 2a consulta dejaría fuera "
+                               "a los clientes individuales (BAMA / OXXO).")
+
+    def exportar(self, menu):
+        """List > Export > Spreadsheet → default format → save, waiting like the 1st Monivoi's export (a list
+        of a few days can be long); DescargaConLista.exportar waits 90 s."""
+        s = self.session
+        s.findById(menu).select()
+        s.findById("wnd[1]/tbar[0]/btn[0]").press()                 # format selector: keep its default
+        desde, self.con_carpeta = self.dialogo_guardar("wnd[1]/tbar[0]/btn[0]")
+        self.exportado = Archivos.esperar_nuevo(self.ruta_xlsx, desde,
+                                                timeout=Archivos.ESPERA_EXPORTACION, estable=3.0)
+        if self.exportado:
+            Paralelo.marca(f"{self.MARCA}: archivo exportado")
+
+    def volver_al_menu(self):
+        """As recorded: Exit → 'end the list?' Yes → Exit; Exit is pressed again only on the selection screen
+        (on the main menu it would ask to log off). The file is already exported: problems are only reported."""
+        s = self.session
+        try:
+            s.findById(self.BTN_SALIR).press()
+            if SAP.esperar(s, self.BTN_FIN_LISTA):
+                s.findById(self.BTN_FIN_LISTA).press()
+                SAP.esperar_libre(s)
+            elif SAP.existe(s, "wnd[1]"):
+                raise RuntimeError("SAP mostró un popup distinto al de confirmar el cierre de la lista "
+                                   f"({SAP.describir_ventana(s)}) y no lo toqué.")
+            if SAP.existe(s, self.SELECCION):
+                s.findById(self.BTN_SALIR).press()
+            if SAP.existe(s, "wnd[1]"):
+                raise RuntimeError(f"quedó abierta la ventana {SAP.describir_ventana(s)}")
+            if SAP.existe(s, self.SELECCION):
+                raise RuntimeError("SAP siguió en la pantalla de selección de la Monivoi")
+            self.en_menu = True
+        except Exception as e:
+            print(f"[{self.ETIQUETA}] ⚠️ El archivo ya se exportó, pero no pude regresar al menú "
+                  f"principal de SAP: {e}")
+        time.sleep(2)
+        Excel.cerrar_libro(self.ruta_xlsx)
+
+    def limpiar(self):
+        """Temporary file and popups only: a blind Back on an unknown screen of this report could leave SAP's
+        'end the list?' or 'log off?' prompt open (the next download starts with /n from anywhere)."""
+        if os.path.exists(self.ruta_parcial) and not self.conservar_parcial:
+            try:
+                os.remove(self.ruta_parcial)
+            except OSError:
+                pass
+        if self.session is not None and not self.en_menu:
+            SAP.cerrar_popups(self.session)
+
+    @classmethod
+    def revisar_columnas(cls, df):
+        """'Diferencias' looks the UUID up by 'Factura' (the invoice list): an export without both columns is
+        not this report's."""
+        normalizadas = {Archivos.normalizar_encabezado(c) for c in df.columns}
+        faltan = [candidatas[0] for candidatas in (cls.COL_FACTURA_CANDIDATAS, cls.COL_UUID_CANDIDATAS)
+                  if not any(Archivos.normalizar_encabezado(c) in normalizadas for c in candidatas)]
+        if faltan:
+            columnas = ", ".join(f"'{c}'" for c in list(df.columns)[:15])
+            raise RuntimeError(f"el archivo de la Monivoi (2a corrida) no trae la(s) columna(s) "
+                               f"{', '.join(repr(c) for c in faltan)}. Columnas: {columnas}")
+
+
 # ======================================================================
 # Entry points (controller.py). True = downloaded with data; False = no data or a
 # handled error (printed in the console). `session`: the SAP window of a parallel run.
@@ -2410,6 +2547,13 @@ def BKPF_ZSE16(documentos, DateFrom, DateTo, FolderPath=None, FileName=None, soc
                session=None, info=None):
     """Table BKPF (ZSE16) for the documents in `documentos` (fiscal years of the period) → FileName."""
     return BKPF(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session, info).ejecutar()
+
+
+def Monivoi2_ZLMXCOM(documentos, DateFrom, DateTo, FolderPath=None, FileName=None, sociedad=_SOCIEDAD,
+                     session=None, info=None):
+    """ZLMXCOM_TRN_MONINVOI, 2nd run: the invoice lists in `documentos` (VBRL_2's 'List.fact.'), created in the
+    GUI period ±1 day (utils.rango_monivoi_2) → FileName (.csv, default 'Monitoreo_2.csv')."""
+    return Monivoi2(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session, info).ejecutar()
 
 
 def FBL5N_Deudores(documentos, FolderPath=None, FileName=None, session=None, info=None):

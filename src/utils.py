@@ -1,9 +1,9 @@
 """Validación Factura Global — helpers without SAP or tkinter (the GUI opens and tests on its own).
 
-The ONLY place for the Spanish months, the file-name formats and the two date offsets of the
-SAP queries: Monivoi +1 day and the sales buttons ('Venta DSD', 'Venta EIAP') −1 day on the end
-date, plus the accounts and document classes of each sale (asked to SAP AND summed by its tab).
-File NAMES always keep the dates the user typed.
+The ONLY place for the Spanish months, the file-name formats and the date offsets of the SAP
+queries: Monivoi +1 day, the 2nd Monivoi that same day ±1 and the sales buttons ('Venta DSD',
+'Venta EIAP') −1 day on the end date, plus the accounts and document classes of each sale (asked
+to SAP AND summed by its tab). File NAMES always keep the dates the user typed.
 """
 
 from datetime import datetime, timedelta
@@ -42,6 +42,22 @@ def fecha_efectiva_monivoi(fecha_str):
 def fecha_efectiva_monivoi_str(fecha_str):
     """fecha_efectiva_monivoi() as 'DD.MM.YYYY', for SO_ERDAT: '18.08.2026' -> '19.08.2026'."""
     return fecha_efectiva_monivoi(fecha_str).strftime(FORMATO_FECHA)
+
+
+# The 2nd Monivoi (UUIDs of BAMA / OXXO) widens the 1st one's days by this many days on EACH side:
+# SAT stamps are sometimes processed a day early or late.
+MARGEN_DIAS_MONIVOI_2 = 1
+
+
+def rango_monivoi_2(desde_str, hasta_str):
+    """SO_ERDAT (LOW, HIGH) of the 2nd Monivoi: the 1st one's days ±MARGEN_DIAS_MONIVOI_2, i.e. typed
+    '25.10.2026' -> ('25.10.2026', '27.10.2026'). ValueError for a bad date or a backwards range."""
+    if parse_fecha(hasta_str) < parse_fecha(desde_str):
+        raise ValueError(f"El periodo es inválido: {desde_str} — {hasta_str}.")
+    margen = timedelta(days=MARGEN_DIAS_MONIVOI_2)
+    desde = fecha_efectiva_monivoi(desde_str) - margen
+    hasta = fecha_efectiva_monivoi(hasta_str) + margen
+    return desde.strftime(FORMATO_FECHA), hasta.strftime(FORMATO_FECHA)
 
 
 def fecha_efectiva_eiap(fecha_str):
@@ -115,12 +131,13 @@ def nombre_archivo_rango_fb03(desde, hasta):
 # 2nd run (after the consolidation): one file per transaction, named like VBRL / FB03 with the
 # dates of the period. FBL5N is SAP's own text list, kept with the extension of its recording.
 ARCHIVOS_SEGUNDA_CORRIDA = {
-    "vbrp":  ("VBRP",   ".csv"),
-    "vbrk":  ("VBRK",   ".csv"),
-    "vbrl2": ("VBRL_2", ".csv"),
-    "fbl5n": ("FBL5N",  ".XLS"),
-    "knvp":  ("KNVP",   ".csv"),
-    "bkpf":  ("BKPF",   ".csv"),
+    "vbrp":     ("VBRP",        ".csv"),
+    "vbrk":     ("VBRK",        ".csv"),
+    "vbrl2":    ("VBRL_2",      ".csv"),
+    "fbl5n":    ("FBL5N",       ".XLS"),
+    "knvp":     ("KNVP",        ".csv"),
+    "bkpf":     ("BKPF",        ".csv"),
+    "monivoi2": ("Monitoreo_2", ".csv"),
 }
 
 
@@ -143,7 +160,7 @@ def nombre_archivo_rango_2da(clave, desde, hasta):
 CORRIDAS_DESCARGA = {
     1: (("gallo", "Gallo"), ("monivoi", "Monivoi"), ("vbrl", "VBRL"), ("fb03", "FB03")),
     2: (("vbrp", "VBRP"), ("vbrk", "VBRK"), ("vbrl2", "VBRL_2"),
-        ("fbl5n", "FBL5N"), ("knvp", "KNVP"), ("bkpf", "BKPF")),
+        ("fbl5n", "FBL5N"), ("knvp", "KNVP"), ("bkpf", "BKPF"), ("monivoi2", "Monivoi_2")),
 }
 
 
@@ -169,6 +186,7 @@ if __name__ == "__main__":
     print("Monivoi día   :", nombre_archivo_dia_monivoi("11.08.2026"))
     print("Monivoi rango :", nombre_archivo_rango_monivoi("11.08.2026", "13.08.2026"))
     print("Monivoi a SAP :", fecha_efectiva_monivoi_str("18.08.2026"))
+    print("Monivoi 2 SAP :", rango_monivoi_2("18.08.2026", "18.08.2026"))
     print("VBRL    día   :", nombre_archivo_dia_vbrl("11.08.2026"))
     print("VBRL    rango :", nombre_archivo_rango_vbrl("11.08.2026", "13.08.2026"))
     print("FB03    día   :", nombre_archivo_dia_fb03("11.08.2026"))

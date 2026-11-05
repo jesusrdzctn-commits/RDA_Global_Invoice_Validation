@@ -4,13 +4,17 @@ Monivoi ZLMXCOM and, optionally, VBRL ZSE16) → ONE Excel workbook. Tabs, in or
     Validación_doc*
     (* only with a VBRL file; ** only with a VBRL and an FB03 file, which also add the 'Notas de
     crédito' and 'PEP Vouchers' tables to 'TD.Diferencias_Referencias' and to 'Validación_doc')
+    2nd consolidation, after those: Diferencias, Agrupadores, VBRK, Cliente, VBRP, KNVP, VBRL (2), BKPF,
+    Monitor (2)
 
 One class per stage, each with its constants, its computation (preparar → result dict) and
 the sheet it writes (escribir): Comun (shared helpers) → EtapaGallo → EtapaTD →
 EtapaDocumentosFB03 → EtapaVentas → EtapaMonivoi → EtapaCruceTDMTD → EtapaVBRL →
 EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaValidacionDoc (the #N/A rows of those tables,
 side by side) → EtapaListasSegundaCorrida (what the 2nd run of downloads pastes into SAP, from the
-same #N/A rows) → Consolidador (the orchestrator); a class only uses the ones above it.
+same #N/A rows) → EtapaCliente / EtapaHojasSegundaCorrida / CatalogoAgrupadores / EtapaMonitor2 →
+EtapaDiferencias (the 2nd consolidation) → Consolidador (the orchestrator); a class only uses the ones
+above it.
 consolidar_gallo_monivoi() is what the controller calls; calcular_listas_segunda_corrida() gives
 the '2a corrida' download button the same lists without writing a workbook; consolidar_venta_dsd() and
 consolidar_venta_eiap() run when ONLY the file of that sale was downloaded (each its own workbook
@@ -1891,13 +1895,6 @@ class EtapaVBRL:
                 f"VBRL: {en_blanco:,} fila(s) sin valor en la columna "
                 f"{letra_factura} ('{col_factura}')."
             )
-        repetidas = sum(1 for n in repeticiones.values() if n > 1)
-        if repetidas:
-            avisos.append(
-                f"VBRL: {repetidas:,} factura(s) aparecen en más de una fila "
-                f"({len(importes_distintos):,} con importes distintos); XLOOKUP "
-                f"toma sólo la primera."
-            )
 
         df = vbrl.copy()
         df.isetitem(self.COL_FACTURA - 1,
@@ -3215,6 +3212,7 @@ class EtapaHojasSegundaCorrida:
     VBRP_FACTURA, VBRP_MOPED, VBRP_TPOS = 3, 4, 8
     KNVP_CLIENTE, KNVP_DESTINATARIO = 4, 10
     VBRL2_LISTA, VBRL2_FACTURA = 4, 6
+    VBRL2_LISTA_CANDIDATAS = ("List.fact.",)
     BKPF_DOCUMENTO, BKPF_ANULADO = 4, 10
 
     HOJA_VBRK, HOJA_CLIENTE, HOJA_VBRP = "VBRK", "Cliente", "VBRP"
@@ -3254,7 +3252,7 @@ class EtapaHojasSegundaCorrida:
         )},
         {"clave": "vbrl2", "hoja": HOJA_VBRL2, "etiqueta": "VBRL 2a corrida", "columnas": (
             (3,                 ("Md.", "Mandante"),          False, None),
-            (VBRL2_LISTA,       ("List.fact.",),              True,  None),
+            (VBRL2_LISTA,       VBRL2_LISTA_CANDIDATAS,       True,  None),
             (5,                 ("Pos.",),                    False, None),
             (VBRL2_FACTURA,     ("Factura",),                 True,  None),
             (7,                 ("Valor neto",),              False, None),
@@ -3462,13 +3460,255 @@ class EtapaHojasSegundaCorrida:
             ws.freeze_panes = "A2"
 
 
+# === The stakeholder's 'Agrupadores' catalog — one rule per 'Diferencias' row ===
+class ReglaAgrupador:
+    """One row of 'Agrupadores': `llave` = ((field, normalized value), ...) it must match, plus the three texts
+    it gives (Estatus 1, Error, W.A.), its traffic light and its flags (J: its Error wins over a Lista; K: the
+    W.A. is the UUID of the Lista). `destinatario` / `rfc` are what columns E / H of the reference tab show."""
+
+    def __init__(self, fila, nombre, motivo, clase, estatus, wa, error, semaforo, llave,
+                 destinatario=None, rfc="", prevalece=False, wa_uuid=False):
+        self.fila, self.nombre, self.motivo, self.clase = fila, nombre, motivo, clase
+        self.estatus, self.wa, self.error, self.semaforo = estatus, wa, error, semaforo
+        self.llave = tuple(llave)
+        self.destinatario, self.rfc = destinatario, rfc
+        self.prevalece, self.wa_uuid = prevalece, wa_uuid
+
+    @property
+    def etiqueta(self):
+        """What column 'Regla' of 'Diferencias' shows: the row of the 'Agrupadores' tab (+ its name)."""
+        return f"Fila {self.fila}" + (f" · {self.nombre}" if self.nombre else "")
+
+    @property
+    def concatenado(self):
+        """Column F of the reference tab: the key the template concatenated, without SAP's padding."""
+        return "".join(valor for _, valor in self.llave)
+
+
+class CatalogoAgrupadores:
+    """The fixed catalog (template rows 2-11 as agreed on 3-nov-2026, plus a catch-all SIN REGLA row), tried in
+    the template's order on tuples of normalized values. 3-valued logic: an unknown field (#N/A upstream) that
+    could still make an EARLIER rule match stops on SIN REGLA, so a later rule never wins by a missing value."""
+
+    HOJA = "Agrupadores"
+    DESCONOCIDO = object()          # a field whose lookup failed (#N/A in the sheet)
+
+    VERDE, AMARILLO, ROJO = "verde", "amarillo", "rojo"
+    COLORES = {VERDE: ("C6EFCE", "006100"), AMARILLO: ("FFEB9C", "9C5700"), ROJO: ("FFC7CE", "9C0006")}
+
+    TEXTO_VALIDAR = "Validar"
+    GLOBAL = "30162136"
+    RFC_BAMA, RFC_OXXO, RFC_GLOBAL = "BAM010705DG5", "CCO8605231N4", "XAXX010101000"
+    _CORRECTO = "Motivo de Pedido Correcto - Validar con IT"
+    _INCORRECTO = "Motivo de Pedido Incorrecto"
+    _CAMBIAR = "Cambiar Destinatario Factura a 30162136"
+
+    REGLAS = (
+        ReglaAgrupador(2, "", "ZC8", "ZVOR", f"ZVOR - {_INCORRECTO}", "Movimiento Q - ZC8", "Motivo Incorrecto",
+                       ROJO, (("motivo", "ZC8"), ("clase", "ZVOR"), ("destinatario", GLOBAL)),
+                       destinatario=int(GLOBAL), prevalece=True),
+        ReglaAgrupador(3, "", "ZC9", "ZVRE", f"ZVRE - {_INCORRECTO}", "Movimiento Q - ZC9", "Motivo Incorrecto",
+                       ROJO, (("motivo", "ZC9"), ("clase", "ZVRE"), ("destinatario", GLOBAL)),
+                       destinatario=int(GLOBAL), prevalece=True),
+        ReglaAgrupador(4, "", "ZPV", "ZMAD", "PEP VOUCHER", "PEP VOUCHER", "PEP VOUCHER",
+                       AMARILLO, (("motivo", "ZPV"), ("clase", "ZMAD"), ("destinatario", GLOBAL)),
+                       destinatario=int(GLOBAL), prevalece=True),
+        ReglaAgrupador(5, "BAMA", "ZS1", "ZVRE", f"ZVRE - {_CORRECTO}", "Cliente Individual", TEXTO_VALIDAR,
+                       VERDE, (("motivo", "ZS1"), ("clase", "ZVRE"), ("rfc", RFC_BAMA)),
+                       destinatario=30003341, rfc=RFC_BAMA, wa_uuid=True),
+        ReglaAgrupador(6, "OXXO", "ZS1", "ZVRE", f"ZVRE - {_CORRECTO}", "Cliente Individual", TEXTO_VALIDAR,
+                       VERDE, (("motivo", "ZS1"), ("clase", "ZVRE"), ("rfc", RFC_OXXO)),
+                       destinatario="N/A", rfc=RFC_OXXO, wa_uuid=True),
+        ReglaAgrupador(7, "Vendedores mal capturados", "ZA1", "ZVOR", f"ZVOR - {_CORRECTO}", _CAMBIAR,
+                       "Refacturar", VERDE, (("motivo", "ZA1"), ("clase", "ZVOR"))),
+        ReglaAgrupador(8, "Vendedores mal capturados", "ZA2", "ZVRE", f"ZVRE - {_CORRECTO}", _CAMBIAR,
+                       "Refacturar", VERDE, (("motivo", "ZA2"), ("clase", "ZVRE"))),
+        # Tecate: an organic sale (blank motive) of ZVOR billed to the generic RFC; name = its first 6 letters.
+        ReglaAgrupador(9, "Tecate (provisional)", "", "ZVOR", f"ZVOR - {_CORRECTO}",
+                       "Solicitar corrección Destinatario a 30162136 (Global)", "Refacturar", VERDE,
+                       (("nombre6", "TECATE"), ("rfc", RFC_GLOBAL), ("motivo", ""), ("clase", "ZVOR")),
+                       destinatario=30176687, rfc=RFC_GLOBAL),
+        ReglaAgrupador(10, "Motivo de pedido incorrecto", "ZA4", "ZVOR", f"ZVOR - {_INCORRECTO}", "Refacturar",
+                       "Motivo Incorrecto", ROJO, (("motivo", "ZA4"), ("clase", "ZVOR"))),
+        ReglaAgrupador(11, "PepV_Individual", "ZPV", "ZMAD", "PEP VOUCHER INDIVIDUAL", "PEP VOUCHER INDIVIDUAL",
+                       "PEP VOUCHER INDIVIDUAL", AMARILLO, (("motivo", "ZPV"), ("clase", "ZMAD"))),
+    )
+    SIN_REGLA = ReglaAgrupador(12, "SIN REGLA", "", "", TEXTO_VALIDAR, TEXTO_VALIDAR, TEXTO_VALIDAR, AMARILLO,
+                               (("", "SIN REGLA"),))
+
+    ENCABEZADOS = ("", "Motivo de Pedido", "Estatus 1", "Clase de documento", "Destinatario Factura",
+                   "Concatenado", "W.A", "RFC", "Error", "Prevalece sobre Lista", "W.A. = UUID")
+
+    @staticmethod
+    def texto(valor):
+        """A SAP text compared without padding or case; a blank cell is '' (the organic sale's motive)."""
+        return "" if valor is None else str(valor).strip().upper()
+
+    @staticmethod
+    def cliente(valor):
+        """A customer / ship-to number compared as digits without leading zeros: 30162136 == '0030162136'."""
+        texto = CatalogoAgrupadores.texto(valor)
+        if re.fullmatch(r"[0-9]+(?:\.0+)?", texto):
+            texto = texto.split(".", 1)[0].lstrip("0") or "0"
+        return texto
+
+    @classmethod
+    def coincide(cls, regla, datos):
+        """True / False, or None when only unknown fields keep it from being decided."""
+        resultado = True
+        for campo, esperado in regla.llave:
+            valor = datos.get(campo, cls.DESCONOCIDO)
+            if valor is cls.DESCONOCIDO:
+                resultado = None
+            elif valor != esperado:
+                return False
+        return resultado
+
+    @classmethod
+    def clasificar(cls, datos):
+        """The rule of one 'Diferencias' row (`datos`: motivo, clase, destinatario, rfc, nombre6, already
+        normalized or DESCONOCIDO); SIN_REGLA when none matches or an undecidable one comes first."""
+        for regla in cls.REGLAS:
+            resultado = cls.coincide(regla, datos)
+            if resultado:
+                return regla
+            if resultado is None:
+                return cls.SIN_REGLA
+        return cls.SIN_REGLA
+
+    @classmethod
+    def pintar(cls, celda, semaforo):
+        """Fill + bold font of a traffic-light colour (the values are static, so is their colour)."""
+        fondo, letra = cls.COLORES[semaforo]
+        celda.fill = PatternFill(start_color=fondo, end_color=fondo, fill_type="solid")
+        celda.font = Font(bold=True, color=letra)
+
+    @classmethod
+    def escribir(cls, ws):
+        """The reference tab: the template's A:I plus J, K and the SIN REGLA row, as values (no SAP padding);
+        Estatus 1 painted with its traffic light. Nobody edits it: the code holds the catalog."""
+        negrita = Font(bold=True)
+        for columna, texto in enumerate(cls.ENCABEZADOS, start=1):
+            if texto:
+                ws.cell(row=1, column=columna, value=texto).font = negrita
+        for regla in cls.REGLAS + (cls.SIN_REGLA,):
+            valores = (regla.nombre or None, regla.motivo or None, regla.estatus, regla.clase or None,
+                       regla.destinatario, regla.concatenado, regla.wa, regla.rfc or None, regla.error,
+                       "Si" if regla.prevalece else "No", "Si" if regla.wa_uuid else "No")
+            for columna, valor in enumerate(valores, start=1):
+                if valor is not None:
+                    ws.cell(row=regla.fila, column=columna, value=valor)
+            cls.pintar(ws.cell(row=regla.fila, column=3), regla.semaforo)
+        notas = {
+            3: "Semáforo: rojo = motivo incorrecto; amarillo = validar (PEP voucher o sin regla); verde = motivo "
+               "correcto (lo que falta lo valida IT). Es el mismo color de 'Estatus 1' en Diferencias.",
+            6: "Llave de la regla, sin los espacios de relleno de SAP. Se prueban en el orden de las filas: "
+               "Motivo+Clase+Destinatario (2-4), Motivo+Clase+RFC (5-6), Motivo+Clase (7, 8, 10, 11) y Tecate "
+               "(primeras 6 letras del nombre + RFC + Motivo + Clase, fila 9). Ninguna: SIN REGLA.",
+            10: "Si: el Error de la regla se muestra aunque el documento ya esté en una Lista de factura. "
+                "No: si está en una Lista, Error muestra el número de Lista.",
+            11: "Si: W.A. es el UUID de la Lista de factura en 'Monitor (2)' (sin Lista: Validar; Lista sin "
+                "UUID o que no está: Sin UUID).",
+        }
+        for columna, texto in notas.items():
+            Comun.comentar(ws.cell(row=1, column=columna), texto, ancho=360, alto=110)
+        for letra, ancho in {"A": 26, "B": 10, "C": 50, "D": 11, "E": 13, "F": 26, "G": 52, "H": 16,
+                             "I": 24, "J": 12, "K": 12}.items():
+            ws.column_dimensions[letra].width = ancho
+        ws.freeze_panes = "A2"
+
+
+# === Stage: 'Monitor (2)' — the 2nd Monivoi: the UUID of each invoice list (BAMA / OXXO) ===
+class EtapaMonitor2:
+    """The 2nd Monivoi (invoice lists of VBRL_2, created on the GUI days ±1), written as SAP gave it on 'Monitor
+    (2)', and its 'Factura' (the invoice list) → 'UUID' map. `ruta` None = not downloaded (VBRL_2 was not
+    either): a blank sheet that finds nothing, as the formula did. A list keeps its first non-empty UUID."""
+
+    HOJA = "Monitor (2)"
+    ORIGEN = "Monivoi (2a corrida)"
+    COL_FACTURA_CANDIDATAS = EtapaMonivoi.COL_FACTURA_CANDIDATAS
+    COL_UUID_CANDIDATAS = EtapaMonivoi.COL_UUID_CANDIDATAS
+    UUID_VACIOS = EtapaMonivoi.UUID_VACIOS
+    NOTA_SIN_ARCHIVO = "Monitor (2): no hubo archivo de la Monivoi (2a corrida); la pestaña quedó en blanco."
+
+    def __init__(self, ruta):
+        self.ruta = ruta or None
+        self.resultado = None
+
+    @staticmethod
+    def clave_lista(valor):
+        """An invoice list as both sides are compared: trimmed, no '.0', digits without leading zeros."""
+        texto = CatalogoAgrupadores.cliente(valor)
+        return texto or None
+
+    @classmethod
+    def uuid_vacio(cls, valor):
+        return str(valor).strip().upper() in cls.UUID_VACIOS
+
+    def preparar(self):
+        """Read and check the file → {disponible, sin_datos, df, mapa {lista: uuid or None}, avisos}. ValueError:
+        a file with data but without 'Factura' / 'UUID' (a wrong file must stop the run, not empty the W.A.)."""
+        vacio = {"disponible": False, "sin_datos": True, "df": None, "mapa": {}, "avisos": []}
+        if self.ruta is None:
+            self.resultado = vacio
+            return vacio
+        df = Comun.leer_csv(self.ruta)
+        if Comun.es_sin_datos(df):
+            self.resultado = dict(vacio, disponible=True, avisos=[
+                f"{self.HOJA}: el archivo de la {self.ORIGEN} vino sin datos; la pestaña quedó en blanco."])
+            return self.resultado
+        col_lista = Comun.col_por_candidatos(df, self.COL_FACTURA_CANDIDATAS, "factura (lista de facturas)",
+                                             origen=self.ORIGEN)
+        col_uuid = Comun.col_por_candidatos(df, self.COL_UUID_CANDIDATAS, "UUID", origen=self.ORIGEN)
+        mapa, distintos = {}, {}
+        for lista, uuid in zip(df[col_lista], df[col_uuid]):
+            clave = self.clave_lista(lista)
+            if clave is None:
+                continue
+            texto = None if self.uuid_vacio(uuid) else str(uuid).strip()
+            if texto is not None:
+                distintos.setdefault(clave, set()).add(texto.upper())
+            if mapa.get(clave) is None:
+                mapa[clave] = texto
+        avisos = []
+        varios = sorted(clave for clave, uuids in distintos.items() if len(uuids) > 1)
+        if varios:
+            avisos.append(f"{self.HOJA}: {len(varios):,} lista(s) traen más de un UUID distinto (ej.: "
+                          f"{', '.join(varios[:3])}); el W.A. toma el primero.")
+        self.resultado = {"disponible": True, "sin_datos": False, "df": df, "mapa": mapa, "avisos": avisos}
+        return self.resultado
+
+    def uuid(self, lista):
+        """UUID of `lista` (None: not in the file, no UUID, or no file at all)."""
+        return self.resultado["mapa"].get(self.clave_lista(lista))
+
+    def escribir(self, libro):
+        """The sheet: SAP's columns from A, header row 1, values as text; blank (with a note) without data."""
+        ws = libro.create_sheet(self.HOJA)
+        r = self.resultado
+        if r["df"] is None:
+            Comun.comentar(ws["A1"], r["avisos"][0] if r["avisos"] else self.NOTA_SIN_ARCHIVO,
+                           ancho=320, alto=80)
+            return ws
+        df = r["df"]
+        negrita = Font(bold=True)
+        for columna, encabezado in enumerate(df.columns, start=1):
+            ws.cell(row=1, column=columna, value=str(encabezado).strip()).font = negrita
+        for numero, fila in enumerate(df.itertuples(index=False, name=None), start=2):
+            for columna, valor in enumerate(fila, start=1):
+                texto = str(valor).strip()
+                if texto:
+                    EtapaHojasSegundaCorrida.poner(ws, numero, columna, texto)
+        ws.freeze_panes = "A2"
+        return ws
+
+
 # === Stage: 'Diferencias' — the stakeholder's final analysis tab ===
 class EtapaDiferencias:
-    """Sheet 'Diferencias': one row per document awaiting validation (same rows as 'Validación_doc'); A:D
-    values, F 'Tipo' (Factura / NC / PV), G:Q LIVE template formulas (XLOOKUPs into VBRK, Cliente, VBRP,
-    KNVP, 'VBRL (2)', BKPF; no IFERROR). Two user-approved simplifications: J tests the first 2
-    characters as TEXT; P/Q read a blank 'Anul.con' (empty or padded) as not reversed. `preparar` mirrors
-    every formula."""
+    """Sheet 'Diferencias' (A:S): one row per document awaiting validation (same rows as 'Validación_doc'); A:D
+    values, F 'Tipo', LIVE lookups (G:K, M:N, Q:R; XLOOKUPs into VBRK, Cliente, VBRP, KNVP, 'VBRL (2)', BKPF; no
+    IFERROR) and, as VALUES from ONE rule of 'Agrupadores', L Estatus 1 (traffic light), O Error, P W.A., S
+    Regla. `preparar` mirrors every formula and feeds the rule from the raw lookups (SAP padding off)."""
 
     HOJA = "Diferencias"
     FILA_ENCABEZADO = 2
@@ -3479,13 +3719,14 @@ class EtapaDiferencias:
     ENCABEZADOS = (
         (1, "CL"), (2, "Nº documento"), (3, "Referencia de pago"), (4, "Sum of Importe en moneda local"),
         (5, "Monto"), (6, "Tipo"), (7, "No cliente"), (8, "Nombre cliente"), (9, "RFC"),
-        (10, "Observación"), (11, "Motivo de Pedido"), (12, "Clase de documento"),
-        (13, "Destinatario Factura"), (14, "Lista de Factura"), (15, "Estatus Lista de factura"),
-        (16, "Documento Anulado"), (17, "Estatus Documento anulado"),
+        (10, "Observación"), (11, "Motivo de Pedido"), (12, "Estatus 1"), (13, "Clase de documento"),
+        (14, "Destinatario Factura"), (15, "Error"), (16, "W.A"), (17, "Lista de Factura"),
+        (18, "Documento Anulado"), (19, "Regla"),
     )
     ANCHOS = {"A": 8, "B": 14, "C": 18, "D": 16, "E": 13, "F": 9, "G": 12, "H": 32, "I": 18,
-              "J": 20, "K": 12, "L": 12, "M": 20, "N": 14, "O": 14, "P": 16, "Q": 24}
-    ULTIMA_COLUMNA = 17
+              "J": 20, "K": 12, "L": 48, "M": 12, "N": 20, "O": 22, "P": 50, "Q": 14, "R": 16, "S": 34}
+    ULTIMA_COLUMNA = 19
+    COL_ESTATUS, COL_ERROR, COL_WA, COL_REGLA = 12, 15, 16, 19
 
     RFC_GLOBAL = "XAXX010101000"
     PREFIJOS_VENDEDOR = ("20", "21")
@@ -3493,12 +3734,14 @@ class EtapaDiferencias:
     TEXTO_VENDEDOR = "Vendedor"
     TEXTO_INDIVIDUAL = "Cliente Individual"
     TEXTO_SIN_DATO = "N/D"
+    TEXTO_SIN_UUID = "Sin UUID"
     NA = "#N/A"
 
-    def __init__(self, etapa_validacion, etapa_hojas):
-        """Both stages must already be prepared."""
+    def __init__(self, etapa_validacion, etapa_hojas, etapa_monitor2=None):
+        """Every stage must already be prepared; `etapa_monitor2` None = the 2nd Monivoi was not given."""
         self.etapa_validacion = etapa_validacion
         self.etapa_hojas = etapa_hojas
+        self.etapa_monitor2 = etapa_monitor2
         self.resultado = None
 
     @staticmethod
@@ -3538,83 +3781,99 @@ class EtapaDiferencias:
                  f"{Comun.texto_formula(EtapaDiferencias.TEXTO_VENDEDOR)},"
                  f"{Comun.texto_formula(EtapaDiferencias.TEXTO_INDIVIDUAL)}))"),
             11: f"=+_xlfn.XLOOKUP(C{r},{vbrp_f},{vbrp_m})",
-            12: f"=+_xlfn.XLOOKUP(C{r},{vbrp_f},{vbrp_t})",
-            13: f"=+_xlfn.XLOOKUP(G{r},{knvp_c},{knvp_d})",
-            14: f"=+_xlfn.XLOOKUP(C{r},{vbrl_f},{vbrl_l},{sin_dato})",
-            15: f"=+IF(N{r}={sin_dato},\"No\",\"Si\")",
-            16: f"=IF({anulado}=\"\",{sin_dato},{anulado})",
-            17: f"=+IF(P{r}={sin_dato},\"No\",\"Si\")",
+            13: f"=+_xlfn.XLOOKUP(C{r},{vbrp_f},{vbrp_t})",
+            14: f"=+_xlfn.XLOOKUP(G{r},{knvp_c},{knvp_d})",
+            17: f"=+_xlfn.XLOOKUP(C{r},{vbrl_f},{vbrl_l},{sin_dato})",
+            18: f"=IF({anulado}=\"\",{sin_dato},{anulado})",
         }
 
     def evaluar(self, referencia, documento):
-        """Python mirror: what each formula of one row shows once Excel calculates → {'G'…'Q': value or NA}.
-        `referencia`: what column C holds ('#N/A' error cell, number or text); `documento`: column B."""
+        """One row → {'G'…'S': what the sheet shows (formula columns as Excel calculates them, NA = #N/A),
+        'regla': the ReglaAgrupador}. `referencia`: column C ('#N/A' error cell, number or text); `documento`: B."""
         H = EtapaHojasSegundaCorrida
+        A = CatalogoAgrupadores
         mapas = self.etapa_hojas.mapas
         NA = self.NA
         # An error cell in C poisons every lookup; a number never matches a text key.
         ref_error = referencia == NA
         ref = H.clave_texto(referencia) if isinstance(referencia, str) and not ref_error else None
 
-        out = {}
-        if ref_error:
-            g = NA
-        elif ref in mapas["vbrk"]:
-            g = mapas["vbrk"][ref]
-            g = 0 if g is None else g
-        else:
-            g = NA
-        out["G"] = g
+        falta = object()
 
-        persona = mapas["cliente"].get(H.clave_cliente(g)) if g != NA else None
+        def buscar(mapa, llave):
+            """What XLOOKUP finds: the raw value (None = an empty cell) or `falta`."""
+            return mapa[llave] if llave is not None and llave in mapa else falta
+
+        def mostrar(valor):
+            return NA if valor is falta else (0 if valor is None else valor)
+
+        out = {}
+        solicitante = falta if ref_error else buscar(mapas["vbrk"], ref)
+        g = out["G"] = mostrar(solicitante)
+        cliente = None if solicitante is falta else H.clave_cliente(g)
+        persona = mapas["cliente"].get(cliente) if cliente is not None else None
         if persona is None:
             out["H"] = out["I"] = out["J"] = NA
+            rfc_dato = nombre_dato = A.DESCONOCIDO
         else:
             rfc, nombre = persona
-            out["H"] = 0 if nombre is None else nombre
-            out["I"] = (rfc or "").strip()
+            out["H"] = mostrar(nombre)
+            out["I"] = "0" if rfc is None else str(rfc).strip()
             if out["I"].upper() == self.RFC_GLOBAL.upper():
                 out["J"] = self.TEXTO_GLOBAL
             elif str(g)[:2] in self.PREFIJOS_VENDEDOR:
                 out["J"] = self.TEXTO_VENDEDOR
             else:
                 out["J"] = self.TEXTO_INDIVIDUAL
+            rfc_dato, nombre_dato = A.texto(rfc), A.texto(nombre)[:6]
 
-        for letra, clave in (("K", "moped"), ("L", "tpos")):
-            if ref is not None and ref in mapas["vbrp"][clave]:
-                valor = mapas["vbrp"][clave][ref]
-                out[letra] = 0 if valor is None else valor
-            else:
-                out[letra] = NA
+        motivo = buscar(mapas["vbrp"]["moped"], ref)
+        clase = buscar(mapas["vbrp"]["tpos"], ref)
+        destinatario = falta if cliente is None else buscar(mapas["knvp"], cliente)
+        out["K"], out["M"], out["N"] = mostrar(motivo), mostrar(clase), mostrar(destinatario)
 
-        if g != NA and H.clave_cliente(g) in mapas["knvp"]:
-            valor = mapas["knvp"][H.clave_cliente(g)]
-            out["M"] = 0 if valor is None else valor
-        else:
-            out["M"] = NA
-
-        if ref_error:
-            out["N"] = out["O"] = NA
-        else:
-            if ref is not None and ref in mapas["vbrl2"]:
-                valor = mapas["vbrl2"][ref]
-                out["N"] = 0 if valor is None else valor
-            else:
-                out["N"] = self.TEXTO_SIN_DATO
-            out["O"] = "No" if out["N"] == self.TEXTO_SIN_DATO else "Si"
+        lista = falta if ref_error else buscar(mapas["vbrl2"], ref)
+        out["Q"] = NA if ref_error else (self.TEXTO_SIN_DATO if lista is falta else mostrar(lista))
 
         doc = H.clave_texto(documento)
         if doc is not None and doc in mapas["bkpf"]:
             texto = (mapas["bkpf"][doc] or "").strip()
-            out["P"] = texto if texto else self.TEXTO_SIN_DATO
-            out["Q"] = "No" if out["P"] == self.TEXTO_SIN_DATO else "Si"
+            out["R"] = texto if texto else self.TEXTO_SIN_DATO
         else:
-            out["P"] = out["Q"] = NA
+            out["R"] = NA
+
+        def dato(valor, normalizar):
+            return A.DESCONOCIDO if valor is falta else normalizar(valor)
+        regla = A.clasificar({
+            "motivo": dato(motivo, A.texto), "clase": dato(clase, A.texto),
+            "destinatario": dato(destinatario, A.cliente), "rfc": rfc_dato, "nombre6": nombre_dato,
+        })
+        en_lista = lista is not falta and self.es_lista(lista)
+        out["L"] = regla.estatus
+        out["O"] = str(lista).strip() if en_lista and not regla.prevalece else regla.error
+        out["P"] = self._wa(regla, lista if en_lista else None)
+        out["S"] = regla.etiqueta
+        out["regla"] = regla
         return out
 
+    @staticmethod
+    def es_lista(valor):
+        """A real Lista de factura: one leer_listas_vbrl2 hands to the 2nd Monivoi (no blank, no SAP zeros)."""
+        return valor is not None and bool(Comun.documentos_distintos([valor]))
+
+    def _wa(self, regla, lista):
+        """W.A.: the rule's text or, with flag K (the stakeholder's formula): no Lista → Validar; the UUID of the
+        Lista in 'Monitor (2)'; a Lista that is not there or has no UUID → Sin UUID."""
+        if not regla.wa_uuid:
+            return regla.wa
+        if lista is None:
+            return CatalogoAgrupadores.TEXTO_VALIDAR
+        uuid = self.etapa_monitor2.uuid(lista) if self.etapa_monitor2 is not None else None
+        return uuid or self.TEXTO_SIN_UUID
+
     def preparar(self):
-        """The rows of the sheet and how their formulas will end → {'filas': [(tipo, centro, documento,
-        referencia, importe)], 'esperado': [mirror per row], 'conteo': {...}, 'avisos': [...]}."""
+        """The rows of the sheet and what each one shows → {'filas': [(tipo, centro, documento, referencia,
+        importe)], 'esperado': [evaluar per row], 'conteo': {...}, 'avisos': [...]}."""
         validacion = self.etapa_validacion.resultado["bloques"]
         filas = []
         for clave, tipo in self.TIPOS:
@@ -3629,19 +3888,31 @@ class EtapaDiferencias:
         NA = self.NA
         cuenta = lambda condicion: sum(1 for e in esperado if condicion(e))
         sin_vbrk = cuenta(lambda e: e["G"] == NA)
+        sin_regla = CatalogoAgrupadores.SIN_REGLA
+        por_regla = {}
+        for e in esperado:
+            por_regla[e["S"]] = por_regla.get(e["S"], 0) + 1
         conteo = {
             "filas":         n,
             "por_tipo":      {tipo: sum(1 for f in filas if f[0] == tipo) for _, tipo in self.TIPOS},
             "sin_vbrk":      sin_vbrk,
             "sin_cliente":   cuenta(lambda e: e["G"] != NA and e["H"] == NA),
             "sin_vbrp":      cuenta(lambda e: e["K"] == NA),
-            "sin_knvp":      cuenta(lambda e: e["G"] != NA and e["M"] == NA),
-            "sin_lista":     cuenta(lambda e: e["N"] == self.TEXTO_SIN_DATO),
-            "sin_bkpf":      cuenta(lambda e: e["P"] == NA),
-            "anuladas":      cuenta(lambda e: e["Q"] == "Si"),
+            "sin_knvp":      cuenta(lambda e: e["G"] != NA and e["N"] == NA),
+            "sin_lista":     cuenta(lambda e: e["Q"] == self.TEXTO_SIN_DATO),
+            "sin_bkpf":      cuenta(lambda e: e["R"] == NA),
+            "anuladas":      cuenta(lambda e: e["R"] not in (NA, self.TEXTO_SIN_DATO)),
             "cliente_global":     cuenta(lambda e: e["J"] == self.TEXTO_GLOBAL),
             "vendedor":           cuenta(lambda e: e["J"] == self.TEXTO_VENDEDOR),
             "cliente_individual": cuenta(lambda e: e["J"] == self.TEXTO_INDIVIDUAL),
+            "semaforo":      {color: cuenta(lambda e, color=color: e["regla"].semaforo == color)
+                              for color in (CatalogoAgrupadores.VERDE, CatalogoAgrupadores.AMARILLO,
+                                            CatalogoAgrupadores.ROJO)},
+            "por_regla":     por_regla,
+            "sin_regla":     cuenta(lambda e: e["regla"] is sin_regla),
+            "wa_uuid":       cuenta(lambda e: e["regla"].wa_uuid and e["P"] not in (
+                                 CatalogoAgrupadores.TEXTO_VALIDAR, self.TEXTO_SIN_UUID)),
+            "wa_sin_uuid":   cuenta(lambda e: e["regla"].wa_uuid and e["P"] == self.TEXTO_SIN_UUID),
             "con_fp":        sum(1 for f in filas
                                  if isinstance(f[3], str) and EtapaListasSegundaCorrida.excluida(f[3])),
             "importe":       round(sum(f[4] for f in filas), 2),
@@ -3677,41 +3948,52 @@ class EtapaDiferencias:
             if conteo["sin_bkpf"]:
                 avisos.append(f"{etiqueta}: {conteo['sin_bkpf']:,} renglón(es) con un Nº documento que no "
                               f"está en BKPF; Documento Anulado queda en #N/A.")
+            if conteo["sin_regla"]:
+                avisos.append(f"{etiqueta}: {conteo['sin_regla']:,} renglón(es) no empatan ninguna regla de "
+                              f"'{CatalogoAgrupadores.HOJA}' (o les falta un dato para decidirla): Estatus 1, "
+                              f"Error y W.A. dicen '{CatalogoAgrupadores.TEXTO_VALIDAR}'.")
+            sin_archivo = self.etapa_monitor2 is None or not self.etapa_monitor2.resultado["disponible"]
+            if conteo["wa_sin_uuid"] and sin_archivo:
+                avisos.append(f"{etiqueta}: {conteo['wa_sin_uuid']:,} renglón(es) de BAMA / OXXO con Lista de "
+                              f"factura dicen '{self.TEXTO_SIN_UUID}' sin que hubiera archivo de la Monivoi de la "
+                              f"2a corrida ('{EtapaMonitor2.HOJA}' en blanco): confírmalos en SAP.")
+        if self.etapa_monitor2 is not None:
+            avisos.extend(self.etapa_monitor2.resultado["avisos"])
 
         self.resultado = {"filas": filas, "esperado": esperado, "conteo": conteo, "avisos": avisos}
         return self.resultado
 
     def escribir(self, ws):
-        """Write the sheet like the template: row 2 headers (with an AutoFilter), data from row 3, A:D as
-        values and E, G:Q as formulas; panes frozen under the headers."""
+        """Write the sheet like the template: row 2 headers (with an AutoFilter), data from row 3, A:D, F and
+        L, O, P, S as values (Estatus 1 painted), E and the lookups as formulas; panes frozen."""
         resultado = self.resultado
         negrita = Font(bold=True)
         formato = Comun.FORMATO_NUMERO
         for columna, texto in self.ENCABEZADOS:
             ws.cell(row=self.FILA_ENCABEZADO, column=columna, value=texto).font = negrita
 
-        Comun.comentar(
-            ws.cell(row=self.FILA_ENCABEZADO, column=6),
-            "Factura = renglón de la tabla Facturas de 'TD.Diferencias_Referencias'; NC = de Notas de "
-            "crédito; PV = de PEP Vouchers. Son los renglones cuya Diferencia terminó en #N/A (los "
-            "mismos de 'Validación_doc').",
-            ancho=360, alto=100,
-        )
-        Comun.comentar(
-            ws.cell(row=self.FILA_ENCABEZADO, column=10),
-            "Cliente Global si el RFC es XAXX010101000; Vendedor si el No cliente empieza con 20 o 21; "
-            "si no, Cliente Individual. Misma regla del Excel de referencia con una fórmula más corta.",
-            ancho=360, alto=90,
-        )
-        Comun.comentar(
-            ws.cell(row=self.FILA_ENCABEZADO, column=16),
-            "Documento de anulación (Anul.con) del Nº documento en BKPF; 'N/D' si no tiene (vacío o sólo "
-            "espacios). Si el documento no está en BKPF: #N/A.",
-            ancho=360, alto=90,
-        )
+        notas = {
+            6: "Factura = renglón de la tabla Facturas de 'TD.Diferencias_Referencias'; NC = de Notas de "
+               "crédito; PV = de PEP Vouchers. Son los renglones cuya Diferencia terminó en #N/A (los "
+               "mismos de 'Validación_doc').",
+            10: "Cliente Global si el RFC es XAXX010101000; Vendedor si el No cliente empieza con 20 o 21; "
+                "si no, Cliente Individual. Misma regla del Excel de referencia con una fórmula más corta.",
+            self.COL_ESTATUS: "Valor (no fórmula): Estatus 1 de la regla de 'Agrupadores' que empató (columna "
+                              "Regla). Rojo = motivo incorrecto; amarillo = validar; verde = motivo correcto.",
+            self.COL_ERROR: "Valor: el Error de la regla. Si el documento ya está en una Lista de factura, el "
+                            "número de Lista, salvo en las reglas que prevalecen (filas 2-4 de 'Agrupadores').",
+            self.COL_WA: "Valor: el W.A. de la regla. BAMA / OXXO: el UUID de su Lista en 'Monitor (2)'; sin "
+                         "Lista, Validar; Lista sin UUID o que no está, Sin UUID.",
+            18: "Documento de anulación (Anul.con) del Nº documento en BKPF; 'N/D' si no tiene (vacío o sólo "
+                "espacios). Si el documento no está en BKPF: #N/A.",
+            self.COL_REGLA: "Fila de la pestaña 'Agrupadores' cuya regla decidió Estatus 1, Error y W.A. "
+                            "(SIN REGLA: ninguna empató o faltó un dato para decidirla).",
+        }
+        for columna, texto in notas.items():
+            Comun.comentar(ws.cell(row=self.FILA_ENCABEZADO, column=columna), texto, ancho=360, alto=100)
 
         fila = self.FILA_INICIO
-        for tipo, centro, documento, referencia, importe in resultado["filas"]:
+        for (tipo, centro, documento, referencia, importe), e in zip(resultado["filas"], resultado["esperado"]):
             EtapaHojasSegundaCorrida.poner(ws, fila, 1, centro or None)
             EtapaHojasSegundaCorrida.poner(ws, fila, 2, documento or None)
             # '#N/A' (the document is not in FB) stays the error cell the other tables show.
@@ -3724,6 +4006,10 @@ class EtapaDiferencias:
                 celda = ws.cell(row=fila, column=columna, value=formula)
                 if columna == 5:
                     celda.number_format = formato
+            for columna, letra in ((self.COL_ESTATUS, "L"), (self.COL_ERROR, "O"), (self.COL_WA, "P"),
+                                   (self.COL_REGLA, "S")):
+                EtapaHojasSegundaCorrida.poner(ws, fila, columna, e[letra])
+            CatalogoAgrupadores.pintar(ws.cell(row=fila, column=self.COL_ESTATUS), e["regla"].semaforo)
             fila += 1
 
         ultima = max(fila - 1, self.FILA_ENCABEZADO)
@@ -3766,6 +4052,17 @@ def leer_solicitantes_vbrk(ruta_vbrk):
     return EtapaListasSegundaCorrida.leer_solicitantes(ruta_vbrk)
 
 
+def leer_listas_vbrl2(ruta_vbrl2):
+    """The invoice lists ('List.fact.', distinct, in order) of the 2nd-run VBRL that the 2nd Monivoi pastes
+    into SAP → (valores, filas_leidas, nombre_columna); empty for the 'Sin datos' placeholder."""
+    vbrl2 = Comun.leer_csv(ruta_vbrl2)
+    candidatas = EtapaHojasSegundaCorrida.VBRL2_LISTA_CANDIDATAS
+    if Comun.es_sin_datos(vbrl2):
+        return [], 0, candidatas[0]
+    columna = Comun.col_por_candidatos(vbrl2, candidatas, "lista de facturas", origen="VBRL 2a corrida")
+    return Comun.documentos_distintos(vbrl2[columna]), len(vbrl2), columna
+
+
 def preparar_tablas_diferencias(gallo, pasos_gallo, etapa_td, etapa_vbrl, etapa_fb=None,
                                 update_status=None):
     """The three 'TD.Diferencias_Referencias' tables and the 2nd-run lists from their #N/A rows →
@@ -3789,13 +4086,13 @@ class Consolidador:
     """Runs the consolidation: reads the CSVs, runs the stages (EtapaGallo → EtapaTD → EtapaMonivoi →
     EtapaCruceTDMTD → [EtapaVBRL → … → EtapaListasSegundaCorrida]) and writes the workbook. VBRL and FB03
     are OPTIONAL (old dates must still consolidate; Notas / PEP tables need BOTH). The 2nd consolidation
-    (`rutas_segunda`) is the SAME run plus six sheets and 'Diferencias': one code path."""
+    (`rutas_segunda`) is the SAME run plus 'Diferencias', 'Agrupadores', six sheets and 'Monitor (2)'."""
 
     def __init__(self, ruta_gallo, ruta_monivoi, ruta_output, nombre_salida=None,
                  callback_status=None, ruta_vbrl=None, ruta_fb03=None, rutas_segunda=None):
         """`ruta_vbrl` adds 'VBRL', 'TD.Diferencias_Referencias', 'Validación_doc'; `ruta_fb03` (with it)
         adds 'FB' and the Notas / PEP tables; `nombre_salida` defaults to 'Consolidado_<Gallo>.xlsx';
-        `rutas_segunda` = 2nd consolidation (needs `ruta_vbrl`)."""
+        `rutas_segunda` = 2nd consolidation (needs `ruta_vbrl`; its 'monivoi2' None = blank 'Monitor (2)')."""
         self.ruta_gallo = ruta_gallo
         self.ruta_monivoi = ruta_monivoi
         self.ruta_output = ruta_output
@@ -3817,7 +4114,7 @@ class Consolidador:
 
     def _escribir_libro(self, ruta, etapa_gallo, monivoi, etapa_vbrl, etapa_fb, etapa_td, cruce,
                         etapa_td_ref, etapa_notas_pep, etapa_monivoi, etapa_validacion,
-                        etapa_diferencias, etapa_hojas):
+                        etapa_diferencias, etapa_hojas, etapa_monitor2=None):
         """Write every sheet to `ruta`. The tab order of the workbook is the order of the writes."""
         with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
@@ -3859,7 +4156,9 @@ class Consolidador:
             if etapa_diferencias is not None:
                 ws_dif = writer.book.create_sheet(EtapaDiferencias.HOJA)
                 etapa_diferencias.escribir(ws_dif)
+                CatalogoAgrupadores.escribir(writer.book.create_sheet(CatalogoAgrupadores.HOJA))
                 etapa_hojas.escribir(writer.book)
+                etapa_monitor2.escribir(writer.book)
                 # Opens on 'Diferencias', ONLY that tab selected (several would be edited as a group).
                 for ws in writer.book.worksheets:
                     ws.sheet_view.tabSelected = ws is ws_dif
@@ -3893,10 +4192,13 @@ class Consolidador:
             etapa_vbrl = EtapaVBRL(vbrl, Comun.es_sin_datos(vbrl))
             etapa_vbrl.preparar()
 
-        etapa_hojas = None
+        etapa_hojas = etapa_monitor2 = None
         if self.rutas_segunda is not None:
             etapa_hojas = EtapaHojasSegundaCorrida(self.rutas_segunda, update_status)
             etapa_hojas.preparar()
+            update_status("📄 Leyendo Monivoi (2a corrida)...")
+            etapa_monitor2 = EtapaMonitor2(self.rutas_segunda.get("monivoi2"))
+            etapa_monitor2.preparar()
 
         etapa_fb = None
         if con_notas_pep:
@@ -3932,7 +4234,7 @@ class Consolidador:
         etapa_diferencias = None
         if etapa_hojas is not None:
             update_status("🧮 Construyendo 'Diferencias'...")
-            etapa_diferencias = EtapaDiferencias(etapa_validacion, etapa_hojas)
+            etapa_diferencias = EtapaDiferencias(etapa_validacion, etapa_hojas, etapa_monitor2)
             etapa_diferencias.preparar()
 
         update_status("💾 Guardando Excel consolidado...")
@@ -3950,7 +4252,7 @@ class Consolidador:
             self._escribir_libro(
                 ruta_temporal, etapa_gallo, monivoi, etapa_vbrl, etapa_fb, etapa_td, cruce,
                 etapa_td_ref, etapa_notas_pep, etapa_monivoi, etapa_validacion,
-                etapa_diferencias, etapa_hojas)
+                etapa_diferencias, etapa_hojas, etapa_monitor2)
             os.replace(ruta_temporal, ruta_final)
         finally:
             if os.path.exists(ruta_temporal):
@@ -4021,8 +4323,12 @@ class Consolidador:
             "notas_pep_avisos":     notas_pep_avisos,
             "listas_2da":           listas_2da,
             "segunda_incluida":     etapa_hojas is not None,
-            "filas_hojas_segunda":  ({d["hoja"]: len(d["filas"]) for k, d in etapa_hojas.resultado.items()
-                                      if k != "avisos"} if etapa_hojas is not None else {}),
+            "filas_hojas_segunda":  (dict({d["hoja"]: len(d["filas"]) for k, d in etapa_hojas.resultado.items()
+                                           if k != "avisos"}, **{EtapaMonitor2.HOJA: (
+                                               0 if etapa_monitor2.resultado["df"] is None
+                                               else len(etapa_monitor2.resultado["df"]))})
+                                     if etapa_hojas is not None else {}),
+            "monitor2_disponible":  bool(etapa_monitor2 and etapa_monitor2.resultado["disponible"]),
             "diferencias":          etapa_diferencias.resultado["conteo"] if etapa_diferencias else None,
             "segunda_avisos":       ((etapa_hojas.resultado["avisos"] + etapa_diferencias.resultado["avisos"])
                                      if etapa_diferencias else []),
@@ -4040,7 +4346,8 @@ def consolidar_gallo_monivoi(
     rutas_segunda=None,
 ):
     """The controller's entry point: Consolidador(...).ejecutar() (see its docs). `rutas_segunda` makes
-    it the 2nd consolidation: {vbrk, fbl5n, vbrp, knvp, vbrl2, bkpf: path} (needs `ruta_vbrl`)."""
+    it the 2nd consolidation: {vbrk, fbl5n, vbrp, knvp, vbrl2, bkpf: path, monivoi2: path or None}
+    (needs `ruta_vbrl`)."""
     return Consolidador(
         ruta_gallo, ruta_monivoi, ruta_output,
         nombre_salida=nombre_salida,
