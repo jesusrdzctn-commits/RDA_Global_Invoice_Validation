@@ -155,8 +155,10 @@ def nombre_archivo_rango_2da(clave, desde, hasta):
     return f"{prefijo}_{d}_a_{h}{ext}"
 
 
-# The two runs of the main download button (GUI radio buttons): (controller key, name in the legend).
-# ONE definition for the GUI legends and for what the controller runs (a test ties them together).
+# The two runs the main download button does in ONE go, the 1st before the 2nd (the lists of the 2nd are
+# computed from the files of the 1st): (controller key, name in the GUI's file list). ONE definition for that
+# list and for the transactions the controller runs (a test ties them together); the controller runs the 2nd
+# run in the order of its PASADAS_2DA, the GUI lists its files in the order below.
 CORRIDAS_DESCARGA = {
     1: (("gallo", "Gallo"), ("monivoi", "Monivoi"), ("vbrl", "VBRL"), ("fb03", "FB03")),
     2: (("vbrp", "VBRP"), ("vbrk", "VBRK"), ("vbrl2", "VBRL_2"),

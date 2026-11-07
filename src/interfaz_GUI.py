@@ -1,9 +1,8 @@
 """Validación Factura Global — GUI (tkinter).
 
 A slate side rail on the left holds the period of the run and the progress of the WHOLE process
-(download 1st run -> consolidation 1st run -> download 2nd run -> consolidation 2nd run), one coloured
-dot per step. The work area holds one card per phase and a status strip whose bar fills while a
-process runs. Colour carries meaning (green done, amber warnings, red error), never decoration.
+(download of every SAP transaction -> consolidation in Excel), one coloured dot per step. The work
+area holds one card per phase and a status strip whose bar fills while a process runs. Colour carries meaning (green done, amber warnings, red error), never decoration.
 
 The controller wires the on_* callbacks and reports the rail with marcar_paso(). `python
 interfaz_GUI.py` opens the window on its own. This module imports no SAP dependencies on purpose
@@ -82,21 +81,12 @@ ESTADOS_RIEL = {
     "error":     (Paleta.rojo,         Paleta.rojo,        "#FFFFFF",           "#FF8A8A"),
 }
 
-# step key -> (number, title on the rail). The order is the order of the process.
+# step key -> (number, title on the rail). The order is the order of the process. The keys are also the
+# keys of the state chips of the two cards.
 PASOS = (
-    ("descarga1",      "1", "Descarga 1a corrida"),
-    ("consolidacion1", "2", "Consolidación 1a corrida"),
-    ("descarga2",      "3", "Descarga 2a corrida"),
-    ("consolidacion2", "4", "Consolidación 2a corrida"),
+    ("descarga",      "1", "Descarga de SAP"),
+    ("consolidacion", "2", "Consolidación en Excel"),
 )
-
-# step key -> (card, run number): where a click on the rail takes the user.
-PASO_A_CORRIDA = {
-    "descarga1":      ("descarga", 1),
-    "consolidacion1": ("consolidacion", 1),
-    "descarga2":      ("descarga", 2),
-    "consolidacion2": ("consolidacion", 2),
-}
 
 
 def _mezclar(color, otro, t):
@@ -463,16 +453,8 @@ class ValidacionFacturaGUI:
     ANCHO_BASE = 1120
     ANCHO_RIEL = 270
 
-    LEYENDAS_DESCARGA = {
-        1: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[1]),
-        2: " · ".join(nombre for _, nombre in CORRIDAS_DESCARGA[2]),
-    }
-    LEYENDAS_CONSOLIDACION = {
-        1: "Gallo + Monivoi + VBRL + FB03 → Excel consolidado",
-        2: "1a consolidación + Diferencias + Agrupadores + 7 pestañas de la 2a corrida",
-    }
-    # Switch for the 2nd consolidation's segment (False keeps it disabled).
-    CONSOLIDACION_2_DISPONIBLE = True
+    LEYENDA_CONSOLIDACION = ("Gallo + Monivoi + VBRL + FB03 + las 7 pestañas de la 2a corrida "
+                             "→ Excel con Diferencias y Agrupadores")
 
     def __init__(self, root):
         self.root = root
@@ -493,10 +475,6 @@ class ValidacionFacturaGUI:
 
         # Parallel run by passes (opt-in): always starts off (sequential is the safe default).
         self.paralelo_var = tk.BooleanVar(value=False)
-
-        # Which run the main buttons execute (1a / 2a); always the 1st when the window opens.
-        self.corrida_descarga_var = tk.IntVar(value=1)
-        self.corrida_consolidacion_var = tk.IntVar(value=1)
 
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
@@ -536,8 +514,6 @@ class ValidacionFacturaGUI:
         self._ultimo_mensaje = None    # the last status message (without its clock): what the bar paced on
 
         self._build_ui()
-        self._on_corrida_descarga_change()
-        self._on_corrida_consolidacion_change()
         self._refrescar_pasos()
         self._actualizar_resumen_periodo()
         # Last: the traces would otherwise fire while the window is still being assembled.
@@ -669,27 +645,23 @@ class ValidacionFacturaGUI:
                 conector = tk.Frame(avance, bg=Paleta.riel_suave, width=2, height=px(6))
                 conector.pack(anchor="w", padx=(px(13), 0))
                 self._conectores.append(conector)
-            fila = tk.Frame(avance, bg=Paleta.riel, cursor="hand2")
+            fila = tk.Frame(avance, bg=Paleta.riel)
             fila.pack(fill="x", pady=(px(6) if posicion == 0 else 0, 0))
-            circulo = tk.Canvas(fila, width=px(28), height=px(28), bg=Paleta.riel,
-                                highlightthickness=0, cursor="hand2")
+            circulo = tk.Canvas(fila, width=px(28), height=px(28), bg=Paleta.riel, highlightthickness=0)
             circulo.pack(side=tk.LEFT)
-            textos = tk.Frame(fila, bg=Paleta.riel, cursor="hand2")
+            textos = tk.Frame(fila, bg=Paleta.riel)
             textos.pack(side=tk.LEFT, padx=(px(10), 0))
-            nombre = tk.Label(textos, text=titulo, font=(FUENTE, 10, "bold"), fg="#FFFFFF",
-                              bg=Paleta.riel, anchor="w", cursor="hand2")
-            nombre.pack(anchor="w")
+            tk.Label(textos, text=titulo, font=(FUENTE, 10, "bold"), fg="#FFFFFF",
+                     bg=Paleta.riel, anchor="w").pack(anchor="w")
             estado = tk.Label(textos, text="", font=(FUENTE, 8), fg=Paleta.riel_texto,
-                              bg=Paleta.riel, anchor="w", cursor="hand2")
+                              bg=Paleta.riel, anchor="w")
             estado.pack(anchor="w")
-            for pieza in (fila, circulo, textos, nombre, estado):
-                pieza.bind("<Button-1>", lambda _e, c=clave: self._seleccionar_paso(c))
             self._riel_paso[clave] = (circulo, estado, numero)
 
         # Footer of the rail: what to have ready, in plain words.
         tk.Label(
             riel,
-            text="Antes de descargar: SAP GUI abierto\ncon tu sesión iniciada. Cada proceso\n"
+            text="Antes de descargar: SAP GUI abierto\ncon sesión iniciada. Cada proceso\n"
                  "pide confirmación antes de empezar.",
             font=(FUENTE, 8), fg=Paleta.riel_texto, bg=Paleta.riel, justify="left",
         ).pack(side=tk.BOTTOM, anchor="w", padx=px(22), pady=px(12))
@@ -802,18 +774,8 @@ class ValidacionFacturaGUI:
         px = self._px
         marco, interior, _ = self._tarjeta(parent, "Descarga de SAP", chip="descarga")
 
-        fila = tk.Frame(interior, bg=Paleta.tarjeta)
-        fila.pack(fill="x", pady=(px(10), 0))
-        self.radios_descarga = self._segmentos(
-            fila, self.corrida_descarga_var, ((1, "1a corrida"), (2, "2a corrida")),
-            self._on_corrida_descarga_change, fondo=Paleta.tarjeta,
-        )
-        self.leyenda_descarga = tk.Label(fila, text="", font=(FUENTE, 9, "italic"), fg=Paleta.suave,
-                                         bg=Paleta.tarjeta, anchor="w", justify="left")
-        self.leyenda_descarga.pack(side=tk.LEFT, fill="x", expand=True, padx=(px(6), 0))
-
         cuerpo = tk.Frame(interior, bg=Paleta.tarjeta)
-        cuerpo.pack(fill="x", pady=(px(12), 0))
+        cuerpo.pack(fill="x", pady=(px(10), 0))
         cuerpo.columnconfigure(0, weight=1)
 
         # Left: the files this download will leave in the folder (always room for the longer list).
@@ -823,7 +785,7 @@ class ValidacionFacturaGUI:
         caja = tk.Frame(izquierda, bg=Paleta.campo, highlightthickness=1,
                         highlightbackground=Paleta.borde)
         caja.pack(fill="x")
-        lineas = max(len(self._lineas_archivos(corrida)) for corrida in CORRIDAS_DESCARGA)
+        lineas = len(self._lineas_archivos())
         tk.Label(caja, textvariable=self.filename_var, font=(FUENTE_MONO, 9), fg=Paleta.texto,
                  bg=Paleta.campo, justify="left", anchor="nw", height=lineas,
                  padx=px(10), pady=px(6)).pack(fill="x")
@@ -858,25 +820,19 @@ class ValidacionFacturaGUI:
         tk.Label(derecha, text="Usa las ventanas de SAP que ya tengas abiertas.", font=(FUENTE, 8),
                  fg=Paleta.suave, bg=Paleta.tarjeta, anchor="w").pack(anchor="w")
 
-        # Its text follows the 'corrida' segment (_on_corrida_descarga_change).
-        self.download_btn = self._boton(interior, "", self._handle_todos)
+        n = sum(len(transacciones) for transacciones in CORRIDAS_DESCARGA.values())
+        self.download_btn = self._boton(interior, f"⬇️ Descargar todo ({n} transacciones)", self._handle_todos)
         self.download_btn.pack(fill="x", pady=(px(12), 0))
         return marco
 
     def _build_tarjeta_consolidacion(self, parent):
         px = self._px
         marco, interior, _ = self._tarjeta(parent, "Consolidación en Excel", chip="consolidacion")
-        fila = tk.Frame(interior, bg=Paleta.tarjeta)
-        fila.pack(fill="x", pady=(px(10), 0))
-        self.radios_consolidacion = self._segmentos(
-            fila, self.corrida_consolidacion_var, ((1, "1a corrida"), (2, "2a corrida")),
-            self._on_corrida_consolidacion_change, fondo=Paleta.tarjeta,
-        )
         self.leyenda_consolidacion = self._leyenda(interior, 2, px(360))
-        self.leyenda_consolidacion.pack(fill="x", pady=(px(8), 0))
+        self.leyenda_consolidacion.config(text=self.LEYENDA_CONSOLIDACION)
+        self.leyenda_consolidacion.pack(fill="x", pady=(px(10), 0))
 
-        # Its text follows the 'corrida' segment (_on_corrida_consolidacion_change).
-        self.consolidar_btn = self._boton(interior, "", self._handle_consolidar)
+        self.consolidar_btn = self._boton(interior, "🧩 Consolidar...!", self._handle_consolidar)
         self.consolidar_btn.pack(side=tk.BOTTOM, fill="x", pady=(px(10), 0))
         return marco
 
@@ -950,8 +906,8 @@ class ValidacionFacturaGUI:
     # ------------------------------------------------------------------
     def marcar_paso(self, paso, estado):
         """
-        Set the state of one step of the rail: paso in ('descarga1', 'consolidacion1', 'descarga2',
-        'consolidacion2'), estado in ('pendiente', 'en_curso', 'listo', 'parcial', 'error'). A step that
+        Set the state of one step of the rail: paso in ('descarga', 'consolidacion'), estado in
+        ('pendiente', 'en_curso', 'listo', 'parcial', 'error'). A step that
         starts resets the bar; one that ends fills it (green done, amber with warnings, red on error).
         Main thread only: it touches Tk.
         """
@@ -1033,27 +989,11 @@ class ValidacionFacturaGUI:
         self._refrescar_chips(estados)
 
     def _refrescar_chips(self, estados=None):
-        """The chip of each card shows the state of the run its segment has selected."""
+        """The chip of each card shows the state of its step."""
         estados = estados or self._estados_mostrados()
-        claves = {"descarga": f"descarga{self.corrida_descarga()}",
-                  "consolidacion": f"consolidacion{self.corrida_consolidacion()}"}
         for tarjeta, chip in self._chips_paso.items():
-            etiqueta, texto, fondo, simbolo = ESTADOS[estados[claves[tarjeta]]]
+            etiqueta, texto, fondo, simbolo = ESTADOS[estados[tarjeta]]
             chip.configure(text=f"{simbolo}  {etiqueta}", fg=texto, bg=fondo)
-
-    def _seleccionar_paso(self, clave):
-        """A click on a step of the rail selects that run in its card (not while a process is running)."""
-        if self._ocupado:
-            return
-        tarjeta, corrida = PASO_A_CORRIDA[clave]
-        if tarjeta == "descarga":
-            self.corrida_descarga_var.set(corrida)
-            self._on_corrida_descarga_change()
-        elif corrida == 2 and not self.CONSOLIDACION_2_DISPONIBLE:
-            return
-        else:
-            self.corrida_consolidacion_var.set(corrida)
-            self._on_corrida_consolidacion_change()
 
     # ------------------------------------------------------------------
     # Folder pickers
@@ -1156,23 +1096,25 @@ class ValidacionFacturaGUI:
     def _preview_nombre_eiap(self):
         return self._preview_nombre_venta(nombre_archivo_rango_eiap)
 
-    def _lineas_archivos(self, corrida):
-        """[(name, file)] of the selected download run (the 1st one also lists 'Venta DSD' and 'Venta
-        EIAP', whose buttons sit next to it)."""
-        if corrida == 2:
-            return [(nombre, self._preview_nombre_2da(clave)) for clave, nombre in CORRIDAS_DESCARGA[2]]
-        return [
-            ("Gallo",       self._preview_nombre()),
-            ("Monivoi",     self._preview_nombre_monivoi()),
-            ("VBRL",        self._preview_nombre_vbrl()),
-            ("FB03",        self._preview_nombre_fb03()),
-            ("Venta DSD",   self._preview_nombre_dsd()),
-            ("Venta EIAP",  self._preview_nombre_eiap()),
-        ]
+    def _lineas_archivos(self):
+        """[(name, file)] of what the main download button leaves in the folder: its 1st run and its 2nd
+        run (CORRIDAS_DESCARGA: the same lists the controller runs), then 'Venta DSD' and 'Venta EIAP',
+        whose buttons sit next to it."""
+        nombres_1a = {
+            "gallo":   self._preview_nombre,
+            "monivoi": self._preview_nombre_monivoi,
+            "vbrl":    self._preview_nombre_vbrl,
+            "fb03":    self._preview_nombre_fb03,
+        }
+        return (
+            [(nombre, nombres_1a[clave]()) for clave, nombre in CORRIDAS_DESCARGA[1]]
+            + [(nombre, self._preview_nombre_2da(clave)) for clave, nombre in CORRIDAS_DESCARGA[2]]
+            + [("Venta DSD", self._preview_nombre_dsd()), ("Venta EIAP", self._preview_nombre_eiap())]
+        )
 
     def _update_filename_preview(self):
-        """The files of the selected download run, names aligned in a column."""
-        lineas = self._lineas_archivos(self.corrida_descarga())
+        """The files of the main download, names aligned in a column."""
+        lineas = self._lineas_archivos()
         ancho = max(len(nombre) for nombre, _ in lineas)
         self.filename_var.set("\n".join(f"{nombre:<{ancho}}  {archivo}" for nombre, archivo in lineas))
 
@@ -1221,38 +1163,6 @@ class ValidacionFacturaGUI:
         except ValueError:
             self.resumen_periodo_var.set("⚠ Revisa las fechas\nDD.MM.AAAA · Desde ≤ Hasta")
             self._pintar_resumen_periodo("#FFB4B4")
-
-    # ------------------------------------------------------------------
-    # Runs (segments of the cards)
-    # ------------------------------------------------------------------
-    def _on_corrida_descarga_change(self):
-        """Legend, main button text and file names follow the selected download run."""
-        corrida = self.corrida_descarga()
-        self.leyenda_descarga.config(text=self.LEYENDAS_DESCARGA[corrida])
-        n = len(CORRIDAS_DESCARGA[corrida])
-        self.download_btn.config(text=f"⬇️ Descargar {corrida}a corrida ({n} transacciones)")
-        self._update_filename_preview()
-        self._refrescar_chips()
-
-    def _on_corrida_consolidacion_change(self):
-        corrida = self.corrida_consolidacion()
-        self.leyenda_consolidacion.config(text=self.LEYENDAS_CONSOLIDACION[corrida])
-        self.consolidar_btn.config(text=f"🧩 Consolidar {corrida}a corrida...!")
-        self._estado_radio_consolidacion_2()
-        self._refrescar_chips()
-
-    def _estado_radio_consolidacion_2(self):
-        """The 2nd consolidation segment is disabled while CONSOLIDACION_2_DISPONIBLE is False."""
-        if not self.CONSOLIDACION_2_DISPONIBLE:
-            self.radios_consolidacion[2].config(state="disabled")
-
-    def corrida_descarga(self):
-        """1 or 2: the run the main download button executes (read by the controller)."""
-        return 2 if self.corrida_descarga_var.get() == 2 else 1
-
-    def corrida_consolidacion(self):
-        """1 or 2: the consolidation the main consolidation button executes (read by the controller)."""
-        return 2 if self.corrida_consolidacion_var.get() == 2 else 1
 
     # ------------------------------------------------------------------
     # Validation
@@ -1385,9 +1295,6 @@ class ValidacionFacturaGUI:
             )
         )
 
-    def _radios_corrida(self):
-        return tuple(self.radios_descarga.values()) + tuple(self.radios_consolidacion.values())
-
     def disable_buttons(self):
         self._ocupado = True
         self._barra_cerrada = False
@@ -1396,9 +1303,7 @@ class ValidacionFacturaGUI:
         for boton, _ in self._botones_accion():
             boton.habilitar(False)
         self.paralelo_chk.habilitar(False)
-        for radio in self._radios_corrida():           # the run cannot change while one is running
-            radio.habilitar(False)
-        for radio in self.radios_modo.values():        # nor the period
+        for radio in self.radios_modo.values():        # the period cannot change while one is running
             radio.habilitar(False)
         self.progreso.establecer(3, Paleta.acento)
         self.root.configure(cursor="watch")
@@ -1409,11 +1314,8 @@ class ValidacionFacturaGUI:
         for boton, _ in self._botones_accion():
             boton.habilitar(True)
         self.paralelo_chk.habilitar(True)
-        for radio in self._radios_corrida():
-            radio.habilitar(True)
         for radio in self.radios_modo.values():
             radio.habilitar(True)
-        self._estado_radio_consolidacion_2()
         if not self._barra_cerrada:
             self._cerrar_barra_por_mensaje()
         self.root.configure(cursor="")

@@ -1,14 +1,15 @@
 """Validación Factura Global — controller: glue between the GUI (interfaz_GUI.py), the SAP
 downloads (Descargas_SAP.py) and the consolidation (Consolidacion.py).
 
-The main download button runs Gallo, Monivoi, VBRL and FB03 one after another (default) or,
-with the GUI checkbox, IN PARALLEL by passes: Gallo ‖ Monivoi, then VBRL ‖ FB03 (VBRL needs
-the Monivoi file and FB03 the Gallo file of pass 1).
-After a consolidation, the 2nd run (VBRK, VBRP, VBRL 2nd run, FBL5N, KNVP, BKPF, Monivoi 2nd run)
-pastes into SAP what the #N/A rows of 'TD.Diferencias_Referencias' carry: one after another, or, with
-the same checkbox, IN PARALLEL by passes of up to THREE windows (PASADAS_2DA): VBRK ‖ VBRP ‖ VBRL 2nd
-run, then FBL5N ‖ KNVP ‖ BKPF, then Monivoi 2nd run (FBL5N and KNVP paste the 'Solic.' column of the
-VBRK of pass 1; Monivoi 2nd run the 'List.fact.' lists of the VBRL 2nd run).
+The main download button runs EVERYTHING in one go. 1st run: Gallo, Monivoi, VBRL and FB03 one after
+another (default) or, with the GUI checkbox, IN PARALLEL by passes: Gallo ‖ Monivoi, then VBRL ‖ FB03
+(VBRL needs the Monivoi file and FB03 the Gallo file of pass 1). From those files the lists the 2nd run
+pastes into SAP (what the #N/A rows of 'TD.Diferencias_Referencias' carry) are computed IN MEMORY and the
+2nd run (VBRK, VBRP, VBRL 2nd run, FBL5N, KNVP, BKPF, Monivoi 2nd run) follows: one after another, or, with
+the same checkbox, IN PARALLEL by passes of up to THREE windows (PASADAS_2DA): VBRK ‖ VBRP ‖ VBRL 2nd run,
+then FBL5N ‖ KNVP ‖ BKPF, then Monivoi 2nd run (FBL5N and KNVP paste the 'Solic.' column of the VBRK of
+pass 1; Monivoi 2nd run the 'List.fact.' lists of the VBRL 2nd run). The one consolidation button then
+builds the whole workbook, 'Diferencias' and 'Agrupadores' included.
 """
 
 import os
@@ -172,120 +173,238 @@ class ValidacionFacturaController:
         self._execute_download([self._TX_EIAP], "Venta EIAP")
 
     def execute_download_todos(self):
-        """Main download button: the run its GUI radio selects (1a = Gallo, Monivoi, VBRL, FB03; 2a = the
-        seven downloads of execute_download_segunda)."""
-        if self._corrida_gui("corrida_descarga") == 2:
-            self.execute_download_segunda()
-            return
-        # The GUI checkbox decides HOW the four run; single-transaction buttons never go parallel.
-        usar_paralelo = getattr(self.gui, "usar_paralelo", None)
-        corrida = CORRIDAS_DESCARGA[1]
-        self._execute_download(
-            [self._TX_POR_CLAVE[clave] for clave, _ in corrida],
-            " + ".join(nombre for _, nombre in corrida),
-            paralelo=bool(usar_paralelo()) if callable(usar_paralelo) else False,
-        )
-
-    def _corrida_gui(self, metodo):
-        """1 or 2 from a GUI radio button reader (`metodo`); 1 when the GUI has none (older GUI)."""
-        leer = getattr(self.gui, metodo, None)
-        return 2 if callable(leer) and leer() == 2 else 1
-
-    def _marcar_paso(self, paso, estado):
-        """Report the state of a step of the process to the GUI's progress rail ('descarga1',
-        'consolidacion1', 'descarga2', 'consolidacion2' x 'en_curso', 'listo', 'parcial', 'error').
-        `paso` None (a single-transaction download) and a GUI without `marcar_paso` (older GUI, test
-        doubles) are skipped. Main thread only: it touches Tk."""
-        marcar = getattr(self.gui, "marcar_paso", None)
-        if paso is not None and callable(marcar):
-            marcar(paso, estado)
-
-    def execute_download_segunda(self):
-        """'2a corrida' radio + download button: the seven downloads, with the 1st consolidation's lists
-        recomputed from the 1st run's files (calcular_listas_segunda_corrida)."""
+        """Main download button: EVERYTHING in one run, with ONE confirmation and ONE summary. The 1st run
+        (Gallo, Monivoi, VBRL, FB03) goes first; the lists the 2nd run asks SAP for are then computed IN
+        MEMORY from its files (calcular_listas_segunda_corrida) and the 2nd run (PASADAS_2DA) follows with
+        them. The GUI checkbox decides HOW each run goes: one after another or in parallel by passes. The
+        2nd run is skipped, saying so, when the 1st one did not leave what its lists come from."""
         if self._ocupado:
             return
         if not self.gui.validate_dates():
             return
-        cfg = {clave: self.gui.get_config(clave) for clave in ("gallo", "monivoi", "vbrl", "fb03")}
-        rutas = {clave: os.path.join(c["input_path"], c["filename"]) for clave, c in cfg.items()}
 
-        faltan = [cfg[clave]["filename"] for clave in ("gallo", "vbrl") if not os.path.exists(rutas[clave])]
-        if faltan:
-            messagebox.showerror(
-                "2a corrida de descargas",
-                "La 2a corrida pega lo que quedó en #N/A en la 1a consolidación, y eso sale de los\n"
-                "archivos de la 1a corrida. No encontré:\n\n"
-                + "".join(f"  • {nombre}\n" for nombre in faltan)
-                + f"\nen la carpeta:\n  {cfg['gallo']['input_path']}\n\n"
-                "Descarga primero la 1a corrida de este periodo.",
-            )
+        txs1 = [self._TX_POR_CLAVE[clave] for clave, _ in CORRIDAS_DESCARGA[1]]
+        pasadas2 = self._txs_segunda_corrida()
+        txs2 = [tx for pasada in pasadas2 for tx in pasada]
+        self._validar_dependencias(txs1)
+        self._validar_pasadas(pasadas2)        # VBRK in an earlier pass than FBL5N / KNVP, in both modes
+
+        # Read EVERYTHING the run needs now: Tk may only be touched by its own thread and the GUI can be
+        # edited while SAP works. The lists are computed from these very files; the 2nd run is configured
+        # from `base`, never from the GUI again.
+        configs1 = {tx["clave"]: self.gui.get_config(tx["clave"]) for tx in txs1}
+        base = configs1["gallo"]
+        # The 2nd run's file names do not depend on its lists: none of the eleven may repeat.
+        nombres2 = self._configs_segunda_corrida(base, {"referencias": [], "documentos": []}, txs2)
+        problema = self._validar_paralelo(txs1 + txs2, {**configs1, **nombres2})
+        if problema:
+            messagebox.showerror("Descarga de SAP", problema)
             return
-        ruta_fb03 = rutas["fb03"]
-        if not os.path.exists(ruta_fb03):
-            if not messagebox.askyesno(
-                "Archivo de FB03 no encontrado",
-                f"No encontré {cfg['fb03']['filename']} en la carpeta de descarga.\n\n"
-                "Sin FB03 las listas salen SÓLO de la tabla Facturas (sin 'Notas de crédito'\n"
-                "ni 'PEP Vouchers').\n\n¿Continuar así?",
-            ):
-                return
-            ruta_fb03 = None
+
+        paralelo = self._paralelo_gui()
+        n_ventanas1 = self._ventanas_necesarias(txs1) if paralelo else 1
+        n_ventanas2 = self._ventanas_de_pasadas(pasadas2) if paralelo else 1
+        paralelo = n_ventanas1 > 1
+
+        periodo = (
+            f"Fecha    : {base['fecha']}" if base["mode"] == "single"
+            else f"Periodo  : {base['date_from']} — {base['date_to']}"
+        )
+        if paralelo:
+            orden = (
+                "En paralelo, por pasadas: las transacciones de una pasada corren a la vez, cada una en su propia "
+                "ventana de SAP, y cada pasada empieza cuando termina la anterior:\n\n"
+                + self._texto_orden("1a corrida", txs1, self._pasadas(txs1, n_ventanas1), True)
+                + "\n" + self._texto_orden("2a corrida", txs2, pasadas2, True)
+                + "\nUso las ventanas de SAP que ya estén abiertas...\n"
+                "*IMPORTANTE:* No trabajar en esas ventanas mientras corre y en la medida de lo posible evitar hacer click en ellas.\n\n"
+            )
+        else:
+            orden = (
+                "Se ejecutan una tras otra:\n\n"
+                + self._texto_orden("1a corrida", txs1, None, False)
+                + "\n" + self._texto_orden("2a corrida", txs2, None, False) + "\n"
+            )
+        consultas = "".join(
+            f"{self._nombre_corto(tx)} consulta {tx['lista']}.\n" for tx in txs1 if tx.get("lista")
+        )
+        confirm = messagebox.askyesno(
+            "Confirmar descarga (todas las transacciones)",
+            f"¿Iniciar la descarga de las {len(txs1) + len(txs2)} transacciones?\n\n"
+            f"Sociedad : {base['sociedad']}\n"
+            f"{periodo}\n\n"
+            f"{orden}"
+            f"{consultas}"
+            "Las listas de la 2a corrida se calculan solas con los archivos de la 1a (lo que quede en #N/A "
+            "en 'TD.Diferencias_Referencias'): si la 1a corrida no deja bien el Gallo o el VBRL, la 2a no se ejecuta.\n\n"
+            "Mientras corren NO copiar ni pegar nada!! Puesto que el portapapeles se usa para pasarle las listas a SAP...\n\n"
+            f"Se guardará en:\n{base['input_path']}"
+        )
+        if not confirm:
+            return
 
         self._ocupado = True
-        listas = None
+        estado_final = None
+        resumen = []        # lines of what already ran: an unexpected error must not hide them
         try:
             self.gui.disable_buttons()
-            listas = calcular_listas_segunda_corrida(
-                rutas["gallo"], rutas["vbrl"], ruta_fb03, callback_status=self.gui.set_status)
-        except (FileNotFoundError, ValueError) as e:
-            self.gui.set_status("❌ Error al calcular las listas de la 2a corrida")
-            self._marcar_paso("descarga2", "error")
-            messagebox.showerror("2a corrida de descargas", f"No pude calcular las listas:\n\n{e}")
+            self._marcar_paso("descarga", "en_curso")
+            os.makedirs(base["input_path"], exist_ok=True)
+            inicio_total = time.time()
+
+            lineas1, resultados1, duraciones1, notas1 = self._correr_etapa(txs1, configs1, n_ventanas1)
+            resumen = self._resumen_etapa("1a corrida", txs1, lineas1, duraciones1, notas1)
+            todo_ok = all(resultados1.get(tx["clave"]) == "datos" for tx in txs1)
+
+            listas, avisos = self._listas_segunda(configs1, resultados1)
+            if listas is None:
+                todo_ok = False
+                resumen += [""] + avisos
+            else:
+                configs2 = self._configs_segunda_corrida(base, listas, txs2)
+                self.gui.set_status("⏳ Iniciando la 2a corrida... (no cierre SAP)")
+                lineas2, resultados2, duraciones2, notas2 = self._correr_etapa(
+                    txs2, configs2, n_ventanas2, pasadas=pasadas2)
+                todo_ok = (todo_ok and not avisos
+                           and all(resultados2.get(tx["clave"]) == "datos" for tx in txs2))
+                resumen += ([""] + self._texto_listas(listas) + avisos
+                            + self._resumen_etapa("2a corrida", txs2, lineas2, duraciones2, notas2))
+            total = time.time() - inicio_total
+
+            if listas is None:
+                estado_final = "⚠️ Descarga de la 1a corrida terminada; la 2a corrida NO se ejecutó"
+            elif todo_ok:
+                estado_final = "✅ ¡Descarga completada (1a + 2a corrida)!"
+            else:
+                estado_final = "⚠️ Descarga terminada con avisos"
+            self.gui.set_status(estado_final)
+            self._marcar_paso("descarga", "listo" if todo_ok else "parcial")
+            mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
+            mostrar(
+                "Resumen de descarga (todas las transacciones)",
+                "Proceso terminado:\n\n" + "\n".join(resumen)
+                + f"\n\n⏱️ Tiempo total: {_fmt_duracion(total)}"
+                + f"\nRuta: {base['input_path']}"
+            )
         except Exception as e:
-            self.gui.set_status("❌ Error al calcular las listas de la 2a corrida")
-            self._marcar_paso("descarga2", "error")
-            messagebox.showerror("Error", f"Ocurrió un error inesperado al calcular las listas:\n\n{e}")
+            estado_final = None
+            self.gui.set_status("❌ Error en la descarga")
+            self._marcar_paso("descarga", "error")
+            ya_corrio = ("\n\nLo que ya había terminado:\n" + "\n".join(resumen)) if resumen else ""
+            messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}{ya_corrio}")
         finally:
             self._ocupado = False
             self.gui.enable_buttons()
-        if listas is None:
-            return
-        self.gui.set_status("✓ Listo para comenzar")
+            if estado_final is None:
+                self.gui.set_status("✓ Listo para comenzar")
 
-        origen = [f"Calculadas de: {cfg['gallo']['filename']}, {cfg['vbrl']['filename']}"
-                  + (f", {cfg['fb03']['filename']}" if ruta_fb03 else " (sin FB03)")]
-        # Same staleness checks as the consolidation: an older child may not cover its parent.
-        for hijo, padre, efecto in (("vbrl", "monivoi", "facturas"), ("fb03", "gallo", "documentos")):
-            if hijo == "fb03" and ruta_fb03 is None:
-                continue
-            try:
-                anterior = os.path.getmtime(rutas[hijo]) < os.path.getmtime(rutas[padre]) - 2
-            except OSError:
-                anterior = False
-            if anterior:
-                origen.append(
-                    f"⚠️ {cfg[hijo]['filename']} es ANTERIOR a {cfg[padre]['filename']}: puede no "
-                    f"cubrir sus {efecto} (#N/A de más)."
-                )
+    def _paralelo_gui(self):
+        """True if the GUI's 'en paralelo' switch is on (False for a GUI without one)."""
+        usar_paralelo = getattr(self.gui, "usar_paralelo", None)
+        return bool(usar_paralelo()) if callable(usar_paralelo) else False
+
+    def _marcar_paso(self, paso, estado):
+        """Report the state of a step of the process to the GUI's progress rail ('descarga',
+        'consolidacion' x 'en_curso', 'listo', 'parcial', 'error'). `paso` None (a single-transaction
+        download) and a GUI without `marcar_paso` (older GUI, test doubles) are skipped. Main thread
+        only: it touches Tk."""
+        marcar = getattr(self.gui, "marcar_paso", None)
+        if paso is not None and callable(marcar):
+            marcar(paso, estado)
+
+    def _texto_orden(self, titulo, txs, pasadas, paralelo):
+        """The confirmation's lines for ONE run: its passes (parallel) or its transactions in order."""
+        if paralelo:
+            cuerpo = "".join(
+                f"  Pasada {i}: {' ‖ '.join(self._nombre_corto(tx) for tx in pasada)}\n"
+                for i, pasada in enumerate(pasadas, 1)
+            )
+        else:
+            cuerpo = "".join(f"  {i}) {tx['nombre']}\n" for i, tx in enumerate(txs, 1))
+        return f"{titulo}:\n{cuerpo}"
+
+    def _correr_etapa(self, txs, configs, n_ventanas, pasadas=None):
+        """Run `txs` with their `configs` (read before the run, never the GUI): in parallel by passes when
+        `n_ventanas` > 1 (`pasadas`: fixed passes, else split by dependency), else one after another.
+        → (lines, estados, seconds, notes) as _descargar_en_paralelo; no notes when sequential."""
+        if n_ventanas > 1:
+            return self._descargar_en_paralelo(txs, configs, n_ventanas, pasadas=pasadas)
+        lineas, resultados, duraciones = self._correr_secuencial(txs, configs)
+        return lineas, resultados, duraciones, []
+
+    @staticmethod
+    def _resumen_etapa(titulo, txs, lineas, duraciones, notas=()):
+        """['— titulo —', '✅ Gallo...: file (45 s)', ..., notes of the run]: one line per transaction of the run,
+        then ITS notes (parallel timings, window count): each run numbers its own passes, so they stay apart."""
+        return ([f"— {titulo} —"]
+                + [f"{lineas[tx['clave']]} ({_fmt_duracion(duraciones[tx['clave']])})" for tx in txs]
+                + list(notas))
+
+    @staticmethod
+    def _texto_listas(listas):
+        """Summary lines about the lists the 2nd run was asked with (what was queried, what was left out)."""
+        lineas = [
+            f"ℹ️ Listas de la 2a corrida: {len(listas['referencias']):,} referencia(s) · "
+            f"{len(listas['documentos']):,} documento(s) en #N/A"
+        ]
+        excluidas = listas["excluidas_fp"]["renglones"]
+        if excluidas:
+            lineas.append(f"ℹ️ Fuera {excluidas:,} renglón(es) cuya Referencia de pago empieza con 'FP': "
+                          "ni su referencia ni su Nº documento se consultan.")
+        if not listas["referencias"] and not listas["documentos"]:
+            lineas.append("ℹ️ Ningún renglón quedó en #N/A: la 2a corrida sólo dejó archivos vacíos "
+                          "(para que la consolidación los encuentre).")
+        lineas += [f"⚠️ {aviso}" for aviso in listas.get("avisos") or []]
+        return lineas
+
+    def _listas_segunda(self, configs, resultados):
+        """The lists of the 2nd run, computed IN MEMORY from the files the 1st run just left → (listas, avisos).
+        Only files THIS run wrote count (`resultados`): an older file of a failed download is never used. Gallo
+        and VBRL are required (`listas` None, `avisos` saying why); without FB03 the lists come from the
+        Facturas table only (an aviso). Never raises: the 1st run's summary must survive."""
+        rutas = {clave: os.path.join(c["input_path"], c["filename"]) for clave, c in configs.items()}
+
+        def dejado(clave):
+            return resultados.get(clave) in ("datos", "vacio") and os.path.exists(rutas[clave])
+
+        faltan = [configs[clave]["filename"] for clave in ("gallo", "vbrl") if not dejado(clave)]
+        if faltan:
+            return None, [
+                "⚠️ La 2a corrida NO se ejecutó: sus listas salen del Gallo y del VBRL y no quedó bien "
+                "descargado: " + ", ".join(faltan) + ". Revisa la 1a corrida y vuelve a descargar."
+            ]
+        ruta_fb03 = rutas["fb03"] if dejado("fb03") else None
+        avisos = []
+        if ruta_fb03 is None:
+            avisos.append(
+                f"⚠️ {configs['fb03']['filename']} no quedó bien descargado: las listas de la 2a corrida "
+                "salen SÓLO de la tabla Facturas (sin 'Notas de crédito' ni 'PEP Vouchers')."
+            )
         try:
-            self._ofrecer_segunda_corrida(listas, cfg["gallo"], origen="\n".join(origen))
+            listas = calcular_listas_segunda_corrida(
+                rutas["gallo"], rutas["vbrl"], ruta_fb03, callback_status=self.gui.set_status)
+        except (FileNotFoundError, ValueError) as e:
+            return None, [f"⚠️ La 2a corrida NO se ejecutó: no pude calcular sus listas: {e}"]
         except Exception as e:
-            self.gui.set_status("❌ Error al preparar la 2a corrida")
-            self._marcar_paso("descarga2", "error")
-            messagebox.showerror("2a corrida de descargas", f"No pude preparar la 2a corrida:\n\n{e}")
+            return None, [f"❌ La 2a corrida NO se ejecutó: error inesperado al calcular sus listas: {e}"]
+        return listas, avisos
 
-    def _execute_download(self, txs, etiqueta, paralelo=False):
-        """Run `txs` (one after another, or in parallel by passes) and show ONE summary."""
-        if not txs:
-            raise ValueError("No se indicó ninguna transacción a descargar.")
-        # A dependent transaction (VBRL needs THIS run's Monivoi) goes after its parent: no stale files.
+    @staticmethod
+    def _validar_dependencias(txs):
+        """A dependent transaction (VBRL needs THIS run's Monivoi) goes after its parent: no stale files.
+        ValueError otherwise (a programming error, not something the user can fix)."""
         for pos, tx in enumerate(txs):
             requiere = tx.get("requiere")
             if requiere and requiere not in [t["clave"] for t in txs[:pos]]:
                 raise ValueError(
                     f"{tx['nombre']} necesita que '{requiere}' se descargue antes, en la misma corrida."
                 )
+
+    def _execute_download(self, txs, etiqueta, paralelo=False):
+        """Run `txs` (one after another, or in parallel by passes) and show ONE summary."""
+        if not txs:
+            raise ValueError("No se indicó ninguna transacción a descargar.")
+        self._validar_dependencias(txs)
         if self._ocupado:
             return
         if not self.gui.validate_dates():
@@ -333,7 +452,7 @@ class ValidacionFacturaController:
                         for i, pasada in enumerate(self._pasadas(txs, n_ventanas), 1)
                     )
                     + "\n"
-                    f"Uso las ventanas de SAP que ya estén abiertas...\n"
+                    "Uso las ventanas de SAP que ya estén abiertas...\n"
                     "*IMPORTANTE:* No trabajar en esas ventanas mientras corre y en la medida de lo posible evitar hacer click en ellas.\n\n"
                 )
             else:
@@ -366,13 +485,10 @@ class ValidacionFacturaController:
         if not confirm:
             return
 
-        # Only the whole 1st run is a step of the process; single downloads are not.
-        paso = "descarga1" if [tx["clave"] for tx in txs] == [c for c, _ in CORRIDAS_DESCARGA[1]] else None
         self._ocupado = True
         estado_final = None
         try:
             self.gui.disable_buttons()
-            self._marcar_paso(paso, "en_curso")
             os.makedirs(base["input_path"], exist_ok=True)
             inicio_total = time.time()
             if paralelo:
@@ -394,7 +510,6 @@ class ValidacionFacturaController:
                 else f"⚠️ Descarga de {etiqueta} terminada con avisos"
             )
             self.gui.set_status(estado_final)
-            self._marcar_paso(paso, "listo" if todo_ok else "parcial")
             mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
             mostrar(
                 f"Resumen de descarga ({etiqueta})",
@@ -406,7 +521,6 @@ class ValidacionFacturaController:
         except Exception as e:
             estado_final = None
             self.gui.set_status("❌ Error en la descarga")
-            self._marcar_paso(paso, "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
         finally:
             self._ocupado = False
@@ -673,158 +787,6 @@ class ValidacionFacturaController:
         prefijo = f"⚡ Pasada {pasada}/{total_pasadas} · " if pasada else "⚡ "
         return prefijo + "  ".join(partes) + f"  ({minutos}:{seg:02d})"
 
-    def execute_consolidacion(self):
-        """Consolidate the Gallo and Monivoi CSVs of the GUI dates (VBRL and FB03 optional), offering to
-        pick by hand a file that is not where it is expected."""
-        if self._ocupado:
-            return
-        if self._corrida_gui("corrida_consolidacion") == 2:
-            self.execute_consolidacion_segunda()
-            return
-        if not self.gui.validate_dates():
-            return
-
-        cfg_gallo   = self.gui.get_config("gallo")
-        cfg_monivoi = self.gui.get_config("monivoi")
-        cfg_vbrl    = self.gui.get_config("vbrl")
-        input_path  = cfg_gallo["input_path"]
-
-        ventas = self._ventas_solas(cfg_gallo, cfg_monivoi)
-        if ventas:
-            self._consolidar_solo_ventas(ventas)
-            return
-
-        ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
-        if not ruta_gallo:
-            return
-        ruta_monivoi = self._localizar_archivo(input_path, cfg_monivoi["filename"], "Monivoi")
-        if not ruta_monivoi:
-            return
-        ruta_vbrl, cancelar = self._resolver_vbrl(input_path, cfg_vbrl["filename"], ruta_monivoi)
-        if cancelar:
-            return
-        # FB03 only matters with a VBRL (the Notas / PEP tables read both): without one it is not asked for.
-        ruta_fb03 = None
-        if ruta_vbrl:
-            cfg_fb03 = self.gui.get_config("fb03")
-            ruta_fb03, cancelar = self._resolver_fb03(input_path, cfg_fb03["filename"], ruta_gallo)
-            if cancelar:
-                return
-
-        try:
-            ruta_output = self.gui.get_consolidacion_path()
-        except OSError as e:
-            messagebox.showerror(
-                "Error", f"No se pudo usar la carpeta de consolidación:\n{e}"
-            )
-            return
-        nombre_salida = f"Consolidado_{os.path.splitext(cfg_gallo['filename'])[0]}.xlsx"
-
-        linea_vbrl = (
-            f"  🧾 VBRL    : {os.path.basename(ruta_vbrl)}\n" if ruta_vbrl
-            else "  🧾 VBRL    : (sin VBRL: no se generan 'VBRL' ni 'TD.Diferencias_Referencias')\n"
-        )
-        if ruta_fb03:
-            linea_fb03 = f"  📑 FB03    : {os.path.basename(ruta_fb03)}\n"
-        elif ruta_vbrl:
-            linea_fb03 = ("  📑 FB03    : (sin FB03: no se generan 'FB', 'Notas de crédito' "
-                          "ni 'PEP Vouchers')\n")
-        else:
-            linea_fb03 = ""
-        confirm = messagebox.askyesno(
-            "Confirmar consolidación",
-            f"¿Consolidar estos archivos en un solo Excel?\n\n"
-            f"  🐓 Gallo   : {os.path.basename(ruta_gallo)}\n"
-            f"  📊 Monivoi : {os.path.basename(ruta_monivoi)}\n"
-            f"{linea_vbrl}{linea_fb03}\n"
-            f"Se generará:\n  {nombre_salida}\n\n"
-            f"En la carpeta:\n  {ruta_output}"
-        )
-        if not confirm:
-            return
-
-        self._ocupado = True
-        listas_2da = None
-        try:
-            self.gui.disable_buttons()
-            self._marcar_paso("consolidacion1", "en_curso")
-            resumen = consolidar_gallo_monivoi(
-                ruta_gallo, ruta_monivoi, ruta_output,
-                nombre_salida=nombre_salida,
-                callback_status=self.gui.set_status,
-                ruta_vbrl=ruta_vbrl,
-                ruta_fb03=ruta_fb03,
-            )
-
-            nota_monivoi = (
-                "\n⚠️ El archivo de Monivoi venía sin datos; su pestaña quedó vacía."
-                if resumen["monivoi_sin_datos"] else ""
-            )
-            avisos = self._avisos_consolidacion(resumen)
-            nota_ventas = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
-
-            lineas_vbrl = ""
-            if resumen.get("vbrl_incluido"):
-                lineas_vbrl = (
-                    f"\n  • Filas VBRL               : {resumen['filas_vbrl']:,}"
-                    f"\n  • Referencias (facturas)   : {resumen['filas_td_referencias']:,}"
-                    f"\n      …en #N/A               : {resumen['td_referencias_na']:,}"
-                )
-                if resumen["vbrl_sin_datos"]:
-                    lineas_vbrl += "\n⚠️ El archivo de VBRL venía sin datos; su pestaña quedó vacía."
-                if resumen.get("fb03_incluido"):
-                    lineas_vbrl += (
-                        f"\n  • Filas FB03               : {resumen['filas_fb']:,}"
-                        f"\n  • Notas de crédito         : {resumen['filas_notas_ref']:,}"
-                        f"  (Σ {resumen['total_notas_ref']:,.2f})"
-                        f"\n      …en #N/A               : {resumen['notas_ref_na']:,}"
-                        f"\n  • PEP Vouchers             : {resumen['filas_pep_ref']:,}"
-                        f"  (Σ {resumen['total_pep_ref']:,.2f})"
-                        f"\n      …en #N/A               : {resumen['pep_ref_na']:,}\n\n"
-                    )
-                listas = resumen.get("listas_2da")
-
-            self.gui.set_status("✅ ¡Consolidación completada!")
-            self._marcar_paso(
-                "consolidacion1",
-                "parcial" if (avisos or nota_monivoi or resumen.get("vbrl_sin_datos")) else "listo",
-            )
-            messagebox.showinfo(
-                "Consolidación completada",
-                f"Archivo generado:\n{resumen['ruta']}\n\n"
-                f"  • Filas Gallo              : {resumen['filas_gallo']:,}\n"
-                f"  • Filas Monivoi            : {resumen['filas_monivoi']:,}\n"
-                f"  • Referencias únicas       : {resumen['refs_unicas']:,}\n"
-                f"  • Docs 'MX Commercial'     : {resumen['filas_catalogo']:,}\n"
-                f"  • Globales (filtro final)  : {resumen['filas_globales']:,}\n"
-                f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}"
-                f"{lineas_vbrl}{nota_monivoi}{nota_ventas}"
-            )
-            listas_2da = resumen.get("listas_2da")
-        except (FileNotFoundError, ValueError) as e:
-            self.gui.set_status("❌ Error en la consolidación")
-            self._marcar_paso("consolidacion1", "error")
-            messagebox.showerror("Error en la consolidación", str(e))
-        except Exception as e:
-            self.gui.set_status("❌ Error en la consolidación")
-            self._marcar_paso("consolidacion1", "error")
-            messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
-        finally:
-            self._ocupado = False
-            self.gui.enable_buttons()
-            if "completada" not in self.gui.status_var.get():
-                self.gui.set_status("✓ Listo para comenzar")
-        if listas_2da is not None:
-            try:
-                self._ofrecer_segunda_corrida(listas_2da, cfg_gallo)
-            except Exception as e:
-                self.gui.set_status("❌ Error al preparar la 2a corrida")
-                self._marcar_paso("descarga2", "error")
-                messagebox.showerror(
-                    "2a corrida de descargas",
-                    f"El Excel consolidado sí se generó, pero no pude preparar la 2a corrida:\n\n{e}",
-                )
-
     @staticmethod
     def _avisos_consolidacion(resumen):
         """Every warning of a consolidation summary, in the order the stakeholder should read them
@@ -848,9 +810,12 @@ class ValidacionFacturaController:
     # A 2nd-run file older than this many seconds was asked for an older 1st run (lookups may miss).
     _TOLERANCIA_ANTIGUEDAD = 2
 
-    def execute_consolidacion_segunda(self):
-        """'2a corrida' radio + consolidation button: the 1st consolidation plus the 2nd run's sheets, 'Diferencias'
-        and 'Agrupadores'. A missing Monitoreo_2 is not asked for (VBRL_2 was not downloaded either): blank tab."""
+    def execute_consolidacion(self):
+        """Main consolidation button: ONE workbook with everything — Gallo, Monivoi, VBRL, FB03 and the 2nd
+        run's sheets, 'Diferencias' and 'Agrupadores' — offering to pick by hand a file that is not where it
+        is expected. With NEITHER Gallo nor Monivoi in the folder (only the sales buttons were used) it
+        consolidates the sales alone. The VBRL is NOT optional: 'Diferencias' lists the #N/A rows of the
+        tables it feeds. A missing Monitoreo_2 is not asked for (VBRL_2 had no lists either): blank tab."""
         if self._ocupado:
             return
         if not self.gui.validate_dates():
@@ -860,15 +825,18 @@ class ValidacionFacturaController:
         cfg_monivoi = self.gui.get_config("monivoi")
         input_path  = cfg_gallo["input_path"]
 
+        ventas = self._ventas_solas(cfg_gallo, cfg_monivoi)
+        if ventas:
+            self._consolidar_solo_ventas(ventas)
+            return
+
         ruta_gallo = self._localizar_archivo(input_path, cfg_gallo["filename"], "Gallo")
         if not ruta_gallo:
             return
         ruta_monivoi = self._localizar_archivo(input_path, cfg_monivoi["filename"], "Monivoi")
         if not ruta_monivoi:
             return
-        # The VBRL is NOT optional here: 'Diferencias' lists the #N/A rows of the tables it feeds.
-        ruta_vbrl = self._localizar_archivo(
-            input_path, self.gui.get_config("vbrl")["filename"], "VBRL")
+        ruta_vbrl = self._localizar_vbrl(input_path, self.gui.get_config("vbrl")["filename"], ruta_monivoi)
         if not ruta_vbrl:
             return
         ruta_fb03, cancelar = self._resolver_fb03(
@@ -921,11 +889,10 @@ class ValidacionFacturaController:
             for clave, etiqueta in self._ETIQUETAS_SEGUNDA)
         nombre_monivoi2 = os.path.basename(ruta_monivoi2) if ruta_monivoi2 else "(sin archivo: Monitor (2) en blanco)"
         lineas_segunda += f"  • {self._ETIQUETA_MONIVOI2:<17}: {nombre_monivoi2}\n"
-        reemplaza = ("\n⚠️ Ya existe y se REEMPLAZA (el mismo Excel, completado con las pestañas nuevas)."
-                     if os.path.exists(ruta_final) else "")
+        reemplaza = ("\n⚠️ Ya existe y se REEMPLAZA." if os.path.exists(ruta_final) else "")
         if not messagebox.askyesno(
-            "Confirmar 2a consolidación",
-            "¿Completar la consolidación con la 2a corrida?\n\n"
+            "Confirmar consolidación",
+            "¿Consolidar estos archivos en un solo Excel?\n\n"
             f"  🐓 Gallo   : {os.path.basename(ruta_gallo)}\n"
             f"  📊 Monivoi : {os.path.basename(ruta_monivoi)}\n"
             f"  🧾 VBRL    : {os.path.basename(ruta_vbrl)}\n"
@@ -939,7 +906,7 @@ class ValidacionFacturaController:
         self._ocupado = True
         try:
             self.gui.disable_buttons()
-            self._marcar_paso("consolidacion2", "en_curso")
+            self._marcar_paso("consolidacion", "en_curso")
             resumen = consolidar_gallo_monivoi(
                 ruta_gallo, ruta_monivoi, ruta_output,
                 nombre_salida=nombre_salida,
@@ -950,14 +917,21 @@ class ValidacionFacturaController:
             )
             avisos = self._avisos_consolidacion(resumen)
             nota_avisos = ("\n" + "\n".join(f"⚠️ {a}" for a in avisos)) if avisos else ""
+            sin_datos = []
+            if resumen["monivoi_sin_datos"]:
+                sin_datos.append("⚠️ El archivo de Monivoi venía sin datos; su pestaña quedó vacía.")
+            if resumen.get("vbrl_sin_datos"):
+                sin_datos.append("⚠️ El archivo de VBRL venía sin datos; su pestaña quedó vacía.")
+            nota_sin_datos = ("\n" + "\n".join(sin_datos)) if sin_datos else ""
             d = resumen["diferencias"]
             por_tipo = d["por_tipo"]
             semaforo = d["semaforo"]
-            self.gui.set_status("✅ ¡2a consolidación completada!")
-            self._marcar_paso("consolidacion2", "parcial" if avisos else "listo")
+            self.gui.set_status("✅ ¡Consolidación completada!")
+            self._marcar_paso("consolidacion", "parcial" if (avisos or sin_datos) else "listo")
             messagebox.showinfo(
-                "2a consolidación completada",
+                "Consolidación completada",
                 f"Archivo generado:\n{resumen['ruta']}\n\n"
+                f"{self._lineas_primera_consolidacion(resumen)}\n"
                 f"  • Renglones en 'Diferencias': {d['filas']:,}"
                 f"  (Facturas {por_tipo.get('Factura', 0):,} · NC {por_tipo.get('NC', 0):,}"
                 f" · PV {por_tipo.get('PV', 0):,})\n"
@@ -971,21 +945,52 @@ class ValidacionFacturaController:
                 f"{semaforo['amarillo']:,} / {semaforo['rojo']:,}"
                 f"  (SIN REGLA {d['sin_regla']:,})\n"
                 f"  • W.A BAMA / OXXO: UUID {d['wa_uuid']:,} · Sin UUID {d['wa_sin_uuid']:,}"
-                f"{nota_avisos}"
+                f"{nota_sin_datos}{nota_avisos}"
             )
         except (FileNotFoundError, ValueError) as e:
-            self.gui.set_status("❌ Error en la 2a consolidación")
-            self._marcar_paso("consolidacion2", "error")
-            messagebox.showerror("Error en la 2a consolidación", str(e))
+            self.gui.set_status("❌ Error en la consolidación")
+            self._marcar_paso("consolidacion", "error")
+            messagebox.showerror("Error en la consolidación", str(e))
         except Exception as e:
-            self.gui.set_status("❌ Error en la 2a consolidación")
-            self._marcar_paso("consolidacion2", "error")
+            self.gui.set_status("❌ Error en la consolidación")
+            self._marcar_paso("consolidacion", "error")
             messagebox.showerror("Error", f"Ocurrió un error inesperado:\n\n{e}")
         finally:
             self._ocupado = False
             self.gui.enable_buttons()
             if "completada" not in self.gui.status_var.get():
                 self.gui.set_status("✓ Listo para comenzar")
+
+    @staticmethod
+    def _lineas_primera_consolidacion(resumen):
+        """Control lines of the summary that the old 1st consolidation showed (rows read, #N/A left in each
+        reference table): one line per item, each ending in a line break. The VBRL / FB03 blocks only appear
+        when that file was part of the run."""
+        texto = (
+            f"  • Filas Gallo              : {resumen['filas_gallo']:,}\n"
+            f"  • Filas Monivoi            : {resumen['filas_monivoi']:,}\n"
+            f"  • Referencias únicas       : {resumen['refs_unicas']:,}\n"
+            f"  • Docs 'MX Commercial'     : {resumen['filas_catalogo']:,}\n"
+            f"  • Globales (filtro final)  : {resumen['filas_globales']:,}\n"
+            f"  • Σ Importe en moneda local: {resumen['total_importe_gallo']:,.2f}\n"
+        )
+        if resumen.get("vbrl_incluido"):
+            texto += (
+                f"  • Filas VBRL               : {resumen['filas_vbrl']:,}\n"
+                f"  • Referencias (facturas)   : {resumen['filas_td_referencias']:,}\n"
+                f"      …en #N/A               : {resumen['td_referencias_na']:,}\n"
+            )
+            if resumen.get("fb03_incluido"):
+                texto += (
+                    f"  • Filas FB03               : {resumen['filas_fb']:,}\n"
+                    f"  • Notas de crédito         : {resumen['filas_notas_ref']:,}"
+                    f"  (Σ {resumen['total_notas_ref']:,.2f})\n"
+                    f"      …en #N/A               : {resumen['notas_ref_na']:,}\n"
+                    f"  • PEP Vouchers             : {resumen['filas_pep_ref']:,}"
+                    f"  (Σ {resumen['total_pep_ref']:,.2f})\n"
+                    f"      …en #N/A               : {resumen['pep_ref_na']:,}\n"
+                )
+        return texto
 
     _VENTAS = (
         ("dsd",  "Venta DSD",  consolidar_venta_dsd),
@@ -1097,51 +1102,26 @@ class ValidacionFacturaController:
             if "completada" not in self.gui.status_var.get():
                 self.gui.set_status("✓ Listo para comenzar")
 
-    def _resolver_vbrl(self, input_path, filename, ruta_monivoi):
-        """The VBRL CSV (OPTIONAL) → (ruta or None = without VBRL, cancelar = do not consolidate)."""
-        ruta = os.path.join(input_path, filename)
-        if not os.path.exists(ruta):
-            decision = messagebox.askyesnocancel(
-                "Archivo de VBRL no encontrado",
-                f"No encontré el archivo esperado:\n\n  {filename}\n\n"
-                f"en la carpeta:\n  {input_path}\n\n"
-                "Sin VBRL el Excel sale sin las pestañas 'VBRL' y 'TD.Diferencias_Referencias'.\n\n"
-                "Sí = consolidar SIN VBRL\n"
-                "No = seleccionar el archivo manualmente\n"
-                "Cancelar = no consolidar",
-            )
-            if decision is None:
-                return None, True
-            if decision:
-                return None, False
-            ruta = filedialog.askopenfilename(
-                title="Selecciona el CSV de VBRL",
-                initialdir=input_path,
-                filetypes=[("Archivos CSV", "*.csv"), ("Todos los archivos", "*.*")],
-            )
-            if not ruta:
-                return None, True
-
-        # A VBRL OLDER than its Monivoi may not cover its invoices (extra #N/A).
+    def _localizar_vbrl(self, input_path, filename, ruta_monivoi):
+        """The VBRL CSV (REQUIRED: 'Diferencias' needs it) → its path, or None = do not consolidate. A file
+        picked by hand if it is not where it is expected; one OLDER than its Monivoi may not cover its
+        invoices (extra #N/A), so that is confirmed."""
+        ruta = self._localizar_archivo(input_path, filename, "VBRL")
+        if not ruta:
+            return None
         try:
             vbrl_anterior = os.path.getmtime(ruta) < os.path.getmtime(ruta_monivoi) - 2
         except OSError:
             vbrl_anterior = False
-        if vbrl_anterior:
-            decision = messagebox.askyesnocancel(
-                "VBRL anterior al archivo de Monivoi",
-                f"El archivo de VBRL:\n  {os.path.basename(ruta)}\n"
-                f"se descargó ANTES que el de Monivoi:\n  {os.path.basename(ruta_monivoi)}\n\n"
-                "Probablemente no cubre las facturas actuales y saldrían #N/A de más.\n\n"
-                "Sí = usarlo de todos modos\n"
-                "No = consolidar SIN VBRL\n"
-                "Cancelar = no consolidar",
-            )
-            if decision is None:
-                return None, True
-            if not decision:
-                return None, False
-        return ruta, False
+        if vbrl_anterior and not messagebox.askyesno(
+            "VBRL anterior al archivo de Monivoi",
+            f"El archivo de VBRL:\n  {os.path.basename(ruta)}\n"
+            f"se descargó ANTES que el de Monivoi:\n  {os.path.basename(ruta_monivoi)}\n\n"
+            "Probablemente no cubre las facturas actuales y saldrían #N/A de más.\n\n"
+            "¿Usarlo de todos modos?",
+        ):
+            return None
+        return ruta
 
     def _resolver_fb03(self, input_path, filename, ruta_gallo):
         """The FB03 CSV (OPTIONAL, only asked for with a VBRL) → (ruta or None = without FB03, cancelar = do
@@ -1252,115 +1232,6 @@ class ValidacionFacturaController:
                 cfg["documentos"] = list(listas[tx["lista_de"]])
             configs[tx["clave"]] = cfg
         return configs
-
-    def _ofrecer_segunda_corrida(self, listas, base, origen=None):
-        """After a consolidation (or the '2a corrida' button): offer the 2nd run with its lists, or say
-        there is nothing to ask. `origen`: extra lines for the confirmation (where the lists came from).
-        """
-        if not listas["referencias"] and not listas["documentos"]:
-            messagebox.showinfo(
-                "2a corrida de descargas",
-                "En 'TD.Diferencias_Referencias' ningún renglón quedó en #N/A (o sólo los que\n"
-                "tienen una Referencia de pago que empieza con 'FP'): no hay nada que consultar\n"
-                "en VBRP, VBRK, VBRL, BKPF, FBL5N, KNVP ni Monivoi (2a corrida).",
-            )
-            return
-        self._execute_segunda_corrida(listas, base, origen=origen)
-
-    def _execute_segunda_corrida(self, listas, base, origen=None):
-        """Confirm and run the 2nd run (PASADAS_2DA at once with the GUI checkbox, else one after another)
-        and show ONE summary."""
-        if self._ocupado:
-            return
-        pasadas = self._txs_segunda_corrida()
-        self._validar_pasadas(pasadas)        # VBRK in an earlier pass than FBL5N / KNVP, in both modes
-        txs = [tx for pasada in pasadas for tx in pasada]
-        n_ventanas = self._ventanas_de_pasadas(pasadas)
-        configs = self._configs_segunda_corrida(base, listas, txs)
-        problema = self._validar_paralelo(txs, configs)
-        if problema:
-            messagebox.showerror("2a corrida de descargas", problema)
-            return
-        usar_paralelo = getattr(self.gui, "usar_paralelo", None)
-        paralelo = bool(usar_paralelo()) if callable(usar_paralelo) else False
-
-        periodo = (
-            f"Fecha    : {base['fecha']}" if base["mode"] == "single"
-            else f"Periodo  : {base['date_from']} — {base['date_to']}"
-        )
-        excluidas = listas["excluidas_fp"]
-        nota_fp = ""
-        if excluidas["renglones"]:
-            nota_fp = (f"(fuera {excluidas['renglones']:,} renglón(es) cuya Referencia de pago empieza "
-                       "con 'FP':\n ni su referencia ni su Nº documento se consultan)\n")
-        nota_origen = f"{origen}\n" if origen else ""
-        nota_avisos = "".join(f"⚠️ {aviso}\n" for aviso in listas.get("avisos") or [])
-        if paralelo:
-            orden = (
-                "En paralelo, por pasadas: las transacciones de una pasada corren a la vez, cada una en su propia ventana de SAP, y la siguiente empieza cuando termina:\n\n"
-                + "".join(
-                    f"  Pasada {i}: {' ‖ '.join(self._nombre_corto(tx) for tx in pasada)}\n"
-                    for i, pasada in enumerate(pasadas, 1)
-                )
-                + "\nFBL5N y KNVP usan la columna 'Solic.' de VBRK (por eso VBRK va en la pasada 1) y "
-                "Monivoi (2a corrida) las listas de factura del VBRL (2a corrida).\n\n"
-                f"Uso las ventanas 1 a {n_ventanas} de SAP que ya estén abiertas... No trabajar en ellas mientras corre.\n"
-            )
-        else:
-            orden = ("Se ejecutan una tras otra:\n"
-                     + "".join(f"  {i}) {tx['nombre']}\n" for i, tx in enumerate(txs, 1)) + "\n")
-        confirm = messagebox.askyesno(
-            "2a corrida de descargas",
-            f"¿Descargar ahora las {len(txs)} transacciones de la 2a corrida?\n\n"
-            f"Sociedad : {base['sociedad']}\n{periodo}\n\n"
-            f"{nota_fp}{nota_origen}{nota_avisos}\n"
-            f"{orden}"
-            "Mientras corren NO copiar ni pegar nada!! El portapapeles se usa para pasarle las listas a SAP.\n\n"
-            f"Se guardará en:\n{base['input_path']}"
-        )
-        if not confirm:
-            return
-
-        self._ocupado = True
-        estado_final = None
-        try:
-            self.gui.disable_buttons()
-            self._marcar_paso("descarga2", "en_curso")
-            os.makedirs(base["input_path"], exist_ok=True)
-            inicio_total = time.time()
-            if paralelo:
-                lineas, resultados, duraciones, notas = self._descargar_en_paralelo(
-                    txs, configs, n_ventanas, pasadas=pasadas
-                )
-            else:
-                lineas, resultados, duraciones = self._correr_secuencial(txs, configs)
-                notas = []
-            total = time.time() - inicio_total
-            todo_ok = all(resultados.get(tx["clave"]) == "datos" for tx in txs)
-            estado_final = ("✅ ¡2a corrida completada!" if todo_ok
-                            else "⚠️ 2a corrida terminada con avisos")
-            self.gui.set_status(estado_final)
-            self._marcar_paso("descarga2", "listo" if todo_ok else "parcial")
-            mostrar = messagebox.showinfo if todo_ok else messagebox.showwarning
-            mostrar(
-                "Resumen de la 2a corrida",
-                "Proceso terminado:\n\n"
-                + "\n".join(f"{lineas[tx['clave']]} ({_fmt_duracion(duraciones[tx['clave']])})"
-                            for tx in txs)
-                + "\n\n" + "".join(f"{n}\n" for n in notas)
-                + f"⏱️ Tiempo total: {_fmt_duracion(total)}"
-                + f"\nRuta: {base['input_path']}"
-            )
-        except Exception as e:
-            estado_final = None
-            self.gui.set_status("❌ Error en la 2a corrida")
-            self._marcar_paso("descarga2", "error")
-            messagebox.showerror("Error", f"Ocurrió un error inesperado en la 2a corrida:\n\n{e}")
-        finally:
-            self._ocupado = False
-            self.gui.enable_buttons()
-            if estado_final is None:
-                self.gui.set_status("✓ Listo para comenzar")
 
     @staticmethod
     def _texto_info(info):
