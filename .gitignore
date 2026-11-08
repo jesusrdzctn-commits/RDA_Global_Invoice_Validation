@@ -12,3 +12,4 @@ config.json
 Data_Templates/
 
 .venv/
+src/Logs/
