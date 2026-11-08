@@ -6,10 +6,17 @@ queries: Monivoi +1 day, the 2nd Monivoi that same day ±1 and the sales buttons
 to SAP AND summed by its tab). File NAMES always keep the dates the user typed.
 """
 
+import json
+import os
+import sys
+import unicodedata
 from datetime import datetime, timedelta
 
 # Date format the user types everywhere in the app.
 FORMATO_FECHA = "%d.%m.%Y"
+
+# Company code (BUKRS) the app starts with: the GUI field and the command line default to it.
+SOCIEDAD_DEFECTO = "MX21"
 
 # The two sales buttons, 'Venta EIAP' and 'Venta DSD': each has its OWN FAGLL03 query (a merged one
 # was too big and the program failed). What SAP is asked for AND what its tab sums come from these
@@ -24,6 +31,21 @@ MESES_ES = {
     1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
     7: "jul", 8: "ago", 9: "sep", 10: "oct", 11: "nov", 12: "dic",
 }
+
+
+# --- Text ---
+def quitar_acentos(texto):
+    """'Validación' -> 'Validacion': the text without accents, everything else as it was."""
+    descompuesto = unicodedata.normalize("NFKD", str(texto))
+    return "".join(c for c in descompuesto if not unicodedata.combining(c))
+
+
+def normalizar_encabezado(texto):
+    """A header normalized to recognize SPELLING VARIANTS of the same field (accents, dots, spaces, case):
+    'Fe.Contabilización' == 'fecha contabilizacion', 'Solic.' == 'solic'. Never used to guess another column.
+    The ONE rule of the downloads (that check the files they write) and of the consolidation (that reads them).
+    """
+    return "".join(c for c in quitar_acentos(texto).lower() if c.isalnum())
 
 
 # --- Dates ---
@@ -65,11 +87,6 @@ def fecha_efectiva_eiap(fecha_str):
     (only their queries): '10.01.2026' -> datetime(2026, 1, 9); '01.03.2026' -> datetime(2026, 2, 28).
     """
     return parse_fecha(fecha_str) - timedelta(days=1)
-
-
-def fecha_efectiva_eiap_str(fecha_str):
-    """fecha_efectiva_eiap() as 'DD.MM.YYYY', for SO_BUDAT-HIGH: '10.01.2026' -> '09.01.2026'."""
-    return fecha_efectiva_eiap(fecha_str).strftime(FORMATO_FECHA)
 
 
 def _sufijo_dia(f):
@@ -129,12 +146,12 @@ def nombre_archivo_rango_fb03(desde, hasta):
 
 
 # 2nd run (after the consolidation): one file per transaction, named like VBRL / FB03 with the
-# dates of the period. FBL5N is SAP's own text list, kept with the extension of its recording.
+# dates of the period (all of them .csv: the ZSE16 tables are converted from SAP's .xlsx).
 ARCHIVOS_SEGUNDA_CORRIDA = {
     "vbrp":     ("VBRP",        ".csv"),
     "vbrk":     ("VBRK",        ".csv"),
     "vbrl2":    ("VBRL_2",      ".csv"),
-    "fbl5n":    ("FBL5N",       ".XLS"),
+    "kna1":     ("KNA1",        ".csv"),
     "knvp":     ("KNVP",        ".csv"),
     "bkpf":     ("BKPF",        ".csv"),
     "monivoi2": ("Monitoreo_2", ".csv"),
@@ -148,7 +165,7 @@ def nombre_archivo_dia_2da(clave, fecha_str):
 
 
 def nombre_archivo_rango_2da(clave, desde, hasta):
-    """('fbl5n', '18.08.2026', '20.08.2026') -> 'FBL5N_18_ago_26_a_20_ago_26.XLS'."""
+    """('kna1', '18.08.2026', '20.08.2026') -> 'KNA1_18_ago_26_a_20_ago_26.csv'."""
     prefijo, ext = ARCHIVOS_SEGUNDA_CORRIDA[clave]
     d = _sufijo_dia(parse_fecha(desde))
     h = _sufijo_dia(parse_fecha(hasta))
@@ -162,8 +179,80 @@ def nombre_archivo_rango_2da(clave, desde, hasta):
 CORRIDAS_DESCARGA = {
     1: (("gallo", "Gallo"), ("monivoi", "Monivoi"), ("vbrl", "VBRL"), ("fb03", "FB03")),
     2: (("vbrp", "VBRP"), ("vbrk", "VBRK"), ("vbrl2", "VBRL_2"),
-        ("fbl5n", "FBL5N"), ("knvp", "KNVP"), ("bkpf", "BKPF"), ("monivoi2", "Monivoi_2")),
+        ("kna1", "KNA1"), ("knvp", "KNVP"), ("bkpf", "BKPF"), ("monivoi2", "Monivoi_2")),
 }
+
+
+# --- Folders and config.json (ONE place for the GUI and the command line) ---
+def ruta_config():
+    """config.json (last download/consolidation folders): next to the .exe (PyInstaller) or to this .py."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "config.json")
+
+
+def carpeta_base_proyecto():
+    """Documents\\Validacion Factura Global\\src of the current Windows user (parent of Input, Output, Logs)."""
+    perfil = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.join(perfil, "Documents", "Validacion Factura Global", "src")
+
+
+def carpetas_por_defecto():
+    """(download folder, consolidation folder) when config.json has none: <base>\\Input and <base>\\Output."""
+    base = carpeta_base_proyecto()
+    return os.path.join(base, "Input"), os.path.join(base, "Output")
+
+
+def cargar_config(ruta=None):
+    """The whole config.json as a dict; {} if it is missing, unreadable or not a JSON object."""
+    try:
+        with open(ruta or ruta_config(), "r", encoding="utf-8") as f:
+            datos = json.load(f)
+    except (OSError, ValueError):          # ValueError covers JSONDecodeError and bad UTF-8
+        return {}
+    return datos if isinstance(datos, dict) else {}
+
+
+def carpetas_configuradas(config=None):
+    """(download folder, consolidation folder) the app starts with: the ones in `config` (default: the
+    config.json), each falling back to its default when missing, blank or not a text."""
+    config = cargar_config() if config is None else config
+    por_defecto = carpetas_por_defecto()
+    elegidas = []
+    for clave, defecto in zip(("ruta_descarga", "ruta_consolidacion"), por_defecto):
+        valor = config.get(clave)
+        valor = valor.strip() if isinstance(valor, str) else ""
+        elegidas.append(valor or defecto)
+    return tuple(elegidas)
+
+
+# --- The name of the file of ANY transaction (the GUI previews them, the command line uses this) ---
+_NOMBRES_1A_CORRIDA = {
+    "gallo":   (nombre_archivo_dia,         nombre_archivo_rango),
+    "monivoi": (nombre_archivo_dia_monivoi, nombre_archivo_rango_monivoi),
+    "vbrl":    (nombre_archivo_dia_vbrl,    nombre_archivo_rango_vbrl),
+    "fb03":    (nombre_archivo_dia_fb03,    nombre_archivo_rango_fb03),
+}
+
+
+def nombre_archivo_transaccion(clave, fecha=None, desde=None, hasta=None):
+    """File name of the transaction `clave` ('gallo', 'monivoi', 'vbrl', 'fb03' or any key of
+    ARCHIVOS_SEGUNDA_CORRIDA) for ONE day (`fecha`) or a range (`desde` and `hasta`), exactly the one the
+    GUI shows: ('vbrk', fecha='03.11.2026') -> 'VBRK_3_nov_26.csv'. ValueError: unknown key, a bad or missing
+    date, or both a day and a range."""
+    if fecha is not None and (desde is not None or hasta is not None):
+        raise ValueError("Indica un día (fecha) o un rango (desde y hasta), no los dos.")
+    if fecha is None and (desde is None or hasta is None):
+        raise ValueError("Falta la fecha, o el rango completo (desde y hasta).")
+    if clave in _NOMBRES_1A_CORRIDA:
+        por_dia, por_rango = _NOMBRES_1A_CORRIDA[clave]
+        return por_dia(fecha) if fecha is not None else por_rango(desde, hasta)
+    if clave in ARCHIVOS_SEGUNDA_CORRIDA:
+        return (nombre_archivo_dia_2da(clave, fecha) if fecha is not None
+                else nombre_archivo_rango_2da(clave, desde, hasta))
+    raise ValueError(f"Transacción desconocida: {clave!r}.")
 
 
 # The sales buttons only work with a range ("Varios días"): no per-day name.
@@ -195,6 +284,6 @@ if __name__ == "__main__":
     print("FB03    rango :", nombre_archivo_rango_fb03("11.08.2026", "13.08.2026"))
     print("EIAP    rango :", nombre_archivo_rango_eiap("01.01.2026", "10.01.2026"))
     print("DSD     rango :", nombre_archivo_rango_dsd("01.01.2026", "10.01.2026"))
-    print("EIAP    a SAP :", fecha_efectiva_eiap_str("10.01.2026"))
+    print("EIAP    a SAP :", fecha_efectiva_eiap("10.01.2026").strftime(FORMATO_FECHA))
     for clave in ARCHIVOS_SEGUNDA_CORRIDA:
         print(f"{clave:<7} día   :", nombre_archivo_dia_2da(clave, "11.08.2026"))

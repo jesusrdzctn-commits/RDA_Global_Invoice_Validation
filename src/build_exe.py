@@ -126,6 +126,7 @@ def check_source_files():
         "main.py",
         "interfaz_GUI.py",
         "controller.py",
+        "corrida_completa.py",
         "Descargas_SAP.py",
         "Consolidacion.py",
         "utils.py",

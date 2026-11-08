@@ -1,9 +1,8 @@
-"""Validación Factura Global — entry point: the GUI wired to the controller."""
+"""Validación Factura Global — entry point. Without arguments it opens the GUI wired to the controller; with
+arguments it is the command line (corrida_completa.py):  ValidacionFacturaGlobal.exe --corrida-completa --fecha 03.11.2026
+"""
 
 import sys
-import tkinter as tk
-from interfaz_GUI import ValidacionFacturaGUI
-from controller import ValidacionFacturaController
 
 
 def activar_dpi_alto():
@@ -22,13 +21,29 @@ def activar_dpi_alto():
         pass
 
 
-def main():
+def abrir_interfaz():
+    """The window. Tk, the GUI and the controller are imported HERE so the command line never loads them."""
+    import tkinter as tk
+    from interfaz_GUI import ValidacionFacturaGUI
+    from controller import ValidacionFacturaController
+
     activar_dpi_alto()
     root = tk.Tk()
     gui = ValidacionFacturaGUI(root)
     ValidacionFacturaController(gui)
     root.mainloop()
+    return 0
+
+
+def main(argv=None):
+    """→ the exit code of the process. Any argument means the command line (a typo must NOT open a window
+    that a scheduled task would wait on forever); none means the GUI."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv:
+        from corrida_completa import ejecutar_linea_de_comandos
+        return ejecutar_linea_de_comandos(argv)
+    return abrir_interfaz()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -11,7 +11,6 @@ interfaz_GUI.py` opens the window on its own. This module imports no SAP depende
 
 import json
 import os
-import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime
@@ -25,6 +24,7 @@ from utils import (
     nombre_archivo_rango_eiap,
     nombre_archivo_rango_dsd,
     ARCHIVOS_SEGUNDA_CORRIDA,    CORRIDAS_DESCARGA,
+    ruta_config,                 carpetas_por_defecto,       carpetas_configuradas,
     nombre_archivo_dia_2da,      nombre_archivo_rango_2da,
     parse_fecha,
 )
@@ -111,12 +111,18 @@ def _rect_redondeado(canvas, x1, y1, x2, y2, radio, **opciones):
 
 
 def _ruta_config():
-    """config.json (last download/consolidation folders) next to the .exe (PyInstaller) or to this .py."""
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "config.json")
+    """config.json (last download/consolidation folders): utils.ruta_config, shared with the command line."""
+    return ruta_config()
+
+
+class _Fijo:
+    """Stands in for a tk variable where only `.get()` is read (nothing can trace it or write to it)."""
+
+    def __init__(self, valor):
+        self._valor = valor
+
+    def get(self):
+        return self._valor
 
 
 # ----------------------------------------------------------------------
@@ -186,8 +192,16 @@ class _WidgetLienzo(tk.Canvas):
     def _al_cambiar_texto(self):
         pass
 
-    def _dibujar(self):                                        # pragma: no cover - overridden
-        raise NotImplementedError
+    def _dibujar(self):
+        """Default: a rounded rectangle with centred text, coloured by `_colores()` (the button and the pills);
+        the switch draws itself."""
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 2 or h <= 2:
+            return
+        relleno, borde, texto = self._colores()
+        _rect_redondeado(self, 1, 1, w - 1, h - 1, self._radio, fill=relleno, outline=borde, width=2)
+        self.create_text(w / 2, h / 2, text=self._texto, fill=texto, font=self._fuente)
 
     # --- shared event plumbing -------------------------------------------
     def _enlazar_eventos(self):
@@ -269,15 +283,6 @@ class BotonRedondeado(_WidgetLienzo):
                    else _mezclar(Paleta.campo, "#000000", 0.05) if hover else Paleta.campo)
         return relleno, (Paleta.foco if self._foco else Paleta.borde), self.color
 
-    def _dibujar(self):
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
-        if w <= 2 or h <= 2:
-            return
-        relleno, borde, texto = self._colores()
-        _rect_redondeado(self, 1, 1, w - 1, h - 1, self._radio, fill=relleno, outline=borde, width=2)
-        self.create_text(w / 2, h / 2, text=self._texto, fill=texto, font=self._fuente)
-
     def invoke(self):
         if self._habilitado and self._comando:
             self._comando()
@@ -343,15 +348,6 @@ class Segmento(_WidgetLienzo):
         if self._foco and self._habilitado:
             borde = Paleta.foco
         return relleno, borde, texto
-
-    def _dibujar(self):
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
-        if w <= 2 or h <= 2:
-            return
-        relleno, borde, texto = self._colores()
-        _rect_redondeado(self, 1, 1, w - 1, h - 1, self._radio, fill=relleno, outline=borde, width=2)
-        self.create_text(w / 2, h / 2, text=self._texto, fill=texto, font=self._fuente)
 
     def invoke(self):
         if not self._habilitado:
@@ -450,15 +446,18 @@ class ValidacionFacturaGUI:
     file names, validation, status, button state, handlers."""
 
     # Design size = MINIMUM size: _ajustar_al_contenido grows the window when the content needs more room.
-    ANCHO_BASE = 1120
+    ANCHO_BASE = 1040
     ANCHO_RIEL = 270
+    # Dates that give the longest file names (SAP-style 'D_mmm_YY' with a two-digit day): the width of the
+    # 'Archivos que se generarán' box is measured with them.
+    FECHA_LARGA_DESDE, FECHA_LARGA_HASTA = "28.10.2026", "30.12.2026"
 
     LEYENDA_CONSOLIDACION = ("Gallo + Monivoi + VBRL + FB03 + las 7 pestañas de la 2a corrida "
                              "→ Excel con Diferencias y Agrupadores")
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Robotic Desktop Automation Validación Factura Global")
+        self.root.title("Robotic Desktop Automation — Validación Factura Global")
         self.root.configure(bg=Paleta.fondo)
         # Pixel sizes follow the display scaling; point sizes of fonts already do.
         self.escala = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
@@ -470,6 +469,7 @@ class ValidacionFacturaGUI:
         self.on_download_eiap    = None
         self.on_download_todos   = None
         self.on_consolidar       = None
+        self.on_corrida_completa = None
 
         self.mode_var = tk.StringVar(value="single")
 
@@ -478,19 +478,10 @@ class ValidacionFacturaGUI:
 
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
-        user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-        base_proyecto = os.path.join(
-            user_profile, "Documents", "Validacion Factura Global", "src"
-        )
-        ruta_input_default  = os.path.join(base_proyecto, "Input")
-        ruta_output_default = os.path.join(base_proyecto, "Output")
-
-        self.path_var = tk.StringVar(
-            value=(cfg.get("ruta_descarga") or "").strip() or ruta_input_default
-        )
-        self.consolidacion_path_var = tk.StringVar(
-            value=(cfg.get("ruta_consolidacion") or "").strip() or ruta_output_default
-        )
+        ruta_input_default, _ = carpetas_por_defecto()
+        ruta_descarga, ruta_consolidacion = carpetas_configuradas(cfg)
+        self.path_var = tk.StringVar(value=ruta_descarga)
+        self.consolidacion_path_var = tk.StringVar(value=ruta_consolidacion)
         os.makedirs(ruta_input_default, exist_ok=True)
 
         hoy = datetime.now().strftime("%d.%m.%Y")
@@ -530,6 +521,23 @@ class ValidacionFacturaGUI:
     # ------------------------------------------------------------------
     # Window geometry
     # ------------------------------------------------------------------
+    def _igualar_columna_izquierda(self):
+        """The 'Archivos que se generarán' box and the 'Consolidación en Excel' card get exactly the same
+        width: the largest that either needs. The file names change with the period (a range is longer than
+        a day; a day number has no leading zero), so the box is measured with the LONGEST names of both
+        modes: nothing moves when the mode or the dates change."""
+        px = self._px
+        necesario = 0
+        for modo in ("single", "range"):
+            self.filename_var.set(self._texto_archivos(self._lineas_con_fechas_largas(modo)))
+            self.root.update_idletasks()
+            necesario = max(necesario, self._izquierda_descarga.winfo_reqwidth())
+        self._update_filename_preview()                       # back to the names of the dates in the entries
+        necesario = max(necesario, self._marco_consolidacion.winfo_reqwidth())
+        # Each column also holds the gap that separates it from its neighbour (16 px / 6 px).
+        self._cuerpo_descarga.columnconfigure(0, minsize=necesario + px(16))
+        self._fila_inferior.columnconfigure(0, minsize=necesario + px(6))
+
     def _ajustar_al_contenido(self):
         """Fit the window to what the layout really needs (fonts and DPI change it), within the screen."""
         # The date block always reserves the room of its taller variant, so nothing moves with the mode.
@@ -542,6 +550,7 @@ class ValidacionFacturaGUI:
             alto_fechas = max(alto_fechas, marco.winfo_reqheight())
         self.date_container.configure(height=alto_fechas)
         self._on_mode_change()
+        self._igualar_columna_izquierda()
 
         self.root.update_idletasks()
         # The rail is as tall as its content asks for (it cannot propagate its size: its width is fixed).
@@ -603,10 +612,13 @@ class ValidacionFacturaGUI:
         self._build_tarjeta_descarga(principal).pack(fill="x")
         abajo = tk.Frame(principal, bg=Paleta.fondo)
         abajo.pack(fill="both", expand=True, pady=(px(12), 0))
-        for columna, peso in ((0, 5), (1, 7)):     # the folder paths are long: that card gets more room
-            abajo.columnconfigure(columna, weight=peso, uniform="abajo")
+        # Column 0 (Consolidación) has a fixed width, set by _igualar_columna_izquierda to the same width
+        # as the 'Archivos que se generarán' box; the folders card takes all the rest.
+        abajo.columnconfigure(1, weight=1)
         abajo.rowconfigure(0, weight=1)
-        self._build_tarjeta_consolidacion(abajo).grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
+        self._fila_inferior = abajo
+        self._marco_consolidacion = self._build_tarjeta_consolidacion(abajo)
+        self._marco_consolidacion.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
         self._build_tarjeta_carpetas(abajo).grid(row=0, column=1, sticky="nsew", padx=(px(6), 0))
 
     # --- side rail ----------------------------------------------------
@@ -629,7 +641,7 @@ class ValidacionFacturaGUI:
                  bg=Paleta.riel).pack(anchor="w")
         tk.Label(marca, text="Validación Factura Global", font=(FUENTE, 11, "bold"), fg="#FFFFFF",
                  bg=Paleta.riel).pack(anchor="w")
-        tk.Label(marca, text="Contabilidad vs Monitoreo\nde Facturas", font=(FUENTE, 9),
+        tk.Label(marca, text="Análisis Contabilidad vs Monitoreo\n(SAT) de Facturas en CEDIS", font=(FUENTE, 9),
                  fg=Paleta.riel_texto, bg=Paleta.riel, justify="left").pack(anchor="w", pady=(px(4), 0))
 
         self._separador_riel(riel)
@@ -776,40 +788,43 @@ class ValidacionFacturaGUI:
 
         cuerpo = tk.Frame(interior, bg=Paleta.tarjeta)
         cuerpo.pack(fill="x", pady=(px(10), 0))
-        cuerpo.columnconfigure(0, weight=1)
+        cuerpo.columnconfigure(1, weight=1)      # column 0: fixed width (_igualar_columna_izquierda)
+        self._cuerpo_descarga = cuerpo
 
-        # Left: the files this download will leave in the folder (always room for the longer list).
+        # Left: the files this download will leave in the folder (always room for the longer list) and,
+        # right under it and as wide as it, the button that downloads all of them.
         izquierda = tk.Frame(cuerpo, bg=Paleta.tarjeta)
         izquierda.grid(row=0, column=0, sticky="nsew", padx=(0, px(16)))
+        self._izquierda_descarga = izquierda
         self._titulo_campo(izquierda, "Archivos que se generarán")
         caja = tk.Frame(izquierda, bg=Paleta.campo, highlightthickness=1,
                         highlightbackground=Paleta.borde)
         caja.pack(fill="x")
+        self._caja_archivos = caja
         lineas = len(self._lineas_archivos())
         tk.Label(caja, textvariable=self.filename_var, font=(FUENTE_MONO, 9), fg=Paleta.texto,
                  bg=Paleta.campo, justify="left", anchor="nw", height=lineas,
                  padx=px(10), pady=px(6)).pack(fill="x")
+        n = sum(len(transacciones) for transacciones in CORRIDAS_DESCARGA.values())
+        self.download_btn = self._boton(izquierda, f"📸 Descargar todo ({n} transacciones)",
+                                        self._handle_todos)
+        self.download_btn.pack(fill="x", pady=(px(12), 0))
 
-        # Right: single-transaction downloads and the parallel switch.
+        # Right, ONE column: the single-transaction downloads, the parallel switch and, at the bottom
+        # (level with the main button), the full run: download + consolidation.
         derecha = tk.Frame(cuerpo, bg=Paleta.tarjeta)
-        derecha.grid(row=0, column=1, sticky="n")
+        derecha.grid(row=0, column=1, sticky="nsew")
         self._titulo_campo(derecha, "Descargas sueltas (una transacción)")
-        sueltas = tk.Frame(derecha, bg=Paleta.tarjeta)
-        sueltas.pack(fill="x")
-        for columna in (0, 1):
-            sueltas.columnconfigure(columna, weight=1, uniform="sueltas")
         botones = (
             ("download_gallo_btn",   "🐓 Gallo",       self._handle_gallo),
             ("download_monivoi_btn", "📊 Monivoi",     self._handle_monivoi),
             ("download_dsd_btn",     "🛒 Venta DSD",   self._handle_dsd),
             ("download_eiap_btn",    "📈 Venta EIAP",  self._handle_eiap),
         )
-        for posicion, (atributo, texto, comando) in enumerate(botones):
-            boton = self._boton(sueltas, texto, comando, estilo="contorno", alto=32, radio=8,
+        for atributo, texto, comando in botones:
+            boton = self._boton(derecha, texto, comando, estilo="contorno", alto=32, radio=8,
                                 margen=24, fuente=(FUENTE, 9, "bold"))
-            boton.grid(row=posicion // 2, column=posicion % 2, sticky="ew",
-                       padx=(0, px(6)) if posicion % 2 == 0 else (0, 0),
-                       pady=(0, px(6)) if posicion < 2 else (0, 0))
+            boton.pack(fill="x", pady=(0, px(6)))
             setattr(self, atributo, boton)
 
         self.paralelo_chk = Interruptor(
@@ -820,9 +835,9 @@ class ValidacionFacturaGUI:
         tk.Label(derecha, text="Usa las ventanas de SAP que ya tengas abiertas.", font=(FUENTE, 8),
                  fg=Paleta.suave, bg=Paleta.tarjeta, anchor="w").pack(anchor="w")
 
-        n = sum(len(transacciones) for transacciones in CORRIDAS_DESCARGA.values())
-        self.download_btn = self._boton(interior, f"⬇️ Descargar todo ({n} transacciones)", self._handle_todos)
-        self.download_btn.pack(fill="x", pady=(px(12), 0))
+        self.corrida_btn = self._boton(derecha, "🚀 Corrida completa", self._handle_corrida_completa,
+                                       color=Paleta.riel)
+        self.corrida_btn.pack(side=tk.BOTTOM, fill="x")
         return marco
 
     def _build_tarjeta_consolidacion(self, parent):
@@ -931,10 +946,6 @@ class ValidacionFacturaGUI:
             self._pintar_punto(Paleta.rojo)
         self._refrescar_pasos()
         self.root.update_idletasks()
-
-    def estado_paso(self, paso):
-        """State of one step as stored ('pendiente', 'en_curso', 'listo', 'parcial' or 'error')."""
-        return self._estado_paso[paso]
 
     def reiniciar_pasos(self):
         """Every step back to 'pendiente' and the bar empty: a new period starts a new process."""
@@ -1066,7 +1077,7 @@ class ValidacionFacturaGUI:
             return "(fecha inválida)"
 
     def _preview_nombre_2da(self, clave):
-        """File of a 2nd-run transaction ('vbrp', 'fbl5n'...), named with the GUI dates."""
+        """File of a 2nd-run transaction ('vbrp', 'kna1'...), named with the GUI dates."""
         try:
             if self.mode_var.get() == "single":
                 return nombre_archivo_dia_2da(clave, self.date_single_var.get().strip())
@@ -1112,11 +1123,27 @@ class ValidacionFacturaGUI:
             + [("Venta DSD", self._preview_nombre_dsd()), ("Venta EIAP", self._preview_nombre_eiap())]
         )
 
+    @staticmethod
+    def _texto_archivos(lineas):
+        """The lines of `_lineas_archivos`, names aligned in a column."""
+        ancho = max(len(nombre) for nombre, _ in lineas)
+        return "\n".join(f"{nombre:<{ancho}}  {archivo}" for nombre, archivo in lineas)
+
+    def _lineas_con_fechas_largas(self, modo):
+        """`_lineas_archivos()` with the LONGEST names of period mode `modo` (two-digit days), whatever the
+        entries say now. Only the four period variables are swapped for fixed stand-ins (nothing is set, so no
+        trace fires) and they are always put back."""
+        reales = self.mode_var, self.date_single_var, self.date_from_var, self.date_to_var
+        self.mode_var, self.date_single_var = _Fijo(modo), _Fijo(self.FECHA_LARGA_DESDE)
+        self.date_from_var, self.date_to_var = _Fijo(self.FECHA_LARGA_DESDE), _Fijo(self.FECHA_LARGA_HASTA)
+        try:
+            return self._lineas_archivos()
+        finally:
+            self.mode_var, self.date_single_var, self.date_from_var, self.date_to_var = reales
+
     def _update_filename_preview(self):
         """The files of the main download, names aligned in a column."""
-        lineas = self._lineas_archivos()
-        ancho = max(len(nombre) for nombre, _ in lineas)
-        self.filename_var.set("\n".join(f"{nombre:<{ancho}}  {archivo}" for nombre, archivo in lineas))
+        self.filename_var.set(self._texto_archivos(self._lineas_archivos()))
 
     # ------------------------------------------------------------------
     # Period (rail)
@@ -1291,7 +1318,7 @@ class ValidacionFacturaGUI:
         return tuple(
             (boton, boton.color) for boton in (
                 self.download_gallo_btn, self.download_monivoi_btn, self.download_dsd_btn,
-                self.download_eiap_btn, self.download_btn, self.consolidar_btn,
+                self.download_eiap_btn, self.download_btn, self.consolidar_btn, self.corrida_btn,
             )
         )
 
@@ -1364,6 +1391,9 @@ class ValidacionFacturaGUI:
 
     def _handle_consolidar(self):
         self._disparar(self.on_consolidar, "gallo")
+
+    def _handle_corrida_completa(self):
+        self._disparar(self.on_corrida_completa, "gallo")
 
 
 def main():

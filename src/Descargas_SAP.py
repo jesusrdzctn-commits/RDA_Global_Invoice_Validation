@@ -3,13 +3,13 @@ Validación Factura Global — SAP downloads (SAP GUI scripting)
 
 Gallo (FAGLL03), Monivoi (ZLMXCOM_TRN_MONINVOI), VBRL (ZSE16), FB03 (document list) and
 Venta EIAP and Venta DSD (two FAGLL03 queries, each with the accounts and classes of ITS sale); after the consolidation, the 2nd run: VBRP, VBRK,
-VBRL (2nd run), KNVP, BKPF (ZSE16), FBL5N (customer search help) and Monivoi (2nd run). Every download
+VBRL (2nd run), KNVP, BKPF, KNA1 (ZSE16) and Monivoi (2nd run). Every download
 follows its VBS recording; the extra steps are guards that stop the run instead of exporting wrong data.
 
     SAP, Portapapeles, Excel, Archivos      helpers shared by every download
     Paralelo                                several SAP windows at once (the P&L way)
-    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03, FBL5N, Monivoi2, TablaZSE16 → VBRP, VBRK,
-    VBRL2, KNVP, BKPF
+    Descarga → Gallo, Monivoi; DescargaConLista → VBRL, FB03, Monivoi2, TablaZSE16 → VBRP, VBRK,
+    VBRL2, KNVP, BKPF, KNA1
     Gallo_FAGLL03(), Monivoi_ZLMXCOM()...   the entry points the controller calls
 """
 
@@ -21,7 +21,6 @@ import re
 import threading
 import time
 import traceback
-import unicodedata
 from ctypes import wintypes
 from datetime import datetime
 
@@ -46,6 +45,8 @@ from utils import (
     CLASES_EIAP,
     CUENTAS_DSD,
     CLASES_DSD,
+    normalizar_encabezado,
+    quitar_acentos,
 )
 
 MAX_VENTANAS_SAP = 4                                           # corporate limit of SAP windows per user
@@ -64,7 +65,7 @@ class ExportacionTruncadaError(RuntimeError):
 class DescargaPorRevisarError(RuntimeError):
     """The user must review this download (the summary shows the message): SAP exported but something
     failed afterwards (the message says which file was kept), or SAP answered in a way that leaves no
-    file to save (FBL5N with a single hit)."""
+    file to save."""
 
 
 # ======================================================================
@@ -647,8 +648,10 @@ class Archivos:
         return os.path.join(perfil, "Documents", "Validacion Factura Global", "src", "Input")
 
     @staticmethod
-    def xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True):
-        """SAP only exports .xlsx; every download ends up as a utf-8-sig .csv (Excel shows the accents)."""
+    def xlsx_a_csv(ruta_xlsx, ruta_csv, eliminar_xlsx=True, transformar=None):
+        """SAP only exports .xlsx; every download ends up as a utf-8-sig .csv (Excel shows the accents).
+        `transformar(df) -> df` (optional) cleans the frame right before it is written (KNA1: customer
+        numbers without SAP's zeros); the row-limit check runs first, on SAP's own data."""
         df = pd.read_excel(ruta_xlsx, dtype=str, engine="openpyxl")
         if len(df) >= Archivos.MAX_FILAS:
             filas = len(df)
@@ -660,6 +663,8 @@ class Archivos:
                 "pudo quedar INCOMPLETO y no se usó. Descarga un periodo más corto (menos "
                 "días) y vuelve a intentar."
             )
+        if transformar is not None:
+            df = transformar(df)
         df.to_csv(ruta_csv, index=False, encoding="utf-8-sig")
         if eliminar_xlsx:
             Excel.borrar_xlsx(ruta_xlsx)
@@ -671,7 +676,7 @@ class Archivos:
             carpeta = os.path.dirname(ruta_archivo)
             if carpeta:
                 os.makedirs(carpeta, exist_ok=True)
-            # .xls / .txt: the TEXT files SAP writes for a classic list (FBL5N), not real workbooks.
+            # .xls / .txt: text placeholders as well (an older download kept that extension), not real workbooks.
             if ruta_archivo.lower().endswith((".csv", ".txt", ".xls")):
                 pd.DataFrame({"Sin datos": []}).to_csv(ruta_archivo, index=False, encoding="utf-8-sig")
             else:
@@ -709,14 +714,6 @@ class Archivos:
         """Big exports (Gallo, Monivoi) are written in bursts: size unchanged for 3 s; late → RuntimeError."""
         if not Archivos.esperar_nuevo(ruta_xlsx, desde, timeout=Archivos.ESPERA_EXPORTACION, estable=3.0):
             raise RuntimeError(f"SAP no terminó de escribir el archivo exportado: {ruta_xlsx}")
-
-    @staticmethod
-    def normalizar_encabezado(texto):
-        """A header compared without accents, dots, spaces or case ('Solic.' == 'solic'): the same rule
-        as Consolidacion.Comun.normalizar_encabezado, which reads these files afterwards."""
-        sin_acentos = unicodedata.normalize("NFKD", str(texto))
-        sin_acentos = "".join(c for c in sin_acentos if not unicodedata.combining(c))
-        return "".join(c for c in sin_acentos.lower() if c.isalnum())
 
     @staticmethod
     def normalizar_documentos(documentos, etiqueta):
@@ -1409,8 +1406,7 @@ class ZSE16:
     @staticmethod
     def sin_acentos(texto):
         """'Validación ' → 'VALIDACION' (layout names compared without accents, case or edge spaces)."""
-        descompuesto = unicodedata.normalize("NFKD", str(texto))
-        return "".join(c for c in descompuesto if not unicodedata.combining(c)).strip().upper()
+        return quitar_acentos(texto).strip().upper()
 
     @staticmethod
     def elegir_layout_en_grid(session, id_grid, nombre):
@@ -1510,7 +1506,7 @@ class ZSE16:
 
 
 class DescargaConLista(Descarga):
-    """VBRL and FB03: ONE query for a document list pasted via the clipboard, saved as .csv. Converted to a
+    """VBRL, FB03 and the ZSE16 tables: ONE query for a document list pasted via the clipboard, saved as .csv. Converted to a
     '.part' that replaces the final file only once checked; if it fails after SAP exported, the CSV is
     kept as *_REVISAR.csv (not read by the consolidation) and DescargaPorRevisarError says why."""
     ETIQUETA = ""                  # 'VBRL' / 'FB03'
@@ -1534,6 +1530,11 @@ class DescargaConLista(Descarga):
         if self.ext != ".csv":
             raise ValueError(f"{self.ETIQUETA} se guarda como .csv (se recibió '{self.archivo}').")
         self.lista = Archivos.normalizar_documentos(self.documentos, self.ETIQUETA)
+
+    def transformar(self, df):
+        """Hook of `guardar`: the frame read from SAP's .xlsx, cleaned right before it is written as .csv
+        (identity by default; KNA1 strips the zeros of its customer numbers)."""
+        return df
 
     def borrar_restos(self):
         """Files of an earlier run must not pass for this one's (an old .xlsx makes SAP ask to overwrite)."""
@@ -1600,7 +1601,7 @@ class DescargaConLista(Descarga):
                 f"SAP no dejó el archivo {self.nombre_xlsx} en {self.carpeta}.{sin_carpeta}"
             )
         try:
-            Archivos.xlsx_a_csv(self.ruta_xlsx, self.ruta_parcial)
+            Archivos.xlsx_a_csv(self.ruta_xlsx, self.ruta_parcial, transformar=self.transformar)
         except ExportacionTruncadaError:
             raise
         except Exception as e:
@@ -1828,9 +1829,9 @@ class FB03(DescargaConLista):
 
 
 # ======================================================================
-# 2nd run (after the consolidation): VBRP, VBRK, VBRL 2nd run, KNVP, BKPF (ZSE16) and FBL5N.
+# 2nd run (after the consolidation): VBRP, VBRK, VBRL 2nd run, KNVP, BKPF and KNA1 (ZSE16).
 # Each pasos() follows its recording in Scripts (raw)/; the lists come from the #N/A rows of
-# 'TD.Diferencias_Referencias' (Consolidacion.EtapaListasSegundaCorrida) or, for FBL5N and KNVP,
+# 'TD.Diferencias_Referencias' (Consolidacion.EtapaListasSegundaCorrida) or, for KNA1 and KNVP,
 # from the 'Solic.' column of this run's VBRK.
 # ======================================================================
 class TablaZSE16(DescargaConLista):
@@ -1937,7 +1938,7 @@ class VBRP(TablaZSE16):
 
 
 class VBRK(TablaZSE16):
-    """ZSE16 on table VBRK for the same references, as VBRK.vbs does. Its 'Solic.' column feeds FBL5N and
+    """ZSE16 on table VBRK for the same references, as VBRK.vbs does. Its 'Solic.' column feeds KNA1 and
     KNVP, so the file is only accepted with that column."""
     NOMBRE = "VBRK_ZSE16"
     MARCA = "ZSE16/VBRK"
@@ -1961,11 +1962,11 @@ class VBRK(TablaZSE16):
 
     @classmethod
     def revisar_columnas(cls, df):
-        """FBL5N and KNVP need the 'Solic.' column: a layout without it is not this run's VBRK."""
-        buscadas = {Archivos.normalizar_encabezado(c) for c in cls.COL_SOLICITANTE_CANDIDATAS}
-        if not any(Archivos.normalizar_encabezado(c) in buscadas for c in df.columns):
+        """KNA1 and KNVP need the 'Solic.' column: a layout without it is not this run's VBRK."""
+        buscadas = {normalizar_encabezado(c) for c in cls.COL_SOLICITANTE_CANDIDATAS}
+        if not any(normalizar_encabezado(c) in buscadas for c in df.columns):
             columnas = ", ".join(f"{chr(65 + i)}='{c}'" for i, c in enumerate(df.columns[:12]))
-            raise RuntimeError(f"el archivo de VBRK no trae la columna 'Solic.' (la lista de FBL5N y KNVP); "
+            raise RuntimeError(f"el archivo de VBRK no trae la columna 'Solic.' (la lista de KNA1 y KNVP); "
                                f"¿el layout es el de la grabación? Columnas: {columnas}")
 
 
@@ -2083,240 +2084,75 @@ class BKPF(TablaZSE16):
         return self.consultar_y_exportar()
 
 
-class FBL5N(DescargaConLista):
-    """FBL5N.vbs: the report is NOT executed. F4 on the customer field opens its search help; the 'Solic.'
-    customers of this run's VBRK are pasted into the multiple selection of line 8 of tab TAB006 (the one
-    carrying the RFC) and the hit list is saved with 'Save list in file'. SAP writes that TEXT list
-    itself: kept as is, saved under a temporary name and moved over the final file only once checked
-    (*_REVISAR otherwise)."""
-    NOMBRE = "FBL5N_Deudores"
-    MARCA = "FBL5N"
-    ETIQUETA = "FBL5N"
-    ARCHIVO = "FBL5N.XLS"
+class KNA1(TablaZSE16):
+    """ZSE16 on table KNA1 (customer master) for the 'Solic.' customers of this run's VBRK, as KNA1.vbs does
+    (recorded 7-nov-2026): the customers are pasted into the selection field of KUNNR and the layout 'VAL' is
+    picked BY NAME. It replaces the FBL5N search help: the same three columns ('Cliente', 'Nombre 1',
+    'Nº ident.fis.1') but as a real table (.csv, with the checks and *_REVISAR.csv of DescargaConLista).
+    SAP pads 'Cliente' with zeros ('0002040668'); the saved file does not ('2040668', see `transformar`)."""
+    NOMBRE = "KNA1_ZSE16"
+    MARCA = "ZSE16/KNA1"
+    ETIQUETA = "KNA1"
+    TABLA = "KNA1"
+    ARCHIVO = "KNA1.csv"
     UNIDAD = ("cliente(s)", "pedido(s)")
-    EXTENSIONES = (".xls", ".txt")
-    CAMPO_DEUDOR = "wnd[0]/usr/ctxtDD_KUNNR-LOW"
-    TABS = "wnd[1]/usr/tabsG_SELONETABSTRIP"
-    PESTANA = TABS + "/tabpTAB006"
-    SUBPANTALLA = PESTANA + "/ssubSUBSCR_PRESEL:SAPLSDH4:0220/sub:SAPLSDH4:0220"
-    BTN_MULTIPLE = SUBPANTALLA + "/btnG_SELFLD_TAB-MORE[8,56]"
-    MAX_ACIERTOS = (SUBPANTALLA + "/txtDDSHF4CTRL-MAXRECORDS", "wnd[1]/usr/txtDDSHF4CTRL-MAXRECORDS")
-    CELDA_LISTA = "wnd[1]/usr/lbl[1,6]"
-    BTN_SALIR = "wnd[0]/tbar[0]/btn[15]"
-    RADIO_FORMATO = ("wnd[2]/usr/subSUBSCREEN_STEPLOOP:SAPLSPO5:0150/sub:SAPLSPO5:0150/"
-                     "radSPOPLI-SELFLAG[1,0]")
-    MENSAJES_SIN_DATOS = (
-        "no values", "no existen valores", "no hay valores", "ningún valor", "ningun valor",
-        "no se encontraron valores", "no se han encontrado valores",
+    CAMPO = "KUNNR"
+    LAYOUT = "VAL"                 # given by the user (7-nov-2026); the recording clicks row 13
+    COL_CLIENTE_CANDIDATAS = ("Cliente",)
+    # The three columns the 'Cliente' sheet needs (= Consolidacion.EtapaHojasSegundaCorrida.HOJAS['kna1']).
+    COLUMNAS_REQUERIDAS = (
+        ("Cliente", COL_CLIENTE_CANDIDATAS),
+        ("Nombre 1", ("Nombre 1",)),
+        ("Nº ident.fis.1", ("Nº ident.fis.1", "N° ident.fis.1", "Ident.fis.1", "RFC")),
     )
-
-    def __init__(self, documentos, carpeta, archivo, session, info=None):
-        super().__init__(documentos, carpeta, archivo or self.ARCHIVO, session)
-        self.info = info if info is not None else {}
-        # SAP writes a temporary name; the final file is only replaced once the new one is checked.
-        # (self.ext is lower-cased for the checks; the names keep the extension as given.)
-        extension = os.path.splitext(self.archivo)[1]
-        self.nombre_xlsx = f"{self.base}_descarga{extension}"
-        self.ruta_xlsx = os.path.join(self.carpeta, self.nombre_xlsx)
-        self.ruta_parcial = self.ruta_xlsx
-        self.ruta_revisar = os.path.join(self.carpeta, f"{self.base}_REVISAR{extension}")
-
-    def preparar(self):
-        if os.path.basename(self.archivo) != self.archivo:
-            raise ValueError(f"El nombre del archivo no debe incluir carpetas: {self.archivo!r}")
-        if self.ext not in self.EXTENSIONES:
-            raise ValueError(f"FBL5N guarda la lista de SAP tal cual ({' o '.join(self.EXTENSIONES)}); "
-                             f"se recibió '{self.archivo}'.")
-        self.lista = Archivos.normalizar_documentos(self.documentos, self.ETIQUETA)
 
     def pasos(self):
         self.preparar()
         os.makedirs(self.carpeta, exist_ok=True)
         self.borrar_restos()
-        s = self.conectar()
-        SAP.cerrar_popups(s)
-        s.findById("wnd[0]/tbar[0]/okcd").text = "/nFBL5N"
-        s.findById("wnd[0]").sendVKey(0)
-        if not SAP.esperar(s, self.CAMPO_DEUDOR, 10):
-            raise RuntimeError(f"FBL5N no mostró el campo de cuenta de deudor. SAP dice: "
-                               f"'{SAP.aviso(s) or '(sin mensaje)'}'.")
-        s.findById(self.CAMPO_DEUDOR).setFocus()                      # the recording relies on the default cursor
-        s.findById("wnd[0]").sendVKey(4)
-        if not SAP.esperar(s, self.TABS, 10):
-            raise RuntimeError("SAP no abrió la ayuda de búsqueda de deudores (F4) de FBL5N.")
-        if not SAP.existe(s, self.PESTANA):
-            raise RuntimeError("La ayuda de búsqueda de FBL5N no tiene la pestaña TAB006, la que trae el "
-                               "RFC de los clientes (grabación FBL5N.vbs).")
-        s.findById(self.PESTANA).select()                             # SAP remembers the last tab used
-        self.ampliar_aciertos()
-        if not SAP.existe(s, self.BTN_MULTIPLE):
-            raise RuntimeError("La ayuda de búsqueda de FBL5N no tiene el botón de selección múltiple "
-                               "del renglón 8 de su pestaña TAB006 (grabación FBL5N.vbs).")
-
+        s = self.abrir_tabla()
+        ZSE16.dejar_solo_campo(s, self.CAMPO)
         print(f"[{self.ETIQUETA}] {len(self.lista):,} cliente(s) único(s) a consultar.")
-        s.findById(self.BTN_MULTIPLE).press()
-        if not SAP.esperar(s, "wnd[2]/tbar[0]/btn[24]", 10):
-            raise RuntimeError("SAP no abrió la selección múltiple de la ayuda de búsqueda de FBL5N.")
-        with Portapapeles.exclusivo():
-            Portapapeles.copiar_y_verificar("\r\n".join(self.lista))
-            s.findById("wnd[2]/tbar[0]/btn[24]").press()
-            time.sleep(1 + len(self.lista) / 5000)
-        s.findById("wnd[2]/tbar[0]/btn[8]").press()
-        SAP.esperar_libre(s)
-        if not SAP.esperar_cierre(s, "wnd[2]"):
-            raise RuntimeError("La selección múltiple de FBL5N sigue abierta después de copiar.")
-
-        Paralelo.marca(f"{self.MARCA}: búsqueda enviada a SAP")
-        s.findById("wnd[1]/tbar[0]/btn[0]").press()
-        SAP.esperar_libre(s, timeout=_ESPERA_CONSULTA)
-        Paralelo.marca(f"{self.MARCA}: SAP respondió la búsqueda")
-        if self.sin_aciertos():
-            return False
-
-        if SAP.existe(s, self.CELDA_LISTA):
-            s.findById(self.CELDA_LISTA).setFocus()
-            s.findById(self.CELDA_LISTA).caretPosition = 0
-        s.findById("wnd[1]").sendVKey(14)
-        if not SAP.esperar(s, self.RADIO_FORMATO, 10):
-            raise RuntimeError("SAP no mostró las opciones de formato para guardar la lista de FBL5N.")
-        s.findById(self.RADIO_FORMATO).select()
-        s.findById(self.RADIO_FORMATO).setFocus()
-        s.findById("wnd[2]/tbar[0]/btn[0]").press()
-        if not SAP.esperar(s, "wnd[2]/usr/ctxtDY_FILENAME", 10):
-            raise RuntimeError("SAP no abrió el diálogo para guardar la lista de FBL5N.")
-        desde, self.con_carpeta = self.dialogo_guardar("wnd[2]/tbar[0]/btn[0]", ventana="wnd[2]")
-        self.exportado = Archivos.esperar_nuevo(self.ruta_xlsx, desde)
-        if self.exportado:
-            Paralelo.marca(f"{self.MARCA}: archivo exportado")
-        self.cerrar_ayuda()
-        return self.guardar()
-
-    def ampliar_aciertos(self):
-        """Raise the search help's 'maximum number of hits' (usually 500) to its widest value, so the
-        hit list is not cut; without that field, SAP's own limit applies (reported)."""
-        s = self.session
-        for campo in self.MAX_ACIERTOS:
-            if SAP.existe(s, campo):
-                componente = s.findById(campo)
-                try:
-                    largo = int(componente.MaxLength)
-                except Exception:
-                    largo = 5
-                componente.text = "9" * max(1, min(largo, 9))
-                return
-        print(f"[{self.ETIQUETA}] ⚠️ No encontré el campo 'Número máximo de aciertos' de la ayuda de "
-              "búsqueda: aplica el límite que tenga SAP.")
-        self.info["aviso"] = "no se pudo ampliar el número máximo de aciertos de la ayuda de búsqueda"
-
-    def sin_aciertos(self):
-        """Still on the search-help tabs after starting the search: SAP found no customer
-        (placeholder written, True) or said something else (RuntimeError with its text)."""
-        s = self.session
-        if not SAP.existe(s, self.TABS):
-            if not SAP.existe(s, "wnd[1]"):
-                # Standard F4: with exactly ONE hit SAP copies it into the field and skips the list.
-                try:
-                    copiado = str(s.findById(self.CAMPO_DEUDOR).text).strip()
-                except Exception:
-                    copiado = ""
-                if copiado:
-                    raise DescargaPorRevisarError(
-                        f"SAP encontró un solo cliente ({copiado}) y lo pasó directo al campo, sin "
-                        "mostrar la lista (así funciona el F4 con un único resultado): no hay lista "
-                        "que guardar. Consúltalo a mano en FBL5N.")
-                raise RuntimeError("La ayuda de búsqueda de FBL5N se cerró sin mostrar la lista de clientes.")
-            return False
-        textos = [SAP.aviso(s)]
-        for barra in ("wnd[1]/sbar", "wnd[2]/usr/txtMESSTXT1"):
-            try:
-                textos.append(str(s.findById(barra).Text).strip())
-            except Exception:
-                pass
-        mensaje = next((t for t in textos if t), "")
-        if any(m in mensaje.lower() for m in self.MENSAJES_SIN_DATOS):
-            print(f"[SIN DATOS] {self.ETIQUETA}: {mensaje}. Creando archivo vacío: {self.ruta}")
-            SAP.cerrar_popups(s)
-            Archivos.crear_sin_datos(self.ruta)
-            return True
-        raise RuntimeError(f"La ayuda de búsqueda de FBL5N no mostró la lista de clientes. SAP dice: "
-                           f"'{mensaje or '(sin mensaje)'}'. Si significa que no hay datos, agrega ese "
-                           f"texto a FBL5N.MENSAJES_SIN_DATOS.")
-
-    def cerrar_ayuda(self):
-        """Close the hit list, then Exit, as recorded. The file is already written: only reported."""
-        s = self.session
-        try:
-            if SAP.existe(s, "wnd[2]"):
-                raise RuntimeError("quedó abierto otro popup sobre la lista de clientes")
-            s.findById("wnd[1]").close()
-            if not SAP.esperar_cierre(s):
-                raise RuntimeError("la lista de clientes sigue abierta")
-            s.findById(self.BTN_SALIR).press()
-            self.en_menu = True
-        except Exception as e:
-            print(f"[{self.ETIQUETA}] ⚠️ No pude regresar al menú principal de SAP "
-                  f"(el archivo ya se guardó): {e}")
+        self.pegar_lista("wnd[0]/usr/btn%_I1_%_APP_%-VALU_PUSH")
+        return self.consultar_y_exportar(self.revisar_columnas)
 
     @staticmethod
-    def leer_texto(ruta):
-        """The text of SAP's file whatever its encoding (UTF-16 / UTF-8 with or without BOM, ANSI)."""
-        with open(ruta, "rb") as f:
-            datos = f.read()
-        if datos.startswith((b"\xff\xfe", b"\xfe\xff")):
-            return datos.decode("utf-16")
-        if datos.startswith(b"\xef\xbb\xbf"):
-            return datos[3:].decode("utf-8", errors="replace")
-        if datos[:2000].count(b"\x00") > 0:
-            return datos.decode("utf-16-le", errors="replace")
-        try:
-            return datos.decode("utf-8")
-        except UnicodeDecodeError:
-            return datos.decode("cp1252", errors="replace")
+    def quitar_ceros(valor):
+        """A customer number without SAP's left padding: '0002040668' → '2040668'. Only a value made of
+        digits is touched (an alphanumeric customer keeps its characters, trimmed); all zeros → '0';
+        non-text cells (an empty one is NaN) come back unchanged."""
+        if not isinstance(valor, str):
+            return valor
+        texto = valor.strip()
+        if re.fullmatch(r"[0-9]+", texto):
+            return texto.lstrip("0") or "0"
+        return texto
 
-    @staticmethod
-    def contar_presentes(texto, valores):
-        """How many of `valores` appear in `texto` as whole tokens (numbers compared without leading
-        zeros: SAP lists customers without them)."""
-        tokens = set(re.findall(r"[0-9A-Za-z]+", texto.upper()))
-        sin_ceros = {t.lstrip("0") or "0" for t in tokens if t.isdigit()}
-        presentes = 0
-        for valor in valores:
-            v = str(valor).strip().upper()
-            if v in tokens or (v.isdigit() and (v.lstrip("0") or "0") in sin_ceros):
-                presentes += 1
-        return presentes
+    @classmethod
+    def columna(cls, df, candidatas):
+        """Real name of the column of `df` whose header is one of `candidatas` (spelling variants), or None."""
+        buscadas = {normalizar_encabezado(c) for c in candidatas}
+        return next((c for c in df.columns if normalizar_encabezado(c) in buscadas), None)
 
-    def guardar(self, revisar=None):
-        """The file must exist, be complete and contain at least one of the customers asked for;
-        only then does it replace the final file (else it is kept as *_REVISAR)."""
-        if not os.path.exists(self.ruta_xlsx):
-            sin_carpeta = ("" if self.con_carpeta else " El diálogo de guardar no tenía el campo de carpeta: "
-                                                       "SAP lo guardó en su carpeta por defecto.")
-            raise DescargaPorRevisarError(f"SAP no dejó el archivo {self.nombre_xlsx} en {self.carpeta}.{sin_carpeta}")
-        try:
-            if not self.exportado:
-                raise RuntimeError("SAP no terminó de escribir el archivo a tiempo: puede estar incompleto.")
-            presentes = self.contar_presentes(self.leer_texto(self.ruta_xlsx), self.lista)
-            print(f"[{self.ETIQUETA}] {presentes:,} de {len(self.lista):,} cliente(s) pedidos aparecen en el archivo.")
-            if not presentes:
-                raise RuntimeError("ninguno de los clientes pedidos aparece en el archivo que guardó SAP.")
-            self.info["presentes"] = (presentes, len(self.lista))
-        except Exception as e:
-            guardado = self.ruta_revisar
-            try:
-                os.replace(self.ruta_xlsx, guardado)
-            except OSError as e2:
-                self.conservar_parcial, guardado = True, self.ruta_xlsx
-                print(f"[{self.ETIQUETA}] ⚠️ No pude renombrarlo a {os.path.basename(self.ruta_revisar)}: {e2}")
-            print(f"[{self.ETIQUETA}] ⚠️ Guardado para revisar: {guardado}")
-            raise DescargaPorRevisarError(f"guardé {os.path.basename(guardado)} para revisarlo: {e}") from e
-        try:
-            os.replace(self.ruta_xlsx, self.ruta)
-        except OSError as e:
-            raise RuntimeError(f"No pude guardar {self.ruta} (¿está abierto en Excel?). "
-                               "Ciérralo y vuelve a descargar.") from e
-        print(f"[{self.ETIQUETA}] Archivo descargado correctamente: {self.ruta}")
-        return True
+    @classmethod
+    def revisar_columnas(cls, df):
+        """The 'Cliente' sheet reads the three columns by name: a layout without one of them is not the
+        layout of the recording."""
+        faltan = [nombre for nombre, candidatas in cls.COLUMNAS_REQUERIDAS
+                  if cls.columna(df, candidatas) is None]
+        if faltan:
+            columnas = ", ".join(f"{chr(65 + i)}='{c}'" for i, c in enumerate(df.columns[:12]))
+            raise RuntimeError(f"el archivo de KNA1 no trae la(s) columna(s) {', '.join(faltan)}; "
+                               f"¿el layout es el de la grabación? Columnas: {columnas}")
+
+    def transformar(self, df):
+        """Hook of DescargaConLista.guardar: strips the zeros of 'Cliente' BEFORE the .csv is written, so the
+        check (`validar_csv`) and the consolidation both see '2040668'. Without that column the frame goes
+        on untouched: `revisar_columnas` is the one that stops the run and keeps the file for review."""
+        columna = self.columna(df, self.COL_CLIENTE_CANDIDATAS)
+        if columna is not None:
+            df[columna] = df[columna].map(self.quitar_ceros)
+        return df
 
 
 class Monivoi2(DescargaConLista):
@@ -2446,9 +2282,9 @@ class Monivoi2(DescargaConLista):
     def revisar_columnas(cls, df):
         """'Diferencias' looks the UUID up by 'Factura' (the invoice list): an export without both columns is
         not this report's."""
-        normalizadas = {Archivos.normalizar_encabezado(c) for c in df.columns}
+        normalizadas = {normalizar_encabezado(c) for c in df.columns}
         faltan = [candidatas[0] for candidatas in (cls.COL_FACTURA_CANDIDATAS, cls.COL_UUID_CANDIDATAS)
-                  if not any(Archivos.normalizar_encabezado(c) in normalizadas for c in candidatas)]
+                  if not any(normalizar_encabezado(c) in normalizadas for c in candidatas)]
         if faltan:
             columnas = ", ".join(f"'{c}'" for c in list(df.columns)[:15])
             raise RuntimeError(f"el archivo de la Monivoi (2a corrida) no trae la(s) columna(s) "
@@ -2521,8 +2357,8 @@ def FB03_Documentos(documentos, DateFrom, DateTo, FolderPath=None, FileName=None
     return FB03(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session).ejecutar()
 
 
-# 2nd run. `info` (optional dict) receives the layout the run picked by name ('layout') and
-# the FBL5N checks ('presentes', 'aviso'), for the summary.
+# 2nd run. `info` (optional dict) receives what the run chose and the summary shows (the layout it picked
+# by name: 'layout').
 def VBRP_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
     """Table VBRP (ZSE16) for the references in `documentos` → FileName (.csv, default 'VBRP.csv')."""
     return VBRP(documentos, FolderPath, FileName, session, info).ejecutar()
@@ -2556,9 +2392,10 @@ def Monivoi2_ZLMXCOM(documentos, DateFrom, DateTo, FolderPath=None, FileName=Non
     return Monivoi2(documentos, DateFrom, DateTo, FolderPath, FileName, sociedad, session, info).ejecutar()
 
 
-def FBL5N_Deudores(documentos, FolderPath=None, FileName=None, session=None, info=None):
-    """FBL5N customer search help for the customers in `documentos` → FileName (SAP's own text list)."""
-    return FBL5N(documentos, FolderPath, FileName, session, info).ejecutar()
+def KNA1_ZSE16(documentos, FolderPath=None, FileName=None, session=None, info=None):
+    """Table KNA1 (ZSE16) for the customers in `documentos` → FileName (.csv, default 'KNA1.csv'; the
+    'Cliente' column without SAP's left zeros)."""
+    return KNA1(documentos, FolderPath, FileName, session, info).ejecutar()
 
 
 # ======================================================================

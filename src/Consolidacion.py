@@ -4,15 +4,15 @@ Monivoi ZLMXCOM and, optionally, VBRL ZSE16) → ONE Excel workbook. Tabs, in or
     Validación_doc*
     (* only with a VBRL file; ** only with a VBRL and an FB03 file, which also add the 'Notas de
     crédito' and 'PEP Vouchers' tables to 'TD.Diferencias_Referencias' and to 'Validación_doc')
-    2nd consolidation, after those: Diferencias, Agrupadores, VBRK, Cliente, VBRP, KNVP, VBRL (2), BKPF,
-    Monitor (2)
+    2nd consolidation, after those: Diferencias, Agrupadores, VBRK, Cliente (KNA1), VBRP, KNVP, VBRL (2),
+    BKPF, Monitor (2)
 
 One class per stage, each with its constants, its computation (preparar → result dict) and
 the sheet it writes (escribir): Comun (shared helpers) → EtapaGallo → EtapaTD →
 EtapaDocumentosFB03 → EtapaVentas → EtapaMonivoi → EtapaCruceTDMTD → EtapaVBRL →
 EtapaTDReferencias → EtapaFB → EtapaTDNotasPEP → EtapaValidacionDoc (the #N/A rows of those tables,
 side by side) → EtapaListasSegundaCorrida (what the 2nd run of downloads pastes into SAP, from the
-same #N/A rows) → EtapaCliente / EtapaHojasSegundaCorrida / CatalogoAgrupadores / EtapaMonitor2 →
+same #N/A rows) → EtapaHojasSegundaCorrida / CatalogoAgrupadores / EtapaMonitor2 →
 EtapaDiferencias (the 2nd consolidation) → Consolidador (the orchestrator); a class only uses the ones
 above it.
 consolidar_gallo_monivoi() is what the controller calls; calcular_listas_segunda_corrida() gives
@@ -24,7 +24,6 @@ workbook). No SAP and no tkinter here.
 
 import os
 import re
-import unicodedata
 from datetime import datetime
 from functools import partial
 
@@ -35,7 +34,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from utils import CUENTAS_DSD, CLASES_DSD, CUENTAS_EIAP, CLASES_EIAP
+from utils import CUENTAS_DSD, CLASES_DSD, CUENTAS_EIAP, CLASES_EIAP, normalizar_encabezado
 
 
 # === Shared helpers ===
@@ -92,21 +91,12 @@ class Comun:
         return list(vistos)
 
     @staticmethod
-    def normalizar_encabezado(texto):
-        """Header normalized to recognize SPELLING VARIANTS of the same field (accents, dots, spaces,
-        case): 'Fe.Contabilización' == 'fecha contabilizacion'. Never used to guess another column.
-        """
-        sin_acentos = unicodedata.normalize("NFKD", str(texto))
-        sin_acentos = "".join(c for c in sin_acentos if not unicodedata.combining(c))
-        return "".join(c for c in sin_acentos.lower() if c.isalnum())
-
-    @staticmethod
     def col_por_candidatos(df, candidatos, descripcion, origen="Gallo"):
         """Real name of a column, accepting spelling variants of the same field; none found → ValueError
         listing the real columns (`origen` = file): stopping beats summing the wrong one."""
-        normalizadas = {Comun.normalizar_encabezado(c): c for c in df.columns}
+        normalizadas = {normalizar_encabezado(c): c for c in df.columns}
         for candidata in candidatos:
-            real = normalizadas.get(Comun.normalizar_encabezado(candidata))
+            real = normalizadas.get(normalizar_encabezado(candidata))
             if real is not None:
                 return real
         raise ValueError(
@@ -808,7 +798,6 @@ class EtapaDocumentosFB03:
 
     CLASES = frozenset(clase for clase, _ in EtapaTD.NOTAS["clases"])
 
-    _PREFIJOS = tuple(sorted(EtapaGallo.PREFIJOS_LETRAS_GLOBAL))
     DESCRIPCION_FILTRO = (
         f"Clase de documento {'/'.join(sorted(CLASES))} y Referencia Global"
     )
@@ -3086,7 +3075,7 @@ class EtapaListasSegundaCorrida:
 
     @classmethod
     def leer_solicitantes(cls, ruta_vbrk):
-        """Distinct 'Solic.' values of the VBRK CSV (what FBL5N and KNVP paste) → (valores, filas_leidas,
+        """Distinct 'Solic.' values of the VBRK CSV (what KNA1 and KNVP paste) → (valores, filas_leidas,
         nombre_columna); empty for the 'Sin datos' placeholder. FileNotFoundError: missing file;
         ValueError: missing column."""
         vbrk = Comun.leer_csv(ruta_vbrk)
@@ -3098,113 +3087,11 @@ class EtapaListasSegundaCorrida:
 
 
 # === Stage: the 2nd consolidation — the six 2nd-run downloads as sheets ===
-class EtapaCliente:
-    """FBL5N → 'Cliente' sheet. The file is SAP's text list, not a table (dash lines, margins, a header line
-    'Nº ident.fis.1' / 'Cliente' / 'Nombre 1' / 'NIF 3'): split on TAB (or '|'), separator lines dropped,
-    header found by NAME and columns taken from where THAT line puts them, so margins cannot shift them."""
-
-    # (sheet name, header matcher, required); order = sheet order (C..F).
-    CAMPOS = (
-        ("Nº ident.fis.1", lambda n: n.endswith("identfis1") or n == "rfc", True),
-        ("Cliente",        lambda n: n == "cliente",                       True),
-        ("Nombre 1",       lambda n: n in ("nombre1", "nombre"),           True),
-        ("NIF 3",          lambda n: n == "nif3",                          False),
-    )
-    _RE_SEPARADOR = re.compile(r"[\s\-=+|_*]*")
-    LINEAS_EN_ERROR = 4
-
-    @staticmethod
-    def leer_texto(ruta):
-        """The text of SAP's file whatever its encoding (UTF-16 / UTF-8 with or without BOM, ANSI)."""
-        if not os.path.exists(ruta):
-            raise FileNotFoundError(f"Archivo no encontrado: {ruta}")
-        with open(ruta, "rb") as f:
-            datos = f.read()
-        if datos.startswith((b"\xff\xfe", b"\xfe\xff")):
-            return datos.decode("utf-16")
-        if datos.startswith(b"\xef\xbb\xbf"):
-            return datos[3:].decode("utf-8", errors="replace")
-        if datos[:2000].count(b"\x00") > 0:
-            return datos.decode("utf-16-le", errors="replace")
-        try:
-            return datos.decode("utf-8")
-        except UnicodeDecodeError:
-            return datos.decode("cp1252", errors="replace")
-
-    @classmethod
-    def celdas(cls, texto):
-        """The text of the list as rows of trimmed cells (separator and blank lines dropped)."""
-        lineas = [linea for linea in texto.splitlines() if linea.strip()]
-        con_tab = sum("\t" in linea for linea in lineas)
-        con_barra = sum("|" in linea for linea in lineas)
-        if con_tab == 0 and con_barra == 0:
-            return [[linea.strip()] for linea in lineas
-                    if not cls._RE_SEPARADOR.fullmatch(linea)]
-        delimitador = "\t" if con_tab >= con_barra else "|"
-        return [
-            [celda.strip() for celda in linea.split(delimitador)]
-            for linea in lineas
-            if not cls._RE_SEPARADOR.fullmatch(linea)
-        ]
-
-    @classmethod
-    def leer(cls, ruta):
-        """Customers of the FBL5N file → {'filas': [(rfc, cliente, nombre, nif3)], 'sin_datos', 'avisos'};
-        `cliente` via EtapaFB.convertir_documento (same conversion as the lookups' other side).
-        ValueError: no header line with the required columns."""
-        texto = cls.leer_texto(ruta)
-        if texto.lstrip("﻿ \t\r\n").lower().startswith("sin datos"):
-            return {"filas": [], "sin_datos": True,
-                    "avisos": ["Cliente (FBL5N): el archivo vino sin datos; la pestaña quedó vacía."]}
-        filas = cls.celdas(texto)
-
-        posiciones = None
-        inicio = 0
-        for i, fila in enumerate(filas):
-            normalizadas = [Comun.normalizar_encabezado(c) for c in fila]
-            encontrados = {}
-            for nombre, coincide, _ in cls.CAMPOS:
-                for j, n in enumerate(normalizadas):
-                    if n and coincide(n) and j not in encontrados.values():
-                        encontrados[nombre] = j
-                        break
-            if all(nombre in encontrados for nombre, _, requerido in cls.CAMPOS if requerido):
-                posiciones, inicio = encontrados, i + 1
-                break
-        if posiciones is None:
-            vista = " / ".join(" | ".join(f)[:100] for f in filas[:cls.LINEAS_EN_ERROR])
-            raise ValueError(
-                f"No reconocí el archivo de FBL5N '{os.path.basename(ruta)}': busqué la línea de "
-                f"encabezados con 'Nº ident.fis.1', 'Cliente' y 'Nombre 1' y no está. "
-                f"Primeras líneas: {vista or '(archivo vacío)'}"
-            )
-
-        def celda(fila, nombre):
-            j = posiciones.get(nombre)
-            return fila[j] if j is not None and j < len(fila) else ""
-
-        encabezado_norm = {Comun.normalizar_encabezado(celda_h) for celda_h in filas[inicio - 1]}
-        datos = []
-        for fila in filas[inicio:]:
-            cliente = celda(fila, "Cliente")
-            if cliente == "":
-                continue
-            if {Comun.normalizar_encabezado(c) for c in fila} == encabezado_norm:
-                continue
-            datos.append((celda(fila, "Nº ident.fis.1"), EtapaFB.convertir_documento(cliente),
-                          celda(fila, "Nombre 1"), celda(fila, "NIF 3")))
-        avisos = []
-        if not datos:
-            avisos.append("Cliente (FBL5N): el archivo trae encabezados pero ningún cliente; "
-                          "la pestaña quedó vacía.")
-        return {"filas": datos, "sin_datos": False, "avisos": avisos}
-
-
 class EtapaHojasSegundaCorrida:
     """Six sheets the 'Diferencias' formulas read, laid out like the template: headers in row 1, data from
-    COLUMN C (A:B empty, as 'FB'): VBRK, Cliente (FBL5N: C RFC · D Cliente · E Nombre 1 · F NIF 3), VBRP,
-    KNVP, VBRL (2), BKPF. Columns found by NAME; the ones formulas read are REQUIRED (missing → stop
-    listing the real columns), extras go last. Customer numbers are NUMBERS, the rest trimmed text."""
+    COLUMN C (A:B empty, as 'FB'): VBRK, Cliente (KNA1: C RFC · D Cliente · E Nombre 1), VBRP, KNVP, VBRL (2),
+    BKPF. Columns found by NAME; the ones formulas read are REQUIRED (missing → stop listing the real
+    columns), extras go last. Customer numbers are NUMBERS (SAP's left zeros dropped), the rest trimmed text."""
 
     # Columns 'Diferencias' formulas read (1-based): ONE definition for the layout and the formulas.
     VBRK_FACTURA, VBRK_SOLICITANTE = 3, 5
@@ -3226,7 +3113,11 @@ class EtapaHojasSegundaCorrida:
             (4,                 ("Pagador",),                 False, CLIENTE),
             (VBRK_SOLICITANTE,  ("Solic.", "Solicitante"),    True,  CLIENTE),
         )},
-        {"clave": "fbl5n", "hoja": HOJA_CLIENTE, "etiqueta": "FBL5N", "columnas": ()},
+        {"clave": "kna1", "hoja": HOJA_CLIENTE, "etiqueta": "KNA1", "columnas": (
+            (CLIENTE_RFC,       ("Nº ident.fis.1", "N° ident.fis.1", "Ident.fis.1", "RFC"), True, None),
+            (CLIENTE_NUMERO,    ("Cliente",),                 True,  CLIENTE),
+            (CLIENTE_NOMBRE,    ("Nombre 1",),                True,  None),
+        )},
         {"clave": "vbrp", "hoja": HOJA_VBRP, "etiqueta": "VBRP", "columnas": (
             (VBRP_FACTURA,      ("Factura",),                 True,  None),
             (VBRP_MOPED,        ("MoPed", "Motivo de pedido"), True, None),
@@ -3277,6 +3168,8 @@ class EtapaHojasSegundaCorrida:
         )},
     )
     CLAVES = tuple(hoja["clave"] for hoja in HOJAS)
+    # May come without a file (the VBRL_2 download failed): its sheet is left empty, with a warning.
+    OPCIONALES = ("vbrl2",)
 
     @staticmethod
     def clave_texto(valor):
@@ -3289,14 +3182,20 @@ class EtapaHojasSegundaCorrida:
         return valor.upper() if isinstance(valor, str) else valor
 
     def __init__(self, rutas, update_status=None):
-        """`rutas`: {clave: path} with the six keys of CLAVES (vbrk, fbl5n, vbrp, knvp, vbrl2, bkpf)."""
-        faltan = [clave for clave in self.CLAVES if not rutas.get(clave)]
+        """`rutas`: {clave: path} with the six keys of CLAVES (vbrk, kna1, vbrp, knvp, vbrl2, bkpf); the ones in
+        OPCIONALES may be None / missing."""
+        faltan = [clave for clave in self.CLAVES if clave not in self.OPCIONALES and not rutas.get(clave)]
         if faltan:
             raise ValueError(f"Faltan archivos de la 2a corrida: {', '.join(faltan)}.")
         self.rutas = rutas
         self._update_status = update_status or (lambda _mensaje: None)
         self.resultado = None
         self.mapas = None
+
+    @staticmethod
+    def _hoja_vacia(hoja):
+        """The content of a sheet with nothing in it (a file without data, or an optional one not downloaded)."""
+        return {"hoja": hoja["hoja"], "encabezados": {}, "filas": [], "posiciones": [], "sin_datos": True}
 
     @staticmethod
     def _nombres_base(columnas):
@@ -3326,12 +3225,12 @@ class EtapaHojasSegundaCorrida:
         [{col: valor}], 'posiciones': [cols]}. ValueError: a column a formula reads is missing."""
         columnas = list(df.columns)
         bases = cls._nombres_base(columnas)
-        normalizadas = [Comun.normalizar_encabezado(b) for b in bases]
+        normalizadas = [normalizar_encabezado(b) for b in bases]
         usadas = set()
         asignadas = {}
         maxima = max(posicion for posicion, *_ in hoja["columnas"])
         for posicion, candidatos, requerida, tipo in hoja["columnas"]:
-            objetivos = {Comun.normalizar_encabezado(c) for c in candidatos}
+            objetivos = {normalizar_encabezado(c) for c in candidatos}
             indice = next((i for i, n in enumerate(normalizadas)
                            if i not in usadas and n in objetivos), None)
             if indice is None:
@@ -3360,32 +3259,25 @@ class EtapaHojasSegundaCorrida:
         return {"encabezados": encabezados, "filas": filas, "posiciones": posiciones}
 
     def preparar(self):
-        """Read and check the six files (BEFORE the big work: a wrong layout stops the run now) and build
+        """Read and check the six files (BEFORE the big work: a wrong layout stops the run now; an OPCIONALES
+        one that has no file is an empty sheet with a warning) and build
         the sheets' content and the lookup mirrors. Returns {clave: {hoja, encabezados, filas, posiciones,
         sin_datos}, 'avisos': [...]}. FileNotFoundError / ValueError as the readers raise them."""
         resultado = {}
         avisos = []
         for hoja in self.HOJAS:
-            clave, ruta = hoja["clave"], self.rutas[hoja["clave"]]
-            self._update_status(f"📄 Leyendo {hoja['etiqueta']} (2a corrida)...")
-            if clave == "fbl5n":
-                leido = EtapaCliente.leer(ruta)
-                avisos.extend(leido["avisos"])
-                encabezados = {p: nombre for p, (nombre, _, _) in
-                               zip((3, 4, 5, 6), EtapaCliente.CAMPOS)}
-                filas = [
-                    {3: rfc or None, 4: cliente, 5: nombre or None, 6: nif3 or None}
-                    for rfc, cliente, nombre, nif3 in leido["filas"]
-                ]
-                resultado[clave] = {"hoja": hoja["hoja"], "encabezados": encabezados, "filas": filas,
-                                    "posiciones": [3, 4, 5, 6], "sin_datos": leido["sin_datos"]}
+            clave, ruta = hoja["clave"], self.rutas.get(hoja["clave"])
+            if not ruta:      # __init__ lets only an OPCIONALES one get here
+                avisos.append(f"{hoja['hoja']}: no hubo archivo de {hoja['etiqueta']}; "
+                              f"la pestaña quedó vacía y sus búsquedas darán #N/A.")
+                resultado[clave] = self._hoja_vacia(hoja)
                 continue
+            self._update_status(f"📄 Leyendo {hoja['etiqueta']} (2a corrida)...")
             df = Comun.leer_csv(ruta)
             if Comun.es_sin_datos(df):
                 avisos.append(f"{hoja['hoja']}: el archivo de {hoja['etiqueta']} vino sin datos; "
                               f"la pestaña quedó vacía y sus búsquedas darán #N/A.")
-                resultado[clave] = {"hoja": hoja["hoja"], "encabezados": {}, "filas": [],
-                                    "posiciones": [], "sin_datos": True}
+                resultado[clave] = self._hoja_vacia(hoja)
                 continue
             resultado[clave] = dict(self.acomodar(df, hoja), hoja=hoja["hoja"], sin_datos=False)
         resultado["avisos"] = avisos
@@ -3407,7 +3299,7 @@ class EtapaHojasSegundaCorrida:
 
         texto, cliente = self.clave_texto, self.clave_cliente
         cliente_fila = {}
-        for fila in resultado["fbl5n"]["filas"]:
+        for fila in resultado["kna1"]["filas"]:
             llave = cliente(fila.get(self.CLIENTE_NUMERO))
             if llave is not None and llave not in cliente_fila:
                 cliente_fila[llave] = (fila.get(self.CLIENTE_RFC), fila.get(self.CLIENTE_NOMBRE))
@@ -3605,6 +3497,9 @@ class CatalogoAgrupadores:
             6: "Llave de la regla, sin los espacios de relleno de SAP. Se prueban en el orden de las filas: "
                "Motivo+Clase+Destinatario (2-4), Motivo+Clase+RFC (5-6), Motivo+Clase (7, 8, 10, 11) y Tecate "
                "(primeras 6 letras del nombre + RFC + Motivo + Clase, fila 9). Ninguna: SIN REGLA.",
+            7: f"En 'Diferencias', si Observación es Cliente Global (RFC XAXX010101000) o Vendedor y el Destinatario "
+               f"Factura no es {cls.GLOBAL}, W.A dice '{EtapaDiferencias.TEXTO_CAMBIAR_DESTINATARIO}' en lugar del "
+               f"W.A de la regla (no aplica a BAMA / OXXO; Estatus 1, Error y Regla no cambian).",
             10: "Si: el Error de la regla se muestra aunque el documento ya esté en una Lista de factura. "
                 "No: si está en una Lista, Error muestra el número de Lista.",
             11: "Si: W.A. es el UUID de la Lista de factura en 'Monitor (2)' (sin Lista: Validar; Lista sin "
@@ -3709,7 +3604,9 @@ class EtapaDiferencias:
     values, F 'Tipo', LIVE lookups (G:O; XLOOKUPs into VBRK, Cliente, VBRP, KNVP, 'VBRL (2)', BKPF; no IFERROR)
     and, as VALUES from ONE rule of 'Agrupadores', the LAST four columns: P Estatus 1 (traffic light), Q Error,
     R W.A., S Regla. `preparar` mirrors every formula and feeds the rule from the raw lookups (SAP padding off).
-    The dict `evaluar` returns is keyed by the letter of the sheet column each value lands in."""
+    The dict `evaluar` returns is keyed by the letter of the sheet column each value lands in. On top of the
+    catalog, a Cliente Global / Vendedor 'Observación' whose Destinatario Factura is not 30162136 gets
+    `TEXTO_CAMBIAR_DESTINATARIO` in W.A (see `requiere_cambiar_destinatario`)."""
 
     HOJA = "Diferencias"
     FILA_ENCABEZADO = 2
@@ -3744,6 +3641,9 @@ class EtapaDiferencias:
     TEXTO_SIN_DATO = "N/D"
     TEXTO_SIN_UUID = "Sin UUID"
     NA = "#N/A"
+    # Business rule (7-nov-2026): an 'Observación' of Cliente Global or Vendedor must bill to the Global ship-to.
+    TEXTO_CAMBIAR_DESTINATARIO = f"Cambiar destinatario factura a {CatalogoAgrupadores.GLOBAL}"
+    OBSERVACIONES_DESTINATARIO_GLOBAL = (TEXTO_GLOBAL, TEXTO_VENDEDOR)
 
     def __init__(self, etapa_validacion, etapa_hojas, etapa_monitor2=None):
         """Every stage must already be prepared; `etapa_monitor2` None = the 2nd Monivoi was not given."""
@@ -3853,17 +3753,34 @@ class EtapaDiferencias:
 
         def dato(valor, normalizar):
             return A.DESCONOCIDO if valor is falta else normalizar(valor)
+        destinatario_dato = dato(destinatario, A.cliente)
         regla = A.clasificar({
             "motivo": dato(motivo, A.texto), "clase": dato(clase, A.texto),
-            "destinatario": dato(destinatario, A.cliente), "rfc": rfc_dato, "nombre6": nombre_dato,
+            "destinatario": destinatario_dato, "rfc": rfc_dato, "nombre6": nombre_dato,
         })
         en_lista = lista is not falta and self.es_lista(lista)
         out["P"] = regla.estatus
         out["Q"] = str(lista).strip() if en_lista and not regla.prevalece else regla.error
         out["R"] = self._wa(regla, lista if en_lista else None)
+        # The Global / Vendedor ship-to check only replaces W.A; Estatus 1, Error and Regla keep the catalog's rule.
+        out["cambiar_destinatario"] = self.requiere_cambiar_destinatario(out["J"], destinatario_dato, regla)
+        if out["cambiar_destinatario"]:
+            out["R"] = self.TEXTO_CAMBIAR_DESTINATARIO
         out["S"] = regla.etiqueta
         out["regla"] = regla
         return out
+
+    @classmethod
+    def requiere_cambiar_destinatario(cls, observacion, destinatario, regla):
+        """True when `observacion` (column J) is Cliente Global or Vendedor and the Destinatario Factura (already
+        normalized by CatalogoAgrupadores.cliente, or DESCONOCIDO for #N/A) is KNOWN and is not the Global ship-to.
+        A Global RFC (XAXX010101000) always gives 'Cliente Global' in J, so that case needs no second test. Not
+        decided (False): J or the ship-to is #N/A, and the BAMA / OXXO rules (their own ship-to is by design)."""
+        if observacion not in cls.OBSERVACIONES_DESTINATARIO_GLOBAL or regla.wa_uuid:
+            return False
+        if destinatario is CatalogoAgrupadores.DESCONOCIDO:
+            return False
+        return destinatario != CatalogoAgrupadores.GLOBAL
 
     @staticmethod
     def es_lista(valor):
@@ -3922,6 +3839,8 @@ class EtapaDiferencias:
             "wa_uuid":       cuenta(lambda e: e["regla"].wa_uuid and e["R"] not in (
                                  CatalogoAgrupadores.TEXTO_VALIDAR, self.TEXTO_SIN_UUID)),
             "wa_sin_uuid":   cuenta(lambda e: e["regla"].wa_uuid and e["R"] == self.TEXTO_SIN_UUID),
+            "cambiar_dest_global":   cuenta(lambda e: e["cambiar_destinatario"] and e["J"] == self.TEXTO_GLOBAL),
+            "cambiar_dest_vendedor": cuenta(lambda e: e["cambiar_destinatario"] and e["J"] == self.TEXTO_VENDEDOR),
             "con_fp":        sum(1 for f in filas
                                  if isinstance(f[3], str) and EtapaListasSegundaCorrida.excluida(f[3])),
             "importe":       round(sum(f[4] for f in filas), 2),
@@ -3947,7 +3866,7 @@ class EtapaDiferencias:
                 avisos.append(aviso)
             if conteo["sin_cliente"]:
                 avisos.append(f"{etiqueta}: {conteo['sin_cliente']:,} renglón(es) cuyo cliente no está en "
-                              f"'Cliente' (FBL5N); Nombre, RFC y Observación quedan en #N/A.")
+                              f"'Cliente' (KNA1); Nombre, RFC y Observación quedan en #N/A.")
             if conteo["sin_knvp"]:
                 avisos.append(f"{etiqueta}: {conteo['sin_knvp']:,} renglón(es) cuyo cliente no está en KNVP; "
                               f"Destinatario Factura queda en #N/A.")
@@ -3961,6 +3880,12 @@ class EtapaDiferencias:
                 avisos.append(f"{etiqueta}: {conteo['sin_regla']:,} renglón(es) no empatan ninguna regla de "
                               f"'{CatalogoAgrupadores.HOJA}' (o les falta un dato para decidirla): Estatus 1, "
                               f"Error y W.A. dicen '{CatalogoAgrupadores.TEXTO_VALIDAR}'.")
+            cambiar = conteo["cambiar_dest_global"] + conteo["cambiar_dest_vendedor"]
+            if cambiar:
+                avisos.append(f"{etiqueta}: {cambiar:,} renglón(es) con Observación Cliente Global "
+                              f"({conteo['cambiar_dest_global']:,}) o Vendedor ({conteo['cambiar_dest_vendedor']:,}) "
+                              f"cuyo Destinatario Factura no es {CatalogoAgrupadores.GLOBAL}: "
+                              f"W.A dice '{self.TEXTO_CAMBIAR_DESTINATARIO}'.")
             sin_archivo = self.etapa_monitor2 is None or not self.etapa_monitor2.resultado["disponible"]
             if conteo["wa_sin_uuid"] and sin_archivo:
                 avisos.append(f"{etiqueta}: {conteo['wa_sin_uuid']:,} renglón(es) de BAMA / OXXO con Lista de "
@@ -3993,7 +3918,10 @@ class EtapaDiferencias:
             self.COL_ERROR: "Valor: el Error de la regla. Si el documento ya está en una Lista de factura, el "
                             "número de Lista, salvo en las reglas que prevalecen (filas 2-4 de 'Agrupadores').",
             self.COL_WA: "Valor: el W.A. de la regla. BAMA / OXXO: el UUID de su Lista en 'Monitor (2)'; sin "
-                         "Lista, Validar; Lista sin UUID o que no está, Sin UUID.",
+                         "Lista, Validar; Lista sin UUID o que no está, Sin UUID. Excepción (manda sobre la regla, "
+                         "salvo BAMA / OXXO): si Observación es Cliente Global o Vendedor y el Destinatario Factura "
+                         f"no es {CatalogoAgrupadores.GLOBAL}, dice '{self.TEXTO_CAMBIAR_DESTINATARIO}' (con el "
+                         "Destinatario en #N/A no se decide).",
             self.COL_ANULADO: "Documento de anulación (Anul.con) del Nº documento en BKPF; 'N/D' si no tiene "
                               "(vacío o sólo espacios). Si el documento no está en BKPF: #N/A.",
             self.COL_REGLA: "Fila de la pestaña 'Agrupadores' cuya regla decidió Estatus 1, Error y W.A. "
@@ -4055,7 +3983,7 @@ def leer_documentos_gallo_fb03(ruta_gallo):
 
 
 def leer_solicitantes_vbrk(ruta_vbrk):
-    """The 'Solic.' values (distinct, in order) of the VBRK download that FBL5N and KNVP paste into SAP
+    """The 'Solic.' values (distinct, in order) of the VBRK download that KNA1 and KNVP paste into SAP
     → (valores, filas_leidas, nombre_columna).
     """
     return EtapaListasSegundaCorrida.leer_solicitantes(ruta_vbrk)
@@ -4095,7 +4023,8 @@ class Consolidador:
     """Runs the consolidation: reads the CSVs, runs the stages (EtapaGallo → EtapaTD → EtapaMonivoi →
     EtapaCruceTDMTD → [EtapaVBRL → … → EtapaListasSegundaCorrida]) and writes the workbook. VBRL and FB03
     are OPTIONAL (old dates must still consolidate; Notas / PEP tables need BOTH). The 2nd consolidation
-    (`rutas_segunda`) is the SAME run plus 'Diferencias', 'Agrupadores', six sheets and 'Monitor (2)'."""
+    (`rutas_segunda`) is the SAME run plus 'Diferencias', 'Agrupadores', six sheets and 'Monitor (2)'.
+    The VBRL_2 and Monivoi_2 files are optional there (empty sheet / blank 'Monitor (2)', with a warning)."""
 
     def __init__(self, ruta_gallo, ruta_monivoi, ruta_output, nombre_salida=None,
                  callback_status=None, ruta_vbrl=None, ruta_fb03=None, rutas_segunda=None):
@@ -4355,7 +4284,7 @@ def consolidar_gallo_monivoi(
     rutas_segunda=None,
 ):
     """The controller's entry point: Consolidador(...).ejecutar() (see its docs). `rutas_segunda` makes
-    it the 2nd consolidation: {vbrk, fbl5n, vbrp, knvp, vbrl2, bkpf: path, monivoi2: path or None}
+    it the 2nd consolidation: {vbrk, kna1, vbrp, knvp, vbrl2, bkpf: path, monivoi2: path or None}
     (needs `ruta_vbrl`)."""
     return Consolidador(
         ruta_gallo, ruta_monivoi, ruta_output,
