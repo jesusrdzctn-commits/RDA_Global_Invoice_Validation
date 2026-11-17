@@ -193,6 +193,13 @@ def ruta_config():
     return os.path.join(base, "config.json")
 
 
+def ruta_recurso(*partes):
+    """Absolute path of a file bundled with the app (e.g. ruta_recurso("assets", "logo_vfg.ico")): inside the
+    PyInstaller bundle (sys._MEIPASS, the _internal folder of --onedir) or next to this .py."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *partes)
+
+
 def carpeta_base_proyecto():
     """Documents\\Validacion Factura Global\\src of the current Windows user (parent of Input, Output, Logs)."""
     perfil = os.environ.get("USERPROFILE") or os.path.expanduser("~")

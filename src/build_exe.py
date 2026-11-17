@@ -12,6 +12,13 @@ import os
 APP_NAME = "ValidacionFacturaGlobal"
 MODO_BUILD = "--onedir"
 
+# Executable icon (multi-size .ico, 16-256 px). Relative to the folder this script runs from.
+ICONO = os.path.join("assets", "logo_vfg.ico")
+
+# Files read at run time (window icon + rail logo), bundled next to the code with --add-data.
+# Keep the PNG sizes in sync with LOGO_TAMANOS in interfaz_GUI.py and the datas of the .spec.
+RECURSOS = [ICONO] + [os.path.join("assets", f"logo_vfg_{px}.png") for px in (56, 72, 88, 112)]
+
 # Heavy libraries the app never imports (they sneak in from a non-clean environment).
 # If a build fails with ModuleNotFoundError for one of these, remove it from the list.
 MODULOS_EXCLUIDOS = [
@@ -63,7 +70,7 @@ def create_executable():
         MODO_BUILD,
         "--windowed",  # no console window (GUI app)
         f"--name={APP_NAME}",
-        "--icon=NONE",
+        f"--icon={ICONO}",
         "--clean",
         "--noconfirm",
 
@@ -75,6 +82,8 @@ def create_executable():
         "--hidden-import=win32com.client",
         "--hidden-import=pywintypes",
     ]
+    # PyInstaller separates source and destination with os.pathsep (';' on Windows).
+    cmd += [f"--add-data={ruta}{os.pathsep}assets" for ruta in RECURSOS]
     cmd += [f"--exclude-module={modulo}" for modulo in MODULOS_EXCLUIDOS]
     cmd.append("main.py")
 
@@ -130,6 +139,7 @@ def check_source_files():
         "Descargas_SAP.py",
         "Consolidacion.py",
         "utils.py",
+        *RECURSOS,
     ]
 
     print("🔍 Verificando archivos fuente...")

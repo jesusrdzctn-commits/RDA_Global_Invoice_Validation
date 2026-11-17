@@ -27,10 +27,16 @@ from utils import (
     ruta_config,                 carpetas_por_defecto,       carpetas_configuradas,
     nombre_archivo_dia_2da,      nombre_archivo_rango_2da,
     parse_fecha,
+    ruta_recurso,
 )
 
 FUENTE = "Segoe UI"
 FUENTE_MONO = "Consolas"
+
+# Logo of the rail: PNGs pre-scaled in assets/ (Tk cannot resample smoothly and Pillow is not bundled).
+# Keep LOGO_TAMANOS in sync with RECURSOS in build_exe.py / the datas of the .spec.
+LOGO_TAMANOS = (56, 72, 88, 112)
+LOGO_TAMANO_BASE = 52      # design size in pixels at 100% display scaling; the closest PNG is used
 
 
 # ----------------------------------------------------------------------
@@ -458,6 +464,8 @@ class ValidacionFacturaGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Robotic Desktop Automation — Validación Factura Global")
+        self._logo_riel = None      # PhotoImage of the rail logo: Tk drops an image nobody references
+        self._poner_icono_ventana()
         self.root.configure(bg=Paleta.fondo)
         # Pixel sizes follow the display scaling; point sizes of fonts already do.
         self.escala = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
@@ -517,6 +525,24 @@ class ValidacionFacturaGUI:
     def _px(self, valor):
         """A design size in pixels, scaled for the display."""
         return int(round(valor * self.escala))
+
+    def _poner_icono_ventana(self):
+        """Title-bar icon (and every dialog's) from the bundled .ico. Cosmetic: if the file is missing or Tk
+        cannot use it (e.g. not Windows), the window keeps the default icon."""
+        try:
+            self.root.iconbitmap(default=ruta_recurso("assets", "logo_vfg.ico"))
+        except tk.TclError:
+            pass
+
+    def _cargar_logo_riel(self):
+        """The logo as a PhotoImage (the pre-scaled PNG closest to the display scaling), or None when the file
+        is missing or unreadable: the rail then shows just the text."""
+        objetivo = self._px(LOGO_TAMANO_BASE)
+        tamano = min(LOGO_TAMANOS, key=lambda t: abs(t - objetivo))
+        try:
+            return tk.PhotoImage(master=self.root, file=ruta_recurso("assets", f"logo_vfg_{tamano}.png"))
+        except tk.TclError:
+            return None
 
     # ------------------------------------------------------------------
     # Window geometry
@@ -637,8 +663,15 @@ class ValidacionFacturaGUI:
         px = self._px
         marca = tk.Frame(riel, bg=Paleta.riel, padx=px(22), pady=px(12))
         marca.pack(fill="x")
-        tk.Label(marca, text="RDA", font=(FUENTE, 24, "bold"), fg="#FFFFFF",
-                 bg=Paleta.riel).pack(anchor="w")
+        # Logo top-left with the "RDA" mark beside it; the name goes below at full width (it would not fit
+        # next to the logo in the rail).
+        cabecera = tk.Frame(marca, bg=Paleta.riel)
+        cabecera.pack(anchor="w")
+        self._logo_riel = self._cargar_logo_riel()
+        if self._logo_riel is not None:
+            tk.Label(cabecera, image=self._logo_riel, bg=Paleta.riel, bd=0).pack(side=tk.LEFT, padx=(0, px(12)))
+        tk.Label(cabecera, text="RDA", font=(FUENTE, 24, "bold"), fg="#FFFFFF",
+                 bg=Paleta.riel).pack(side=tk.LEFT)
         tk.Label(marca, text="Validación Factura Global", font=(FUENTE, 11, "bold"), fg="#FFFFFF",
                  bg=Paleta.riel).pack(anchor="w")
         tk.Label(marca, text="Análisis Contabilidad vs Monitoreo\n(SAT) de Facturas en CEDIS", font=(FUENTE, 9),
